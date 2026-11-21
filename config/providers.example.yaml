@@ -1,0 +1,17 @@
+profiles:
+  groq_asr:
+    provider: groq
+    key_env: GROQ_API_KEY
+    proxy_env: GROQ_PROXY
+  groq_asr_2:
+    provider: groq
+    key_env: GROQ_API_KEY_2
+    proxy_env: GROQ_PROXY_2
+  gemini_embed:
+    provider: google
+    key_env: GEMINI_API_KEY
+    proxy_env: GEMINI_PROXY
+  gemini_embed_2:
+    provider: google
+    key_env: GEMINI_API_KEY_2
+    proxy_env: GEMINI_PROXY_2

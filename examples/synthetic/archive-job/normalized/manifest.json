@@ -1,0 +1,12 @@
+{
+  "archive_name": "synthetic-example.zip",
+  "archive_size_bytes": 0,
+  "archive_md5": null,
+  "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "archive_uri": "example://synthetic/archive.zip",
+  "scope": "topic",
+  "scope_topic_id": "1",
+  "scope_topic_title": "Example topic",
+  "chat_id": "-1009000",
+  "result_json": "result.json"
+}

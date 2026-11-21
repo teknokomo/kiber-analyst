@@ -1,0 +1,1 @@
+{"chat_id":"-1009000","event_id":"1","type":"topic_created","topic_id":"1","date":"2020-01-01T10:00:00+00:00","actor_id":"user100","actor_name":"Example Author","new_value":"Example topic","old_value":null,"message_id":null,"target_id":null,"target_name":null,"raw_action":"synthetic_topic_created"}

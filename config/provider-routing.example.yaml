@@ -1,0 +1,53 @@
+version: 1
+pools:
+  groq_asr:
+    operation: telegram_asr
+    provider: groq
+    model: whisper-large-v3-turbo
+    profiles: [groq_asr, groq_asr_2]
+    strategy: round_robin
+    weights: {groq_asr: 1, groq_asr_2: 1}
+    quota_scopes:
+      groq_asr: [groq:profile-groq-asr]
+      groq_asr_2: [groq:profile-groq-asr-2]
+    limits: []
+    retry: {max_cycles: 5, initial_seconds: 10, max_seconds: 300, jitter_fraction: 0.2}
+
+  gemini_embed:
+    operation: embed
+    provider: google
+    model: gemini-embedding-2:1536
+    profiles: [gemini_embed, gemini_embed_2]
+    strategy: round_robin
+    weights: {gemini_embed: 1, gemini_embed_2: 1}
+    quota_scopes:
+      gemini_embed: [google:gemini_embed]
+      gemini_embed_2: [google:gemini_embed_2]
+    limits: []
+    retry: {max_cycles: 5, initial_seconds: 10, max_seconds: 300, jitter_fraction: 0.2}
+
+  gemini_asr_embed:
+    operation: asr_embed
+    provider: google
+    model: gemini-embedding-2:1536
+    profiles: [gemini_embed, gemini_embed_2]
+    strategy: round_robin
+    weights: {gemini_embed: 1, gemini_embed_2: 1}
+    quota_scopes:
+      gemini_embed: [google:gemini_embed]
+      gemini_embed_2: [google:gemini_embed_2]
+    limits: []
+    retry: {max_cycles: 5, initial_seconds: 10, max_seconds: 300, jitter_fraction: 0.2}
+
+  gemini_query:
+    operation: search
+    provider: google
+    model: gemini-embedding-2:1536
+    profiles: [gemini_embed, gemini_embed_2]
+    strategy: failover
+    weights: {gemini_embed: 1, gemini_embed_2: 1}
+    quota_scopes:
+      gemini_embed: [google:gemini_embed]
+      gemini_embed_2: [google:gemini_embed_2]
+    limits: []
+    retry: {max_cycles: 5, initial_seconds: 10, max_seconds: 300, jitter_fraction: 0.2}

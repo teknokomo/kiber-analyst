@@ -1,0 +1,43 @@
+{
+  "chats": {
+    "list": [
+      {
+        "id": -1009000,
+        "name": "Example Group",
+        "type": "supergroup",
+        "messages": [
+          {
+            "id": 23,
+            "type": "service",
+            "date": "2020-01-01T10:00:00+03:00",
+            "action": "topic_created",
+            "title": "Example Station"
+          },
+          {
+            "id": 24,
+            "type": "message",
+            "date": "2020-01-01T10:01:00",
+            "from": "Example Author",
+            "from_id": "user1",
+            "reply_to_message_id": 23,
+            "text": [
+              {"type": "bold", "text": "Сводка: "},
+              {"type": "text_link", "text": "план", "href": "https://example.test/plan"}
+            ],
+            "photo": "photos/photo_1.jpg"
+          },
+          {
+            "id": 25,
+            "type": "message",
+            "date": "2020-01-01T10:02:00Z",
+            "from": "Example Author Two",
+            "from_id": "user2",
+            "reply_to_message_id": 24,
+            "edited": "2020-01-01T10:03:00",
+            "text": "Продолжаю"
+          }
+        ]
+      }
+    ]
+  }
+}

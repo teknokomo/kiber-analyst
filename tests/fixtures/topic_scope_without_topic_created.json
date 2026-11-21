@@ -1,0 +1,24 @@
+{
+  "id": -1009000,
+  "name": "Example Group",
+  "type": "supergroup",
+  "messages": [
+    {
+      "id": 101,
+      "type": "message",
+      "date": "2020-01-02T12:00:00",
+      "from": "Алиса",
+      "from_id": "user42",
+      "text": "Начало темы"
+    },
+    {
+      "id": 102,
+      "type": "message",
+      "date": "2020-01-02T12:01:00",
+      "from": "Боб",
+      "from_id": "user43",
+      "reply_to_message_id": 101,
+      "text": "Ответ без маркера topic_created"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "source_id": "telegram:-1009000:topic:1",
+  "chat_id": "-1009000",
+  "topic_id": "1",
+  "chat_title": "Example Group",
+  "topic_title": "Example topic",
+  "complete": true,
+  "message_count": 1,
+  "service_event_count": 1,
+  "messages_sha256": "b17d69732961dc2f287f41e85fed94c678e9d331196969bea1f95fbcec944d95",
+  "services_sha256": "e2631a054ef22bc56f6cc0c5f03f1da25e924de57952eb6827eaf035469bc524",
+  "scope": "topic",
+  "synthetic": true
+}
