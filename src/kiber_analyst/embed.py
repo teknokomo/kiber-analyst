@@ -105,7 +105,7 @@ def _read_records(path: Path, *, normalized_messages: bool) -> list[dict[str, An
 def _project_slug(manifest: dict[str, Any], override: str | None) -> str:
     load = manifest.get("load")
     loaded_slug = load.get("project_slug") if isinstance(load, dict) else None
-    slug = override or manifest.get("project_slug") or loaded_slug or "sample-project"
+    slug = override or manifest.get("project_slug") or loaded_slug or "default"
     if not isinstance(slug, str) or not slug.strip():
         raise EmbedError("Project slug is missing")
     return slug.strip()
@@ -261,9 +261,9 @@ def embed_job(
     job_dir: Path,
     *,
     project: str | None = None,
-    env_path: Path = config_path("knowledge.env"),
-    api_env_path: Path = config_path("providers.env"),
-    proxy_env_path: Path = config_path("proxy.env"),
+    env_path: Path = config_path("knowledge.conf"),
+    api_env_path: Path = config_path("provider-credentials.env"),
+    proxy_env_path: Path = config_path("provider-proxies.env"),
     provider_profile: str = "gemini_embed",
     embedding_call: Callable[[list[str]], tuple[list[list[float]], int | None]] | None = None,
     sleep: Callable[[float], None] = time.sleep,

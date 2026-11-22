@@ -149,10 +149,10 @@ def test_backup_restore_checks_and_restores_queue_snapshot(tmp_path: Path) -> No
         assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
 
 
-def test_mount_requirement_fails_closed_without_configured_uuid(tmp_path: Path) -> None:
-    store = JobStore(tmp_path / "queue", expected_uuid=None, require_mount=True)
+def test_mount_requirement_fails_closed_before_creating_queue(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "queue", require_mount=True)
 
-    with pytest.raises(JobsError, match="KIBER_ANALYST_DATA_UUID is required"):
+    with pytest.raises(JobsError, match="mount target is not configured"):
         store.initialize()
 
     assert not store.data_root.exists()

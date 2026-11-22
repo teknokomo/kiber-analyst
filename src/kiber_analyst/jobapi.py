@@ -10,12 +10,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from kiber_analyst.jobqueue import DEFAULT_DATA_ROOT, DEFAULT_SOCKET, JobsError, canonical_json
+from kiber_analyst.config_paths import data_dir
+from kiber_analyst.jobqueue import DEFAULT_SOCKET, JobsError, canonical_json
 
 MAX_REQUEST_BYTES = 1_048_576
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 ALLOWED_OPERATIONS = {"telegram_asr", "telegram_ingest", "embed", "asr_embed", "search"}
-DATA_PREFIX = DEFAULT_DATA_ROOT.resolve()
+DATA_PREFIX = data_dir().resolve()
 
 
 class _RestrictedParser(argparse.ArgumentParser):
@@ -106,7 +107,7 @@ def parse_job_command(argv: Sequence[str]) -> tuple[str, dict[str, Any], list[di
     if tokens[:2] == ["telegram", "ingest"]:
         parser = _RestrictedParser(add_help=False)
         parser.add_argument("--job", required=True)
-        parser.add_argument("--project", default="sample-project")
+        parser.add_argument("--project", default="default")
         parser.add_argument("--dry-run", action="store_true")
         try:
             args = parser.parse_args(tokens[2:])

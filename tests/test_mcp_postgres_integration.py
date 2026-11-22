@@ -72,7 +72,7 @@ def test_reader_connection_is_read_only_and_acl_denies_all_writes(mcp_config: MC
         autocommit=True,
     ) as conn:
         assert conn.execute("SELECT current_setting('default_transaction_read_only')").fetchone()[0] == "on"
-        assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 12
+        assert conn.execute("SELECT count(*) FROM segments").fetchone()[0] == 403
         privileges = conn.execute(
             """SELECT
                  has_database_privilege('knowledge_reader','knowledge','TEMP'),
@@ -116,14 +116,14 @@ def test_reader_search_segment_asr_union_and_filters(
     service: ToolService, source: str, expected: str | None
 ) -> None:
     result = service.search(
-        "Example Station",
+        "Sample Station",
         "sample-project",
         limit=20,
         source=source,
         source_kind="telegram",
-        date_from="2020-01-02",
-        date_to="2020-01-02",
-        author="Example Author",
+        date_from="2024-01-01",
+        date_to="2024-01-01",
+        author="Test User",
         topic="1",
     )
     sources = {item["source"] for item in result["results"]}
@@ -133,7 +133,7 @@ def test_reader_search_segment_asr_union_and_filters(
         assert sources == {expected}
     assert result["degraded"] is False
     assert all(item["project_slug"] == "sample-project" for item in result["results"])
-    assert all(item["author"] == "Example Author" for item in result["results"])
+    assert all(item["author"] == "Test User" for item in result["results"])
     assert all(item["url"].startswith("https://t.me/") for item in result["results"])
     if source in {"asr", "all"}:
         asr = next(item for item in result["results"] if item["source"] == "asr")
@@ -145,16 +145,16 @@ def test_reader_search_segment_asr_union_and_filters(
 def test_reader_search_topic1_provenance_limits_and_sender_fallback(
     service: ToolService,
 ) -> None:
-    query = "Example Station"
+    query = "Sample Station"
     five = service.search(
         query, "sample-project", limit=5, source_kind="telegram", topic="1"
     )
     assert len(five["results"]) == 5
     item = five["results"][0]
-    assert item["chat_title"] == "Example Group"
-    assert item["topic_title"] == "Example topic"
+    assert item["chat_title"] == "Example Community"
+    assert item["topic_title"] == "Announcements"
     assert item["topic_id"] == "1"
-    assert item["source_id"] == "telegram:-1009000:topic:1"
+    assert item["source_id"] == "telegram:-10012345:topic:1"
 
     one = service.search(
         query, "sample-project", limit=1, source_kind="telegram", topic="1"
@@ -201,10 +201,10 @@ def test_reader_get_document_paginates_all_segments_and_asr(service: ToolService
         if cursor is None:
             break
 
-    assert len(segments) == 12
-    assert len({item["segment_id"] for item in segments}) == 12
-    assert len(asr_results) == 3
-    assert len({item["external_ref"] for item in asr_results}) == 3
+    assert len(segments) == 403
+    assert len({item["segment_id"] for item in segments}) == 403
+    assert len(asr_results) == 9
+    assert len({item["external_ref"] for item in asr_results}) == 9
     assert all("raw_path" not in item and "meta" not in item for item in segments)
 
 
@@ -213,20 +213,20 @@ def test_reader_project_and_ingest_counters(service: ToolService) -> None:
     status = service.ingest_status("sample-project")
 
     assert project["slug"] == "sample-project"
-    assert project["segments"] == 12
-    assert project["asr_results"] == 3
-    assert project["asr_segments"] == 8
-    assert project["embeddings"] == 14
+    assert project["segments"] == 403
+    assert project["asr_results"] == 9
+    assert project["asr_segments"] == 704
+    assert project["embeddings"] == 1062
     assert status["counts"] == {
         "sources": 1,
         "documents": 1,
-        "segments": 12,
+        "segments": 403,
         "asr_runs": 2,
-        "asr_results": 3,
-        "asr_segments": 8,
-        "asr_attempts": 4,
-        "asr_embeddings": 6,
-        "source_embeddings": 8,
+        "asr_results": 9,
+        "asr_segments": 704,
+        "asr_attempts": 10,
+        "asr_embeddings": 681,
+        "source_embeddings": 381,
     }
     assert status["latest_snapshot"]["scope"] == "topic"
 
@@ -234,7 +234,7 @@ def test_reader_project_and_ingest_counters(service: ToolService) -> None:
 def test_reader_search_matches_shared_cli_search_core(
     mcp_config: MCPConfig, service: ToolService
 ) -> None:
-    query = "Example Station"
+    query = "Sample Station"
     with readonly_connection(mcp_config) as conn:
         direct = execute_search(
             conn,
@@ -287,7 +287,7 @@ def test_streamable_http_initialize_list_and_all_tool_calls(
             "search", "get_document", "list_projects", "ingest_status"
         }
         arguments = {
-            "search": {"query": "Example Station", "project": "sample-project", "source": "all"},
+            "search": {"query": "Sample Station", "project": "sample-project", "source": "all"},
             "get_document": {"document_id": DOCUMENT_ID, "limit": 2},
             "list_projects": {},
             "ingest_status": {"project": "sample-project"},

@@ -15,3 +15,11 @@ profiles:
     provider: google
     key_env: GEMINI_API_KEY_2
     proxy_env: GEMINI_PROXY_2
+  gemini_video:
+    provider: google
+    key_env: GEMINI_API_KEY
+    proxy_env: GEMINI_PROXY
+  gemini_video_2:
+    provider: google
+    key_env: GEMINI_API_KEY_2
+    proxy_env: GEMINI_PROXY_2

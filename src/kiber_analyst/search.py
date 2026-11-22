@@ -75,7 +75,7 @@ def search(
     author: str | None = None,
     topic: str | None = None,
     source_id: str | None = None,
-    env_path: Path = config_path("knowledge.env"),
+    env_path: Path = config_path("knowledge.conf"),
     embedding_provider: Callable[[str], list[float]] | None = None,
 ) -> dict[str, Any]:
     normalized_query = query.strip()

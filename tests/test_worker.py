@@ -282,6 +282,82 @@ def test_asr_resume_reuses_saved_success_after_quota_wait(
     assert len(loaded) == 2
 
 
+def test_asr_worker_loads_cached_pilot_results_without_provider_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kiber_analyst.asr as asr_module
+    import kiber_analyst.asr_store as asr_store
+    import kiber_analyst.worker as worker_module
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    job_dir = tmp_path / "asr-source"
+    job_dir.mkdir(mode=0o700)
+    run_id = "ka-saved-pilot"
+    external_ref = "tg:-1001:10367"
+    audio = asr_module.AudioInput(
+        external_ref, "media/10367/voice.ogg", tmp_path / "voice.ogg", 8, "a" * 64
+    )
+    job_record, _created = store.create_job(
+        operation="telegram_asr",
+        command={
+            "params": {
+                "job_dir": str(job_dir), "project": "sample-project",
+                "load_results": True, "run_id": run_id,
+                "external_refs": [external_ref],
+            },
+            "pool": "groq_asr",
+        },
+        fingerprint="f" * 64,
+        idempotency_key="asr-saved-pilot-results",
+    )
+    job = store.claim()
+    assert job and job.id == job_record.id
+
+    run_dir = job_dir / "asr" / "batches" / run_id
+    results_dir = run_dir / "results"
+    results_dir.mkdir(mode=0o700, parents=True)
+    result_path = results_dir / "10367.json"
+    result_bytes = json.dumps({
+        "text": "сохранённая расшифровка",
+        "segments": [{"start": 0.0, "end": 1.5, "text": "сохранённая расшифровка"}],
+    }).encode()
+    result_path.write_bytes(result_bytes)
+    result_path.chmod(0o600)
+    manifest_path = run_dir / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "run_id": run_id,
+        "items": [{
+            "external_ref": external_ref, "status": "complete",
+            "result": "results/10367.json",
+            "result_sha256": hashlib.sha256(result_bytes).hexdigest(),
+        }],
+    }), encoding="utf-8")
+    manifest_path.chmod(0o600)
+
+    worker = JobWorker(store=store, pools={"gemini_query": make_pool()})
+    monkeypatch.setattr(asr_module, "_collect_audio", lambda _job_dir: [audio])
+    monkeypatch.setattr(worker_module, "_duration_seconds", lambda _path: 1.5)
+    monkeypatch.setattr(
+        asr_module, "run_asr_batch",
+        lambda *_args, **_kwargs: pytest.fail("cached result must not call Groq"),
+    )
+    loaded = []
+    monkeypatch.setattr(
+        asr_store, "load_asr",
+        lambda *args, **kwargs: loaded.append((args, kwargs)) or {"status": "done"},
+    )
+
+    report = worker._run_asr(job)
+
+    assert report["status"] == "complete"
+    assert report["files_done"] == 1
+    assert report["segments"] == 1
+    assert len(loaded) == 1
+    assert loaded[0][1]["external_refs"] == [external_ref]
+    assert loaded[0][1]["input_durations"] == {external_ref: 1.5}
+
+
 def _route_asr(invoke):
     from kiber_analyst.worker import ReportedProviderError
 
@@ -308,7 +384,7 @@ def test_search_worker_uses_submitted_fingerprint_and_saves_query_vector(
         {
             "argv": [
                 "search",
-                "Example Station",
+                "Sample Station",
                 "--project",
                 "sample-project",
                 "--limit",
@@ -322,12 +398,12 @@ def test_search_worker_uses_submitted_fingerprint_and_saves_query_vector(
 
     def fake_embed(profile: str, texts: list[str], *, timeout: float):
         assert profile in {"profile_a", "profile_b"}
-        assert texts == ["Example Station"]
+        assert texts == ["Sample Station"]
         assert timeout > 0
         return [[0.0] * 1536], 4
 
     def fake_search(query: str, **kwargs):
-        assert query == "Example Station"
+        assert query == "Sample Station"
         vector = kwargs["embedding_provider"](query)
         assert len(vector) == 1536
         return {"degraded": False, "results": [{"source": "segment"}]}

@@ -93,10 +93,10 @@ def test_jobs_submit_parser_allows_pool_strategy_and_profile_mode() -> None:
 
     parser = _parser()
     selected_strategy = parser.parse_args(
-        ["jobs", "submit", "--pool", "groq_asr", "--strategy", "round_robin", "--", "telegram", "asr", "--job", "sample-job"]
+        ["jobs", "submit", "--pool", "groq_asr", "--strategy", "round_robin", "--", "telegram", "asr", "--job", "/tmp/disallowed-job"]
     )
     selected_profile = parser.parse_args(
-        ["jobs", "submit", "--profile", "groq_asr", "--", "telegram", "asr", "--job", "sample-job"]
+        ["jobs", "submit", "--profile", "groq_asr", "--", "telegram", "asr", "--job", "/tmp/disallowed-job"]
     )
 
     assert selected_strategy.pool == "groq_asr"

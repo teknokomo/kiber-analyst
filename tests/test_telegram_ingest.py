@@ -6,16 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from kiber_analyst.config_paths import data_path
 from kiber_analyst.errors import LoadError
 from kiber_analyst.telegram_ingest import TELEGRAM_ROOT, inspect_export, prepare_export
 
-CHAT_ID = "-1009000"
+CHAT_ID = "-10012345"
 TOPIC_ID = 1
 SOURCE_ID = f"telegram:{CHAT_ID}:topic:{TOPIC_ID}"
 
 
 def test_default_import_root_uses_kiber_managed_staging_area() -> None:
-    assert TELEGRAM_ROOT == Path.home() / ".local/share/kiber-analyst/imports"
+    assert TELEGRAM_ROOT == data_path("imports")
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -46,7 +47,7 @@ def _make_export(root: Path, *, media: bool = False) -> Path:
         message_media = None
     message = {
         "chat_id": CHAT_ID,
-        "date": "2020-02-03T04:05:06+03:00",
+        "date": "2024-02-03T04:05:06+03:00",
         "message_id": 101,
         "media": message_media,
         "reply_to_message_id": None,
@@ -59,7 +60,7 @@ def _make_export(root: Path, *, media: bool = False) -> Path:
     service_event = {
         "actor_id": "7",
         "actor_name": "Fixture Author",
-        "date": "2020-02-03T01:05:06Z",
+        "date": "2024-02-03T01:05:06Z",
         "event_id": 100,
         "message_id": None,
         "new_value": "Тема создана",
@@ -184,6 +185,31 @@ def test_media_metadata_is_checked_and_missing_media_counted(tmp_path: Path) -> 
     assert record["media_type"] == "voice_message"
     assert record["media_path"] == "media/101/audio.ogg"
     assert _source_hashes(topic) == before
+
+
+def test_exporter_media_kind_is_normalized_to_media_type(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    message_path = topic / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"]["kind"] = message["media"].pop("type")
+    messages = _json_bytes(message)
+    _write_private(message_path, messages)
+    manifest_path = topic / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["messages_sha256"] = hashlib.sha256(messages).hexdigest()
+    _write_private(manifest_path, _json_bytes(manifest))
+
+    artifact_dir, _, media_missing = prepare_export(
+        topic, tmp_path / "artifacts" / "job-media-kind", root=root
+    )
+    record = json.loads(
+        (artifact_dir / "normalized" / "messages.jsonl").read_text(encoding="utf-8")
+    )
+
+    assert media_missing == 0
+    assert record["media_type"] == "voice_message"
+    assert record["media_path"] == "media/101/audio.ogg"
 
 
 def test_incomplete_service_export_is_rejected(tmp_path: Path) -> None:

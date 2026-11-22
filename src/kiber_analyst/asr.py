@@ -25,15 +25,13 @@ from kiber_analyst.provider_http import ProfileError, client, load_profile
 
 _LOGGER = logging.getLogger(__name__)
 
-ROTATION_CONFIG_PATH = config_path("processing-policy.yaml")
+ROTATION_CONFIG_PATH = config_path("asr-rotation.yaml")
 MODEL = "whisper-large-v3-turbo"
 LANGUAGE = "ru"
 RESPONSE_FORMAT = "verbose_json"
 MAX_FILE_SIZE_BYTES = 25_000_000
 GLOSSARY_PROMPT = (
-    "Русская речь. Точные написания терминов и имён: Example Station, "
-    "Sample Route, аборги, симилы, телонцы, Скиф, КиберСМЕРШ, "
-    "денацификация, Земной Союз, Советский Союз."
+    "Русская речь. Сохраняй точные написания имён собственных и специальных терминов."
 )
 AUDIO_EXTENSIONS = {
     ".flac",

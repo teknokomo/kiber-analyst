@@ -70,10 +70,12 @@ def parse_date(value: Any) -> tuple[str | None, str | None]:
     return parsed.isoformat(), raw
 
 
-def canonical_chat_id(raw_id: Any) -> str | None:
+def canonical_chat_id(raw_id: Any, chat_type: str | None = None) -> str | None:
     if raw_id is None:
         return None
     value = str(raw_id)
+    if chat_type in {"channel", "supergroup"} and value.isdecimal():
+        return f"-100{value}"
     return value
 
 
@@ -504,7 +506,7 @@ def parse_job(job_dir: Path) -> dict[str, Any]:
             "SELECT chat_index, raw_id, title, chat_type FROM chats ORDER BY chat_index"
         ):
             chat_index, raw_id, title, chat_type = row
-            canonical = canonical_chat_id(raw_id)
+            canonical = canonical_chat_id(raw_id, chat_type)
             if canonical is not None and canonical == target_chat_id:
                 candidates.append((chat_index, canonical, title, chat_type))
         if not candidates and layout == "single":

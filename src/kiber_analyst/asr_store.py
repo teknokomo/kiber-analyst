@@ -51,6 +51,48 @@ def _safe_job_file(root: Path, relative: Any, *, label: str) -> tuple[Path, str]
     return resolved, candidate_path.as_posix()
 
 
+def _selected_manifest_items(
+    raw_items: list[Any], external_refs: list[str] | tuple[str, ...] | set[str] | frozenset[str] | None,
+) -> list[dict[str, Any]]:
+    if external_refs is None:
+        if any(not isinstance(item, dict) for item in raw_items):
+            raise ASRLoadError("Every ASR manifest item must be an object")
+        return raw_items
+    if isinstance(external_refs, (str, bytes)) or not isinstance(
+        external_refs, (list, tuple, set, frozenset)
+    ):
+        raise ASRLoadError("ASR external_refs must be a collection of Telegram references")
+    requested = list(external_refs)
+    if (
+        not requested
+        or any(
+            not isinstance(ref, str) or not _TELEGRAM_REF.fullmatch(ref)
+            for ref in requested
+        )
+        or len(requested) != len(set(requested))
+    ):
+        raise ASRLoadError("ASR external_refs must contain unique valid Telegram references")
+    wanted = set(requested)
+    selected: list[dict[str, Any]] = []
+    found: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise ASRLoadError("Every ASR manifest item must be an object")
+        ref = item.get("external_ref")
+        if not isinstance(ref, str) or ref not in wanted:
+            continue
+        if ref in found:
+            raise ASRLoadError(f"Duplicate ASR external_ref: {ref}")
+        found.add(ref)
+        selected.append(item)
+    missing = wanted - found
+    if missing:
+        raise ASRLoadError(
+            f"ASR manifest is missing selected external_ref: {sorted(missing)[0]}"
+        )
+    return selected
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     try:
@@ -193,7 +235,16 @@ def _item_record(
     item: dict[str, Any],
     root: Path,
     source_snapshot_sha256: str | None,
+    *,
+    result_root: Path | None = None,
+    input_duration_seconds: float | None = None,
 ) -> dict[str, Any]:
+    job_root = root.resolve(strict=True)
+    try:
+        result_base = (result_root or job_root).resolve(strict=True)
+        result_base.relative_to(job_root)
+    except (OSError, ValueError) as exc:
+        raise ASRLoadError("ASR result directory must stay inside the job directory") from exc
     run_key = _run_key(manifest, item)
     external_ref = item.get("external_ref")
     if not isinstance(external_ref, str) or not _TELEGRAM_REF.fullmatch(
@@ -235,18 +286,31 @@ def _item_record(
     ):
         raise ASRLoadError("ASR prompt_sha256 must be a SHA-256 or null")
 
-    duration = _number(
+    manifest_duration = _number(
         item.get("duration_seconds"), label="duration_seconds", nullable=True
     )
+    input_duration = _number(
+        input_duration_seconds, label="input duration_seconds", nullable=True
+    )
+    if (
+        manifest_duration is not None
+        and input_duration is not None
+        and abs(manifest_duration - input_duration) > 1
+    ):
+        raise ASRLoadError(
+            f"ASR input duration differs from manifest by more than 1 second for {external_ref}"
+        )
+    duration = manifest_duration if manifest_duration is not None else input_duration
     result_data: dict[str, Any] | None = None
     result_path: str | None = None
     result_digest: str | None = None
     segments: list[dict[str, Any]] = []
     overall_text = ""
     if status == "complete":
-        result_file, result_path = _safe_job_file(
-            root, item.get("result"), label="result"
+        result_file, _result_relative = _safe_job_file(
+            result_base, item.get("result"), label="result"
         )
+        result_path = result_file.relative_to(job_root).as_posix()
         result_digest = item.get("result_sha256") or item.get("raw_result_sha256")
         if not isinstance(result_digest, str) or not _SHA256.fullmatch(result_digest):
             raise ASRLoadError(f"ASR result_sha256 is missing for {external_ref}")
@@ -335,18 +399,13 @@ def _item_record(
             raise ASRLoadError(
                 f"ASR empty_text_with_tokens_count mismatch for {external_ref}"
             )
-        if not isinstance(item.get("segments_count"), int):
-            raise ASRLoadError(f"ASR segments_count is required for {external_ref}")
-        if not isinstance(item.get("empty_text_count"), int):
-            raise ASRLoadError(f"ASR empty_text_count is required for {external_ref}")
-        if not isinstance(item.get("empty_text_with_tokens_count"), int):
-            raise ASRLoadError(
-                f"ASR empty_text_with_tokens_count is required for {external_ref}"
-            )
     else:
         result_path_value = item.get("result")
         if result_path_value is not None:
-            _, result_path = _safe_job_file(root, result_path_value, label="result")
+            result_file, _result_relative = _safe_job_file(
+                result_base, result_path_value, label="result"
+            )
+            result_path = result_file.relative_to(job_root).as_posix()
         raw_text = item.get("text", "")
         if not isinstance(raw_text, str):
             raise ASRLoadError(f"ASR text must be a string for {external_ref}")
@@ -385,6 +444,9 @@ def _item_record(
         "profile": profile,
         "segments_count": len(segments),
         "empty_text_count": sum(not seg["text"].strip() for seg in segments),
+        "empty_text_with_tokens_count": sum(
+            seg["empty_text_with_tokens"] for seg in segments
+        ),
         "audio_sha256_verified": audio_verified,
         "provider_duration_seconds": (
             result_data.get("duration") if result_data is not None else None
@@ -633,19 +695,30 @@ def load_asr(
     dry_run: bool = False,
     env_path: Path = ENV_PATH,
     report_path: Path | None = None,
+    external_refs: list[str] | tuple[str, ...] | set[str] | frozenset[str] | None = None,
+    input_durations: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     try:
-        manifest = read_json(manifest_path)
         root = job_dir.resolve(strict=True)
+        supplied_manifest_path = Path(manifest_path)
+        if supplied_manifest_path.is_absolute():
+            manifest_relative = supplied_manifest_path.relative_to(root)
+        else:
+            manifest_relative = (Path.cwd() / supplied_manifest_path).relative_to(root)
+        manifest_file, _manifest_relative = _safe_job_file(
+            root, manifest_relative.as_posix(), label="manifest"
+        )
+        manifest = read_json(manifest_file)
     except (OSError, ValueError, TypeError) as exc:
         raise ASRLoadError(
             f"Cannot read ASR job or manifest ({type(exc).__name__})"
         ) from exc
     if not isinstance(manifest, dict):
         raise ASRLoadError("ASR manifest must be a JSON object")
-    raw_items = manifest.get("items")
-    if not isinstance(raw_items, list) or not raw_items:
+    manifest_items = manifest.get("items")
+    if not isinstance(manifest_items, list) or not manifest_items:
         raise ASRLoadError("ASR manifest items must be a non-empty array")
+    raw_items = _selected_manifest_items(manifest_items, external_refs)
     if not isinstance(project, str) or not project.strip():
         raise ASRLoadError("Project slug is required")
     snapshot_sha256 = None
@@ -668,7 +741,16 @@ def load_asr(
     for raw_item in raw_items:
         if not isinstance(raw_item, dict):
             raise ASRLoadError("Every ASR manifest item must be an object")
-        item = _item_record(manifest, raw_item, root, snapshot_sha256)
+        item = _item_record(
+            manifest,
+            raw_item,
+            root,
+            snapshot_sha256,
+            result_root=manifest_file.parent,
+            input_duration_seconds=(input_durations or {}).get(
+                raw_item.get("external_ref")
+            ),
+        )
         if item["external_ref"] in seen_refs:
             raise ASRLoadError(f"Duplicate ASR external_ref: {item['external_ref']}")
         seen_refs.add(item["external_ref"])

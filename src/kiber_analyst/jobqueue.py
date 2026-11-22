@@ -15,12 +15,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from kiber_analyst.config_paths import data_path, runtime_path
+from kiber_analyst.config_paths import data_dir, runtime_path
 from kiber_analyst.errors import IngestError
 
-DEFAULT_DATA_ROOT = data_path()
+DEFAULT_DATA_ROOT = data_dir()
 DEFAULT_SOCKET = runtime_path("control.sock")
 DEFAULT_UUID = os.environ.get("KIBER_ANALYST_DATA_UUID")
+DEFAULT_MOUNT_TARGET = os.environ.get("KIBER_ANALYST_MOUNT_TARGET")
 JOB_STATES = {
     "queued",
     "running",
@@ -272,7 +273,9 @@ class JobStore:
     ) -> None:
         self.data_root = data_root
         self.expected_uuid = expected_uuid
-        self.require_mount = bool(expected_uuid) if require_mount is None else require_mount
+        self.require_mount = (
+            bool(DEFAULT_MOUNT_TARGET) if require_mount is None else require_mount
+        )
         self.db_path = data_root / "queue.db"
         self.jobs_dir = data_root / "jobs"
         self.backups_dir = data_root / "backups"
@@ -281,11 +284,14 @@ class JobStore:
     def verify_storage(self) -> None:
         if not self.require_mount:
             return
-        if not self.expected_uuid:
-            raise JobsError("KIBER_ANALYST_DATA_UUID is required when mount verification is enabled")
+        if not DEFAULT_MOUNT_TARGET:
+            raise JobsError("Required queue mount target is not configured")
+        mount_target = Path(DEFAULT_MOUNT_TARGET)
+        if not _resolved_within(self.data_root, mount_target):
+            raise JobsError("Queue storage must be under the configured mount target")
         try:
             result = subprocess.run(
-                ["findmnt", "--noheadings", "--output", "UUID", "--target", str(self.data_root)],
+                ["findmnt", "--noheadings", "--output", "UUID", "--target", str(mount_target)],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -294,8 +300,8 @@ class JobStore:
         except (OSError, subprocess.TimeoutExpired):
             raise JobsError("Cannot verify the configured queue mount") from None
         actual = result.stdout.strip()
-        if result.returncode != 0 or actual != self.expected_uuid:
-            raise JobsError("Queue disk is not mounted with the expected UUID")
+        if result.returncode != 0 or (self.expected_uuid and actual != self.expected_uuid):
+            raise JobsError("Queue mount is unavailable or has an unexpected identifier")
 
     def initialize(self) -> None:
         self.verify_storage()
@@ -1017,12 +1023,15 @@ class JobStore:
             return cap
 
 
-def mount_ready(expected_uuid: str | None = DEFAULT_UUID, data_root: Path = DEFAULT_DATA_ROOT) -> bool:
-    if not expected_uuid:
+def mount_ready(
+    expected_uuid: str | None = DEFAULT_UUID,
+    mount_target: str | Path | None = DEFAULT_MOUNT_TARGET,
+) -> bool:
+    if mount_target is None:
         return False
     try:
         result = subprocess.run(
-            ["findmnt", "--noheadings", "--output", "UUID", "--target", str(data_root)],
+            ["findmnt", "--noheadings", "--output", "UUID", "--target", str(mount_target)],
             capture_output=True,
             text=True,
             timeout=5,
@@ -1030,4 +1039,6 @@ def mount_ready(expected_uuid: str | None = DEFAULT_UUID, data_root: Path = DEFA
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return result.returncode == 0 and result.stdout.strip() == expected_uuid
+    return result.returncode == 0 and (
+        expected_uuid is None or result.stdout.strip() == expected_uuid
+    )

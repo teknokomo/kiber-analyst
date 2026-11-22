@@ -13,7 +13,7 @@ from kiber_analyst.paths import job_paths, write_json_atomic
 from kiber_analyst.report import build_report
 
 FIXTURES = Path(__file__).parent / "fixtures"
-CHAT_ID = "-1009000"
+CHAT_ID = "-10012345"
 
 
 def make_job(
@@ -60,8 +60,8 @@ def test_topic_scope_without_topic_created_attributes_every_message_to_scope(
         tmp_path,
         "topic_scope_without_topic_created.json",
         scope="topic",
-        scope_topic_id="23",
-        scope_topic_title="Example Station",
+        scope_topic_id="77",
+        scope_topic_title="Sample Station",
     )
     result = parse_job(job)
     parsed = records(job)
@@ -70,9 +70,9 @@ def test_topic_scope_without_topic_created_attributes_every_message_to_scope(
     assert result["topic_created_count"] == 0
     assert result["attribution_counts"] == {"chain": 0, "scope": 2, "none": 0}
     assert [item["attribution"] for item in parsed] == ["scope", "scope"]
-    assert {item["topic_id"] for item in parsed} == {"23"}
+    assert {item["topic_id"] for item in parsed} == {"77"}
     assert len(topics) == 1
-    assert topics[0]["topic_id"] == "23"
+    assert topics[0]["topic_id"] == "77"
     assert "Без установленной темы" not in {item["topic_title"] for item in topics}
 
     report = build_report(job)
@@ -88,7 +88,7 @@ def test_topic_scope_without_topic_created_attributes_every_message_to_scope(
     ]["chain_share"]
     assert "scope авторитетен" in report["attribution_interpretation"]["topic_scope"]
     assert "экспорту всего чата" in report["attribution_interpretation"]["desktop_export"]
-    assert report["messages_by_topic"] == {"23": 2}
+    assert report["messages_by_topic"] == {"77": 2}
 
 
 def test_full_chat_without_topic_chain_is_none_and_has_separate_document_group(
@@ -104,7 +104,7 @@ def test_full_chat_without_topic_chain_is_none_and_has_separate_document_group(
     assert all(item["topic_title"] is None for item in parsed)
     assert all(item["url"] is None for item in parsed)
     assert parsed[0]["meta"]["deep_link"] == (
-        "tg://openmessage?chat_id=-1009000&message_id=201"
+        "tg://openmessage?chat_id=-10012345&message_id=201"
     )
     assert topics == [
         {
@@ -130,17 +130,17 @@ def test_topic_chain_text_entities_dates_media_and_service_messages(
     assert result["service_messages_skipped"] == 1
     assert result["topic_created_count"] == 1
     assert result["attribution_counts"] == {"chain": 2, "scope": 0, "none": 0}
-    assert parsed[0]["topic_id"] == "23"
+    assert parsed[0]["topic_id"] == "77"
     assert parsed[0]["attribution"] == "chain"
-    assert parsed[0]["url"] == "https://t.me/c/9000/23/24"
+    assert parsed[0]["url"] == "https://t.me/c/12345/77/6985"
     assert parsed[0]["text"] == "Сводка: план"
     assert len(parsed[0]["entities"]) == 2
-    assert parsed[0]["date"] == "2020-01-01T10:01:00+03:00"
-    assert parsed[0]["date_raw"] == "2020-01-01T10:01:00"
+    assert parsed[0]["date"] == "2026-11-01T10:01:00+03:00"
+    assert parsed[0]["date_raw"] == "2026-11-01T10:01:00"
     assert parsed[0]["media_type"] == "photo"
     assert parsed[0]["media_path"] == "photos/photo_1.jpg"
     assert parsed[0]["content_hash"].startswith("sha256:")
-    assert parsed[1]["edited_at"] == "2020-01-01T10:03:00+03:00"
+    assert parsed[1]["edited_at"] == "2026-11-01T10:03:00+03:00"
     assert result["links_in_text_count"] == 1
 
 
@@ -148,11 +148,11 @@ def test_explicit_media_type_uses_normalized_or_export_path() -> None:
     assert _media(
         {
             "media_type": "voice_message",
-            "file": "voice_messages/audio_1.ogg",
+            "file": "voice_messages/audio_1@13-02-2023_00-41-30.ogg",
         }
     ) == (
         "voice_message",
-        "voice_messages/audio_1.ogg",
+        "voice_messages/audio_1@13-02-2023_00-41-30.ogg",
     )
     assert _media(
         {
@@ -178,7 +178,8 @@ def test_broken_reply_chains_are_counted_and_fall_back_to_chat_none(
     paths["unpacked"].mkdir(parents=True)
     paths["normalized"].mkdir()
     export = {
-        "id": -1009000,
+        "id": 12345,
+        "type": "supergroup",
         "name": "Test chat",
         "messages": [
             {"id": 1, "type": "message", "reply_to_message_id": 900, "text": "missing"},
@@ -204,8 +205,8 @@ def test_report_rejects_attribution_total_mismatch(tmp_path: Path) -> None:
         tmp_path,
         "topic_scope_without_topic_created.json",
         scope="topic",
-        scope_topic_id="23",
-        scope_topic_title="Example Station",
+        scope_topic_id="77",
+        scope_topic_title="Sample Station",
     )
     parse_job(job)
     paths = job_paths(job)

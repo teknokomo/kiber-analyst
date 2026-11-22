@@ -16,10 +16,7 @@ from kiber_analyst.parse import _make_url, normalized_content_hash
 from kiber_analyst.paths import job_paths, write_json_atomic
 
 TELEGRAM_ROOT = Path(
-    os.environ.get(
-        "KIBER_ANALYST_TELEGRAM_ROOT",
-        str(data_path("imports")),
-    )
+    os.environ.get("KIBER_ANALYST_TELEGRAM_ROOT", str(data_path("imports")))
 )
 _MAX_LINE_BYTES = 4 * 1024 * 1024
 _EVENT_TYPES = {
@@ -262,7 +259,11 @@ def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed:
         return None, None, False, {}
     if not isinstance(value, dict):
         raise LoadError("Telegram message media metadata is invalid")
-    media_type = value.get("type", value.get("media_type"))
+    media_type = value.get("type")
+    if media_type is None:
+        media_type = value.get("media_type")
+    if media_type is None:
+        media_type = value.get("kind")
     if media_type is not None and (
         not isinstance(media_type, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", media_type)
     ):
@@ -421,7 +422,7 @@ def load_telegram_export(
     artifact_dir: Path,
     *,
     env_path: Path,
-    project_slug: str = "sample-project",
+    project_slug: str = "default",
     dry_run: bool = False,
     root: Path = TELEGRAM_ROOT,
 ) -> dict[str, Any]:

@@ -11,6 +11,7 @@ from kiber_analyst.asr_store import (
     _find_audio_file,
     _item_record,
     _run_status,
+    _selected_manifest_items,
 )
 
 
@@ -52,7 +53,7 @@ def _fixture_item(
     }
     item = {
         "run_key": "run-fixture",
-        "external_ref": "tg:-1009000:1101",
+        "external_ref": "tg:-10012345:10367",
         "media_path": "chats/topic/voice.ogg",
         "audio_sha256": "b" * 64,
         "duration_seconds": 1.5,
@@ -94,6 +95,63 @@ def test_asr_load_manifest_validates_external_ref_file_and_hash(tmp_path: Path) 
     bad_hash = dict(item, result_sha256="0" * 64)
     with pytest.raises(ASRLoadError, match="SHA-256 mismatch"):
         _item_record(manifest, bad_hash, tmp_path, None)
+
+
+def test_asr_result_path_is_relative_to_nested_run_manifest(tmp_path: Path) -> None:
+    manifest, item = _fixture_item(tmp_path)
+    source_result = tmp_path / item["result"]
+    run_dir = tmp_path / "asr" / "batches" / "run-fixture"
+    results_dir = run_dir / "results"
+    results_dir.mkdir(parents=True)
+    result_file = results_dir / "result.json"
+    result_file.write_bytes(source_result.read_bytes())
+    item["result"] = "results/result.json"
+
+    record = _item_record(manifest, item, tmp_path, None, result_root=run_dir)
+
+    assert record["raw_json_path"] == "asr/batches/run-fixture/results/result.json"
+    assert record["raw_json_sha256"] == item["result_sha256"]
+
+
+def test_asr_load_uses_ffprobe_duration_when_manifest_omits_it(tmp_path: Path) -> None:
+    manifest, item = _fixture_item(tmp_path)
+    item.pop("duration_seconds")
+    item.pop("segments_count")
+    item.pop("empty_text_count")
+    item.pop("empty_text_with_tokens_count")
+
+    record = _item_record(
+        manifest, item, tmp_path, None, input_duration_seconds=1.5
+    )
+
+    assert record["duration_seconds"] == 1.5
+    assert record["meta"]["provider_duration_seconds"] == 1.5
+    assert record["meta"]["segments_count"] == 1
+    assert record["meta"]["empty_text_count"] == 0
+    assert record["meta"]["empty_text_with_tokens_count"] == 0
+
+    with pytest.raises(ASRLoadError, match="duration differs"):
+        _item_record(manifest, item, tmp_path, None, input_duration_seconds=8.0)
+
+
+def test_asr_loader_selection_ignores_unrequested_pending_items() -> None:
+    selected_refs = [f"tg:-10012345:{message_id}" for message_id in range(1, 10)]
+    manifest_items = [
+        {"external_ref": ref, "status": "complete"} for ref in selected_refs
+    ]
+    manifest_items.extend(
+        {"external_ref": f"tg:-10012345:{message_id}", "status": "pending"}
+        for message_id in range(10, 220)
+    )
+
+    selected = _selected_manifest_items(manifest_items, selected_refs)
+
+    assert len(manifest_items) == 219
+    assert len(selected) == 9
+    assert {item["external_ref"] for item in selected} == set(selected_refs)
+    assert all(item["status"] == "complete" for item in selected)
+    with pytest.raises(ASRLoadError, match="missing selected external_ref"):
+        _selected_manifest_items(manifest_items, ["tg:-10012345:9999"])
 
 
 def test_asr_load_rejects_absolute_traversal_and_symlink_paths(tmp_path: Path) -> None:
@@ -168,5 +226,5 @@ def test_migration_0003_self_registers_and_does_not_change_prior_migrations() ->
     skill_migration_path = (
         root / "skills" / "telegram-ingest" / "migrations" / "0002_telegram.sql"
     )
-    if skill_migration_path.exists():
+    if skill_migration_path.is_file():
         assert skill_migration_path.read_bytes() == migration_path.read_bytes()

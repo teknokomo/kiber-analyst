@@ -48,14 +48,14 @@ class _Connection(_Transaction):
 def test_asr_source_overview_is_read_only_and_counts_done_failed_and_skipped(monkeypatch):
     moment = datetime(2026, 11, 20, tzinfo=UTC)
     rows = [
-        ('tg:-1001:1', 'media/1/a.ogg', 100, 'complete', 200, None,
+        ('tg:-1001:1', 'voice_message', 'media/1/a.ogg', 100, 'complete', 200, None,
          'run-a', 4, 1, moment, moment),
-        ('tg:-1001:2', 'media/2/b.ogg', 100, 'failed', 429, 'RateLimitError',
+        ('tg:-1001:2', 'audio', 'media/2/b.ogg', 100, 'failed', 429, 'RateLimitError',
          'run-a', 0, 0, moment, moment),
-        ('tg:-1001:3', None, None, None, None, None, None, 0, 0, None, None),
-        ('tg:-1001:4', 'media/4/d.ogg', 100 * 1024**2 + 1, None, None,
+        ('tg:-1001:3', 'audio', None, None, None, None, None, None, 0, 0, None, None),
+        ('tg:-1001:4', 'audio', 'media/4/d.ogg', 100 * 1024**2 + 1, None, None,
          None, None, 0, 0, None, None),
-        ('tg:-1001:5', 'media/5/e.ogg', 25_000_001, None, None,
+        ('tg:-1001:5', 'audio', 'media/5/e.ogg', 25_000_001, None, None,
          None, None, 0, 0, None, None),
     ]
     conn = _Connection(rows)
@@ -67,11 +67,16 @@ def test_asr_source_overview_is_read_only_and_counts_done_failed_and_skipped(mon
     )
 
     assert {key: result[key] for key in (
-        'files_total', 'files_done', 'files_failed', 'files_skipped',
-        'files_pending', 'segments', 'empty', 'last_error_code',
+        'files_total', 'files_eligible', 'files_done', 'files_failed',
+        'files_skipped', 'files_pending', 'skipped_by_reason',
+        'segments', 'empty', 'last_error_code',
     )} == {
-        'files_total': 5, 'files_done': 1, 'files_failed': 1, 'files_skipped': 3,
-        'files_pending': 0, 'segments': 4, 'empty': 1, 'last_error_code': 'HTTP_429',
+        'files_total': 5, 'files_eligible': 2, 'files_done': 1,
+        'files_failed': 1, 'files_skipped': 3, 'files_pending': 0,
+        'skipped_by_reason': {
+            'missing_media': 1, 'over_100_MiB': 1, 'provider_file_limit': 1,
+        },
+        'segments': 4, 'empty': 1, 'last_error_code': 'HTTP_429',
     }
     assert result['completed_refs'] == ['tg:-1001:1']
     assert result['failed_refs'] == ['tg:-1001:2']
@@ -81,6 +86,19 @@ def test_asr_source_overview_is_read_only_and_counts_done_failed_and_skipped(mon
         query.lstrip().startswith(('SELECT', 'WITH', 'SET'))
         for query, _ in conn.statements
     )
+    source_query, source_params = next(
+        (query, params) for query, params in conn.statements
+        if query.lstrip().startswith('WITH source AS')
+    )
+    assert "g.meta->>'media_type' = ANY(%s)" in source_query
+    assert "substring(g.meta->>'media_path'" not in source_query
+    assert source_params[-1] == list(asr_source_overview._AUDIO_TYPES)
+
+
+def test_asr_source_overview_does_not_classify_mp4_without_audio_media_type():
+    assert 'mp4' not in asr_source_overview._AUDIO_TYPES
+    assert "g.meta->>'media_type' = ANY(%s)" in asr_source_overview._ROWS_SQL
+    assert "lower(substring(g.meta->>'media_path'" not in asr_source_overview._ROWS_SQL
 
 
 def test_asr_source_overview_rejects_untrusted_source_before_database_access(monkeypatch):

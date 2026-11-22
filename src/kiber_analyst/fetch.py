@@ -37,7 +37,10 @@ def _rclone(args: list[str]) -> str:
     except OSError as exc:
         raise FetchError(f"Cannot start rclone: {exc}") from exc
     if result.returncode:
-        raise FetchError(f"rclone exited with status {result.returncode}")
+        detail = (result.stderr or result.stdout).strip()
+        raise FetchError(
+            f"rclone exited with status {result.returncode}: {detail or 'no diagnostic'}"
+        )
     return result.stdout.strip()
 
 
@@ -87,26 +90,23 @@ def _validate_zip(archive: Path, unpacked: Path) -> str:
 
 
 def fetch_archive(
-    archive_uri: str | None = None,
+    archive_uri: str,
     work_root: Path | None = None,
     *,
-    scope: str = "topic",
+    scope: str = "chat",
     topic_id: str | None = None,
     topic_title: str | None = None,
-    chat_id: str | None = None,
+    chat_id: str,
     expected_md5: str | None = None,
     expected_size: int | None = None,
 ) -> Path:
-    if not isinstance(archive_uri, str) or not archive_uri.strip():
-        raise FetchError("archive_uri is required")
-    if not isinstance(chat_id, str) or not chat_id.strip():
-        raise FetchError("chat_id is required")
-    if work_root is None:
-        work_root = data_path("telegram")
     if scope not in {"topic", "chat"}:
         raise FetchError("scope must be 'topic' or 'chat'")
     if scope == "topic" and not topic_id:
         raise FetchError("topic scope requires topic_id")
+    if not archive_uri or not chat_id:
+        raise FetchError("archive_uri and chat_id are required")
+    work_root = work_root or data_path("jobs")
     archive_name = Path(archive_uri.rsplit("/", 1)[-1]).stem
     slug = re.sub(r"[^a-z0-9-]+", "-", archive_name.lower()).strip("-")
     job_name = f"{datetime.now(UTC):%Y%m%d}-{slug or 'telegram'}"
@@ -130,14 +130,23 @@ def fetch_archive(
 
     remote_sum = _rclone(["md5sum", archive_uri]).split()
     local_md5 = _digest(archive_path, "md5")
-    remote_md5 = remote_sum[0].lower() if remote_sum else None
-    if remote_md5 is None or local_md5.lower() != remote_md5:
-        raise FetchError("Downloaded archive checksum does not match the remote checksum")
-    if expected_md5 is not None and local_md5.lower() != expected_md5.lower():
-        raise FetchError("Downloaded archive checksum does not match the expected checksum")
+    remote_md5 = remote_sum[0].lower() if remote_sum else ""
+    if not re.fullmatch(r"[0-9a-f]{32}", remote_md5):
+        raise FetchError("Remote archive checksum is unavailable")
+    if expected_md5 and remote_md5 != expected_md5.lower():
+        raise FetchError(
+            f"Remote MD5 mismatch: expected {expected_md5}, got "
+            f"{remote_md5}"
+        )
+    if local_md5.lower() != remote_md5:
+        raise FetchError(
+            f"Downloaded archive MD5 mismatch: expected {remote_md5}, got {local_md5}"
+        )
     size_bytes = archive_path.stat().st_size
     if expected_size is not None and size_bytes != expected_size:
-        raise FetchError("Downloaded archive size does not match the expected size")
+        raise FetchError(
+            f"Archive size mismatch: expected {expected_size}, got {size_bytes}"
+        )
 
     result_member = _validate_zip(archive_path, paths["unpacked"])
     manifest = {

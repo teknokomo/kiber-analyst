@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Updated import, media, ASR, embedding, queue, and search workflows.
+- Added database-backed ASR results and separate ASR embeddings.
+- Generalized configuration and data locations for user-managed installations.
+
 ## 0.1.0 — 2026-11-21
 
 First public release.
