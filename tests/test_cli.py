@@ -33,7 +33,7 @@ def test_entry_point_reports_canonical_name(capsys) -> None:
         assert exc.code == 0
     else:
         raise AssertionError("--version must exit")
-    assert capsys.readouterr().out.startswith("kiber-analyst ")
+    assert capsys.readouterr().out.startswith("kiber-analyst 0.1.0 ")
 
 
 def test_cli_parses_asr_load_embed_and_search_source_filter(tmp_path: Path) -> None:

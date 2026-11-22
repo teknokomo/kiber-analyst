@@ -1,12 +1,16 @@
 # Kiber-analyst
 
-Kiber-analyst is a Python toolkit for importing structured Telegram Desktop exports into a PostgreSQL knowledge base. It supports service-event provenance, media metadata, optional embeddings, hybrid search, speech transcription, a durable job queue, and read-only MCP tools.
+Kiber-analyst is a Python toolkit for importing structured Telegram Desktop JSON exports into a PostgreSQL knowledge base. It normalizes messages and service events, tracks media references and missing files, creates embeddings, and supports hybrid full-text/vector search. A read-only MCP server, durable job worker, and restricted broker are included for controlled integrations.
+
+## Version 0.1.0 scope
+
+This release covers Telegram JSON ingestion, message and service-event storage, media metadata and `media_missing` reports, embeddings, hybrid/FTS search, read-only MCP, durable jobs, and the allowlisted broker API. The release is limited to those documented workflows; other media processing and external connectors are out of scope.
 
 ## Requirements
 
 - Python 3.12 or newer
-- PostgreSQL for database-backed operations
-- Optional provider credentials and network access for embeddings and speech transcription
+- PostgreSQL with the schema migrations in `migrations/` for database-backed operations
+- Optional provider credentials and network access only for embedding operations
 
 ## Install
 
@@ -14,73 +18,69 @@ Kiber-analyst is a Python toolkit for importing structured Telegram Desktop expo
 python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -e '.[db,embedding,asr,mcp,test]'
+pip install -e .
 kiber-analyst --version
 kiber-analyst --help
 ```
 
-## Import a Telegram export
-
-Supply the archive URI, chat identifier, and an output directory for each run. No source, project, or archive is built into the CLI.
+Install only the extras needed for your workflow:
 
 ```bash
-kiber-analyst telegram fetch \
-  --archive <archive-uri> \
-  --chat-id <chat-id> \
-  --scope chat \
-  --work-root <job-directory>
-kiber-analyst telegram parse --job <job-directory>/<job-id>
-kiber-analyst telegram report --job <job-directory>/<job-id>
+pip install -e '.[db]'          # PostgreSQL load and search
+pip install -e '.[embedding]'   # embeddings and vector query support
+pip install -e '.[mcp]'         # read-only MCP server
+pip install -e '.[test]'        # tests and Ruff
 ```
 
-For a topic-scoped export, use `--scope topic --topic-id <topic-id>`. Review the manifest, hashes, media references, and report before loading data. Apply the matching SQL migrations with an appropriately privileged database role, then run:
+## Parse a synthetic export
+
+The example contains invented messages and no media or credentials. Copy it before running because parsing writes normalized output beside the input.
 
 ```bash
-kiber-analyst telegram load --job <job-directory>/<job-id> --dry-run
-kiber-analyst telegram load --job <job-directory>/<job-id>
+workdir="$(mktemp -d)"
+cp -R examples/synthetic/archive-job "$workdir/job"
+kiber-analyst telegram parse --job "$workdir/job"
+cat "$workdir/job/normalized/manifest.json"
 ```
 
-`--dry-run` executes the import transaction and rolls it back. PostgreSQL integration tests must use an isolated disposable database.
+The prepared example records are in `examples/synthetic/telegram-topic/`. They demonstrate the message, service-event, and manifest shapes without requiring an account or external service.
 
-## Embeddings, search, and ASR
+## Main workflow
 
-Configure provider profiles, credentials, proxies, and database access in the local configuration directory (`$XDG_CONFIG_HOME/kiber-analyst`, defaulting to `~/.config/kiber-analyst`). Keep credentials out of the repository.
+1. Fetch an archive from a location configured for your environment, or unpack it yourself. Fetch requires an explicit archive URI and chat identifier; it has no embedded archive or source defaults.
+2. Parse `result.json` into normalized JSONL and a report.
+3. Review hashes, source scope, media references, and missing-media counts.
+4. Load into PostgreSQL only after applying the matching migrations with an appropriately privileged database role.
+5. Optionally create embeddings and run hybrid search.
+6. Use the read-only MCP process or restricted broker when an agent needs bounded access.
 
-```bash
-kiber-analyst embed --job <job-directory>/<job-id>
-kiber-analyst search --query "<query>" --project <project-slug>
-kiber-analyst telegram asr --job <job-directory>/<job-id>
-kiber-analyst asr embed --all-runs --project <project-slug>
-```
+## Roadmap
 
-ASR requires an explicit job and configured provider profiles. Missing, unsupported, or oversized media is reported rather than downloaded without a bound. ASR output is stored separately from the original message text.
+Possible future work includes additional input adapters, operational tooling, and usability improvements. This is exploratory only; there are no promised dates or committed scope beyond this release.
 
-## MCP and worker
-
-The optional MCP package exposes read-only knowledge tools. The worker stores queue state under `$XDG_DATA_HOME/kiber-analyst` (default `~/.local/share/kiber-analyst`) and uses `$XDG_RUNTIME_DIR/kiber-analyst` for its control socket when available. These locations can be overridden with `KIBER_ANALYST_DATA_ROOT` and `KIBER_ANALYST_SOCKET`.
-
-See [MCP_READONLY.md](docs/MCP_READONLY.md), [security guidance](docs/security.md), and [installation notes](docs/installation.md) for configuration details.
+Typical commands are available with `kiber-analyst --help`. The input path, project slug, model, and provider settings must be supplied or configured for the local environment; no production account or source is built in.
 
 ## Tests and checks
 
 ```bash
+pip install -e '.[test,db,embedding,mcp]'
 pytest -q
 ruff check .
 python -m compileall -q src
 python scripts/public_release_scan.py
 ```
 
-The repository includes synthetic examples that can be copied and parsed without a provider account or database:
+PostgreSQL integration tests are skipped unless an isolated disposable test database is explicitly configured. Never point those tests at production data.
 
-```bash
-workdir="$(mktemp -d)"
-cp -R examples/synthetic/archive-job "$workdir/job"
-kiber-analyst telegram parse --job "$workdir/job"
-```
+## Architecture and security
 
-## Security
+- `src/kiber_analyst/` contains the CLI, parser, loader, search core, job worker, and restricted broker.
+- `src/kiber_analyst_mcp/` exposes read-only tools and does not import write paths.
+- `migrations/` defines the required database objects and reader permissions.
+- `docs/` describes the data flow, schema, installation, search, and security boundaries.
+- `examples/synthetic/` and `tests/` contain invented data only.
 
-Never commit API keys, proxy credentials, bearer tokens, database passwords, personal data, or production exports. Bind MCP to loopback unless a separately reviewed authenticated gateway is used. Keep provider and database credentials in files outside the repository with restrictive permissions. See [SECURITY.md](SECURITY.md).
+Provider keys and proxy credentials belong in local configuration files or a secret manager; never commit them. The MCP listener should bind to loopback and use a read-only database role. The broker accepts only its configured source allowlist and fixed operations; do not expose its socket to untrusted users. See [SECURITY.md](SECURITY.md) and [docs/security.md](docs/security.md).
 
 ## License
 

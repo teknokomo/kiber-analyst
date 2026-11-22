@@ -5,9 +5,9 @@ The `kiber_analyst_mcp` package exposes search, document reading, project listin
 ## Tools
 
 - `search`: hybrid full-text and vector search with project, source, date, author, and topic filters. The worker obtains query embeddings through its configured provider profiles; the MCP process does not read provider credentials.
-- `get_document`: returns document metadata and keyset-paginated segments. Linked ASR results are returned separately from original message text.
+- `get_document`: returns document metadata and keyset-paginated segments.
 - `list_projects`: lists projects with independent aggregate counts.
-- `ingest_status`: reports import, ASR, embedding, and snapshot counts without exposing internal paths or complete metadata records.
+- `ingest_status`: reports import, embedding, and snapshot counts without exposing internal paths or complete metadata records.
 
 When vector search is unavailable, search can return a full-text result with `degraded=true` and a safe reason. Query text is not written to logs or queue state; only a digest may be retained for operational auditing.
 

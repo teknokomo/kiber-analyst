@@ -1,12 +1,22 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kiber-analyst"
-version = "0.4.2"
-description = "Python tools for importing, enriching, and searching structured source data"
-requires-python = ">=3.12,<3.15"
+version = "0.1.0"
+description = "A Python toolkit for importing and searching structured source archives"
+readme = "README.md"
+license = "LicenseRef-Omsk-Open-License-0.2.0"
+license-files = ["LICENSE", "LICENSE-RU.md"]
+requires-python = ">=3.12"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: Text Processing :: Indexing",
+]
 dependencies = [
   "ijson>=3.3,<4",
   "python-dotenv>=1.0,<2",
@@ -31,6 +41,8 @@ mcp = [
 [project.scripts]
 kiber-analyst = "kiber_analyst.cli:main"
 kiber-analyst-worker = "kiber_analyst.worker:_main"
+kiber-analyst-broker = "kiber_analyst.broker:main"
+kiber-analyst-broker-client = "kiber_analyst.broker_client:main"
 kiber-analyst-queue-backup = "kiber_analyst.queue_backup:main"
 kiber-analyst-backup = "kiber_analyst.backup:main"
 kiber-analyst-queue-restore = "kiber_analyst.queue_restore:main"
