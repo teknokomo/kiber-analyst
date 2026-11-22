@@ -27,7 +27,7 @@ def _json_bytes(value: object) -> bytes:
 
 
 def _fixture(root: Path) -> Path:
-    chat_id = "-1009000"
+    chat_id = "-10012345"
     topic_id = 1
     source_id = f"telegram:{chat_id}:topic:{topic_id}"
     topic = root / chat_id / str(topic_id)
@@ -35,7 +35,7 @@ def _fixture(root: Path) -> Path:
     topic.chmod(0o700)
     message = {
         "chat_id": chat_id,
-        "date": "2020-02-03T04:05:06+03:00",
+        "date": "2024-02-03T04:05:06+03:00",
         "message_id": 101,
         "media": None,
         "reply_to_message_id": None,
@@ -47,7 +47,7 @@ def _fixture(root: Path) -> Path:
     event = {
         "actor_id": "7",
         "actor_name": "Fixture Author",
-        "date": "2020-02-03T01:05:06Z",
+        "date": "2024-02-03T01:05:06Z",
         "event_id": 100,
         "message_id": None,
         "new_value": "Тема создана",
@@ -113,7 +113,7 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_pat
             """SELECT count(*) FROM sources
                WHERE external_id = %s AND project_id IN
                  (SELECT id FROM projects WHERE slug = %s)""",
-            ("-1009000", project_slug),
+            ("-10012345", project_slug),
         ).fetchone()[0] == 0
 
     export_root = tmp_path / "telegram"
@@ -156,7 +156,7 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_pat
         project_id = conn.execute("SELECT id FROM projects WHERE slug=%s", (project_slug,)).fetchone()[0]
         source_id = conn.execute(
             "SELECT id FROM sources WHERE project_id=%s AND external_id=%s",
-            (project_id, "-1009000"),
+            (project_id, "-10012345"),
         ).fetchone()[0]
         assert conn.execute(
             """SELECT count(*) FROM segments seg JOIN documents doc ON doc.id=seg.document_id

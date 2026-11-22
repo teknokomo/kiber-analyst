@@ -171,8 +171,8 @@ def test_rotation_defaults_to_five_cycles_and_glossary(tmp_path: Path) -> None:
     config_path = write_config(tmp_path / "rotation.yaml", ["groq_asr"])
     config = load_rotation_config(config_path)
     assert config.max_cycles == 5
-    assert "Example Station" in config.prompt
-    assert "Советский Союз" in config.prompt
+    assert "специальных терминов" in config.prompt
+    assert config.prompt.startswith("Русская речь.")
 
 
 def test_transient_error_rotates_to_next_profile_and_saves_private_raw_json(
@@ -191,7 +191,7 @@ def test_transient_error_rotates_to_next_profile_and_saves_private_raw_json(
     assert requests[0]["language"] == "ru"
     assert requests[0]["response_format"] == "verbose_json"
     assert requests[0]["temperature"] == 0
-    assert "Example Station" in requests[0]["prompt"]
+    assert "специальных терминов" in requests[0]["prompt"]
 
     item = report["items"][0]
     result_path = Path(report["run_dir"]) / item["result"]

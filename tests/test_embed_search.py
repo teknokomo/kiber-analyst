@@ -19,8 +19,8 @@ def test_normalized_messages_are_adapted_to_segment_input(tmp_path: Path) -> Non
     messages.write_text(
         json.dumps(
             {
-                "chat_id": "-1009000",
-                "message_id": "1007",
+                "chat_id": "-10012345",
+                "message_id": "7087",
                 "content_hash": "sha256:abc",
                 "text": "Текст сообщения",
             },
@@ -34,7 +34,7 @@ def test_normalized_messages_are_adapted_to_segment_input(tmp_path: Path) -> Non
 
     assert result == [
         {
-            "external_ref": "tg:-1009000:1007",
+            "external_ref": "tg:-10012345:7087",
             "content_hash": "sha256:abc",
             "text": "Текст сообщения",
         }
@@ -179,6 +179,6 @@ def test_cli_registers_embed_and_search_commands() -> None:
 def test_search_cli_accepts_an_exact_source_id_filter() -> None:
     args = _parser().parse_args([
         "search", "query", "--project", "sample-project",
-        "--source-id", "telegram:-1009000:topic:1",
+        "--source-id", "telegram:-10012345:topic:1",
     ])
-    assert args.source_id == "telegram:-1009000:topic:1"
+    assert args.source_id == "telegram:-10012345:topic:1"

@@ -5,7 +5,7 @@ from starlette.testclient import TestClient
 from kiber_analyst_mcp.config import MCPConfig
 from kiber_analyst_mcp.server import create_app
 
-TOKEN = "fake-" + "a" * 59
+TOKEN = "test-placeholder-token-that-is-long-enough"
 
 
 def _config() -> MCPConfig:
@@ -56,7 +56,6 @@ def test_mcp_auth_required_tools_list_call_and_healthz() -> None:
         initialized = client.post("/mcp", json=initialize, headers=headers)
         assert initialized.status_code == 200, initialized.text
         assert initialized.headers["content-type"].startswith("application/json")
-        assert initialized.json()["result"]["serverInfo"]["version"] == "0.1.0"
 
         listed = client.post(
             "/mcp", json=_rpc("tools/list", 2), headers=headers

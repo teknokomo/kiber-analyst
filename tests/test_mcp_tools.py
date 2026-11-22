@@ -17,7 +17,7 @@ from kiber_analyst_mcp.tools import ToolFailure, ToolService
 
 PROJECT_ID = "00000000-0000-0000-0000-000000000001"
 DOCUMENT_ID = "00000000-0000-0000-0000-000000000002"
-CREATED_AT = datetime(2020, 1, 2, tzinfo=UTC)
+CREATED_AT = datetime(2026, 11, 7, tzinfo=UTC)
 
 
 class FakeCursor:
@@ -45,12 +45,12 @@ class FakeCursor:
             self.rows = self.connection.search_rows(params)
             return
         if "SELECT d.id,so.kind,d.doc_type" in query:
-            self.rows = [(DOCUMENT_ID, "telegram", "export", "ru", CREATED_AT, 12, 3)]
+            self.rows = [(DOCUMENT_ID, "telegram", "export", "ru", CREATED_AT, 403, 9)]
             return
         if "FROM segments WHERE document_id=%s AND id>%s" in query:
             assert isinstance(params, tuple)
             _document, after, limit = params
-            self.rows = [self.connection.segment_row(i) for i in range(after + 1, min(13, after + limit + 1))]
+            self.rows = [self.connection.segment_row(i) for i in range(after + 1, min(404, after + limit + 1))]
             return
         if query.startswith("SELECT r.external_ref,ar.run_key,ar.model,ar.language"):
             assert isinstance(params, tuple)
@@ -62,7 +62,7 @@ class FakeCursor:
             ]
             return
         if "SELECT p.slug,p.title" in query:
-            self.rows = [("sample-project", "Example Group", 1, 1, 12, 2, 3, 8, 14)]
+            self.rows = [("sample-project", "Great Ring", 1, 1, 403, 2, 9, 704, 1062)]
             return
         if query.startswith("SELECT id FROM projects WHERE slug=%s"):
             self.rows = [(PROJECT_ID,)]
@@ -77,7 +77,7 @@ class FakeCursor:
             self.rows = [("topic", "a" * 64, CREATED_AT)]
             return
         if "SELECT\n                          (SELECT count(*) FROM sources" in query:
-            self.rows = [(1, 1, 12, 2, 3, 8, 4, 6, 8)]
+            self.rows = [(1, 1, 403, 2, 9, 704, 10, 681, 381)]
             return
         raise AssertionError(f"Unexpected SQL: {query[:100]}")
 
@@ -92,7 +92,7 @@ class FakeConnection:
     def __init__(self, *, asr_refs: set[str] | None = None, source_exists: bool = True) -> None:
         self.statements: list[tuple[str, object]] = []
         self.search_params: list[dict] = []
-        self.asr_refs = asr_refs or {f"tg:message:{i}" for i in range(1, 4)}
+        self.asr_refs = asr_refs or {f"tg:message:{i}" for i in range(1, 10)}
         self.source_exists = source_exists
 
     def __enter__(self) -> Self:
@@ -107,16 +107,16 @@ class FakeConnection:
     def search_rows(self, params: dict) -> list[tuple]:
         segment = (
             "segment", 11, None, DOCUMENT_ID, None, None, None, 0.031,
-            "source message", "https://t.me/example", CREATED_AT, "Example Author",
-            "telegram", "sample-project", "telegram:-1009000:topic:23",
-            "-1009000", "Group title", "23", "Example Subject", "1007",
+            "source message", "https://t.me/example", CREATED_AT, "Test User",
+            "telegram", "sample-project", "telegram:-10012345:topic:77",
+            "-10012345", "Group title", "77", "Kibervoyna", "7087",
         )
         asr = (
             "asr", 12, 22, DOCUMENT_ID, "00000000-0000-0000-0000-000000000003",
             1200, 3500, 0.029, "recognized speech", "https://t.me/example",
-            CREATED_AT, "Example Author", "telegram", "sample-project",
-            "telegram:-1009000:topic:23", "-1009000",
-            "Group title", "23", "Example Subject", "1007",
+            CREATED_AT, "Test User", "telegram", "sample-project",
+            "telegram:-10012345:topic:77", "-10012345",
+            "Group title", "77", "Kibervoyna", "7087",
         )
         source = params["source"]
         if source == "segment":
@@ -131,11 +131,11 @@ class FakeConnection:
             number,
             f"tg:message:{number}",
             CREATED_AT,
-            "Example Author",
+            "Test User",
             f"message {number}",
             "https://t.me/example",
-            "voice_message" if number <= 3 else None,
-            "23",
+            "voice_message" if number <= 9 else None,
+            "77",
         )
 
 
@@ -196,17 +196,17 @@ def test_mcp_search_uses_shared_core_for_segment_asr_and_union(
 ) -> None:
     connection = FakeConnection()
     result = _service(connection).search(
-        "Sample Station", "sample-project", source=source,
-        date_from="2020-01-01", date_to="2020-02-01", author="Example Author", topic="23",
+        "Космостанция", "sample-project", source=source,
+        date_from="2023-01-01", date_to="2026-11-07", author="Test User", topic="77",
     )
 
     assert [row["source"] for row in result["results"]] == expected_sources
     assert result["mode"] == "hybrid"
     assert connection.search_params[-1]["source"] == (None if source == "all" else source)
-    assert connection.search_params[-1]["author"] == "Example Author"
-    assert connection.search_params[-1]["topic"] == "23"
-    assert connection.search_params[-1]["date_from"] == "2020-01-01"
-    assert connection.search_params[-1]["date_to"] == "2020-02-01"
+    assert connection.search_params[-1]["author"] == "Test User"
+    assert connection.search_params[-1]["topic"] == "77"
+    assert connection.search_params[-1]["date_from"] == "2023-01-01"
+    assert connection.search_params[-1]["date_to"] == "2026-11-07"
     assert any(query == SEARCH_SQL for query, _ in connection.statements)
 
 
@@ -229,15 +229,15 @@ def test_shared_search_filters_by_source_and_returns_telegram_provenance() -> No
     connection = FakeConnection()
     result = execute_search(
         connection, "topic query", project="sample-project", vector=[0.0] * DIMENSIONS,
-        source_id="telegram:-1009000:topic:23", limit=5,
+        source_id="telegram:-10012345:topic:77", limit=5,
     )
 
     item = result["results"][0]
-    assert connection.search_params[-1]["source_id"] == "telegram:-1009000:topic:23"
-    assert item["source_id"] == "telegram:-1009000:topic:23"
-    assert (item["chat_id"], item["chat_title"]) == ("-1009000", "Group title")
+    assert connection.search_params[-1]["source_id"] == "telegram:-10012345:topic:77"
+    assert item["source_id"] == "telegram:-10012345:topic:77"
+    assert (item["chat_id"], item["chat_title"]) == ("-10012345", "Group title")
     assert (item["topic_id"], item["topic_title"], item["message_id"]) == (
-        "23", "Example Subject", "1007",
+        "77", "Kibervoyna", "7087",
     )
 
 
@@ -245,7 +245,7 @@ def test_shared_search_reports_missing_source_or_topic() -> None:
     with pytest.raises(SearchError, match="source or topic"):
         execute_search(
             FakeConnection(source_exists=False), "query", project="sample-project",
-            vector=None, source_id="telegram:-1009000:topic:999999",
+            vector=None, source_id="telegram:-10012345:topic:999999",
         )
 
 
@@ -256,10 +256,10 @@ def test_mcp_invalid_search_input_is_rejected_before_database_or_worker() -> Non
     with pytest.raises(ToolFailure, match="limit"):
         service.search("query", "sample-project", limit=51)
     with pytest.raises(ToolFailure, match="date_from"):
-        service.search("query", "sample-project", date_from="2021-01-01", date_to="2020-01-01")
+        service.search("query", "sample-project", date_from="2026-01-01", date_to="2025-01-01")
 
 
-def test_mcp_get_document_keyset_pages_return_synthetic_segments_and_asr_results() -> None:
+def test_mcp_get_document_keyset_pages_return_403_segments_and_nine_asr_results() -> None:
     connection = FakeConnection()
     service = _service(connection)
     cursor = None
@@ -267,7 +267,7 @@ def test_mcp_get_document_keyset_pages_return_synthetic_segments_and_asr_results
     transcripts: list[str] = []
     pages = 0
     while True:
-        page = service.get_document(DOCUMENT_ID, limit=5, cursor=cursor)
+        page = service.get_document(DOCUMENT_ID, limit=100, cursor=cursor)
         pages += 1
         segment_ids.extend(item["segment_id"] for item in page["segments"])
         transcripts.extend(item["external_ref"] for item in page["asr_results"])
@@ -276,9 +276,9 @@ def test_mcp_get_document_keyset_pages_return_synthetic_segments_and_asr_results
         if cursor is None:
             break
 
-    assert pages == 3
-    assert segment_ids == list(range(1, 13))
-    assert transcripts == [f"tg:message:{i}" for i in range(1, 4)]
+    assert pages == 5
+    assert segment_ids == list(range(1, 404))
+    assert transcripts == [f"tg:message:{i}" for i in range(1, 10)]
 
 
 def test_mcp_list_projects_and_ingest_status_return_explicit_counts() -> None:
@@ -288,17 +288,17 @@ def test_mcp_list_projects_and_ingest_status_return_explicit_counts() -> None:
     status = service.ingest_status("sample-project")
 
     assert projects[0]["slug"] == "sample-project"
-    assert projects[0]["embeddings"] == 14
+    assert projects[0]["embeddings"] == 1062
     assert status["counts"] == {
         "sources": 1,
         "documents": 1,
-        "segments": 12,
+        "segments": 403,
         "asr_runs": 2,
-        "asr_results": 3,
-        "asr_segments": 8,
-        "asr_attempts": 4,
-        "asr_embeddings": 6,
-        "source_embeddings": 8,
+        "asr_results": 9,
+        "asr_segments": 704,
+        "asr_attempts": 10,
+        "asr_embeddings": 681,
+        "source_embeddings": 381,
     }
     assert "checkpoint" not in json.dumps(status)
 

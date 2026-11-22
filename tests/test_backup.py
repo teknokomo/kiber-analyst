@@ -93,9 +93,9 @@ def test_publish_writes_checksums_and_one_verified_manifest_tree(tmp_path: Path)
     "value",
     [
         "",
-        "gdrive:",
-        "gdrive:/absolute",
-        "gdrive:backup/../escape",
+        "archive:",
+        "archive:/absolute",
+        "archive:backup/../escape",
         "s3:bucket\n--config=/tmp/secret",
     ],
 )

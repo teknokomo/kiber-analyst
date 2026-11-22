@@ -16,8 +16,8 @@ from kiber_analyst.config_paths import config_path
 from kiber_analyst.errors import IngestError
 
 PROFILES_PATH = config_path("providers.yaml")
-API_ENV_PATH = config_path("providers.env")
-PROXY_ENV_PATH = config_path("proxy.env")
+API_ENV_PATH = config_path("provider-credentials.env")
+PROXY_ENV_PATH = config_path("provider-proxies.env")
 
 
 class ProfileError(IngestError):

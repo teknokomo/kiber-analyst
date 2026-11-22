@@ -33,7 +33,7 @@ def test_entry_point_reports_canonical_name(capsys) -> None:
         assert exc.code == 0
     else:
         raise AssertionError("--version must exit")
-    assert capsys.readouterr().out.startswith("kiber-analyst ")
+    assert capsys.readouterr().out.startswith("kiber-analyst 0.1.0 ")
 
 
 def test_cli_parses_asr_load_embed_and_search_source_filter(tmp_path: Path) -> None:
@@ -93,10 +93,10 @@ def test_jobs_submit_parser_allows_pool_strategy_and_profile_mode() -> None:
 
     parser = _parser()
     selected_strategy = parser.parse_args(
-        ["jobs", "submit", "--pool", "groq_asr", "--strategy", "round_robin", "--", "telegram", "asr", "--job", "sample-job"]
+        ["jobs", "submit", "--pool", "groq_asr", "--strategy", "round_robin", "--", "telegram", "asr", "--job", "/tmp/disallowed-job"]
     )
     selected_profile = parser.parse_args(
-        ["jobs", "submit", "--profile", "groq_asr", "--", "telegram", "asr", "--job", "sample-job"]
+        ["jobs", "submit", "--profile", "groq_asr", "--", "telegram", "asr", "--job", "/tmp/disallowed-job"]
     )
 
     assert selected_strategy.pool == "groq_asr"

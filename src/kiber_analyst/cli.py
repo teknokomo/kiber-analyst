@@ -34,11 +34,13 @@ def _parser(prog: str = "kiber-analyst") -> argparse.ArgumentParser:
 
     fetch = commands.add_parser("fetch", help="fetch and safely unpack one archive")
     fetch.add_argument("--archive", required=True)
-    fetch.add_argument("--work-root", type=Path, default=data_path("telegram"))
-    fetch.add_argument("--scope", choices=("topic", "chat"), default="topic")
+    fetch.add_argument("--work-root", type=Path, default=data_path("jobs"))
+    fetch.add_argument("--scope", choices=("topic", "chat"), default="chat")
     fetch.add_argument("--topic-id")
     fetch.add_argument("--topic-title")
     fetch.add_argument("--chat-id", required=True)
+    fetch.add_argument("--md5")
+    fetch.add_argument("--size", type=int)
 
     parse = commands.add_parser("parse", help="normalize result.json into JSONL")
     parse.add_argument("--job", type=Path, required=True)
@@ -55,7 +57,7 @@ def _parser(prog: str = "kiber-analyst") -> argparse.ArgumentParser:
         "ingest", help="queue a complete restricted Telegram topic export for import"
     )
     telegram_ingest.add_argument("--job", type=Path, required=True)
-    telegram_ingest.add_argument("--project", default="sample-project")
+    telegram_ingest.add_argument("--project", default="default")
     telegram_ingest.add_argument("--dry-run", action="store_true")
 
     report = commands.add_parser("report", help="write report.json and print a summary")
@@ -68,7 +70,7 @@ def _parser(prog: str = "kiber-analyst") -> argparse.ArgumentParser:
     asr.add_argument(
         "--rotation-config",
         type=Path,
-        default=config_path("processing-policy.yaml"),
+        default=config_path("asr-rotation.yaml"),
     )
     asr.add_argument(
         "--profile",
@@ -87,11 +89,13 @@ def _parser(prog: str = "kiber-analyst") -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="run fetch, parse, load, and report")
     run.add_argument("--archive", required=True)
-    run.add_argument("--work-root", type=Path, default=data_path("telegram"))
-    run.add_argument("--scope", choices=("topic", "chat"), default="topic")
+    run.add_argument("--work-root", type=Path, default=data_path("jobs"))
+    run.add_argument("--scope", choices=("topic", "chat"), default="chat")
     run.add_argument("--topic-id")
     run.add_argument("--topic-title")
     run.add_argument("--chat-id", required=True)
+    run.add_argument("--md5")
+    run.add_argument("--size", type=int)
 
     provider = top.add_parser(
         "provider-check", help="check one provider profile through its proxy"
@@ -291,6 +295,8 @@ def _run(args: argparse.Namespace) -> int:
             topic_id=args.topic_id if args.scope == "topic" else None,
             topic_title=args.topic_title if args.scope == "topic" else None,
             chat_id=args.chat_id,
+            expected_md5=args.md5,
+            expected_size=args.size,
         )
         print(job)
         return 0
@@ -312,6 +318,8 @@ def _run(args: argparse.Namespace) -> int:
             topic_id=args.topic_id if args.scope == "topic" else None,
             topic_title=args.topic_title if args.scope == "topic" else None,
             chat_id=args.chat_id,
+            expected_md5=args.md5,
+            expected_size=args.size,
         )
         parse_job(job)
         load_job(job)

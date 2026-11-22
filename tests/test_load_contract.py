@@ -63,7 +63,7 @@ def test_database_env_is_loopback_and_knowledge_app_only(tmp_path: Path) -> None
 
 def test_unattributed_document_has_separate_title() -> None:
     assert document_title_for(None, None) == NO_TOPIC_TITLE
-    assert document_title_for("23", "Example Station") == "Example Station"
+    assert document_title_for("77", "Sample Station") == "Sample Station"
 
 
 def test_full_chat_without_none_marks_old_none_document_segments_absent(
@@ -84,7 +84,7 @@ def test_full_chat_without_none_marks_old_none_document_segments_absent(
             "snapshot_sha256": "1" * 64,
             "scope": "chat",
             "scope_topic_id": None,
-            "chat_id": "-1009000",
+            "chat_id": "-10012345",
             "result_json": "result.json",
             "steps": {},
             "load": {"status": "not_run"},
@@ -97,21 +97,21 @@ def test_full_chat_without_none_marks_old_none_document_segments_absent(
 
     class MemoryCursor:
         def __init__(self) -> None:
-            self.documents = [("topic-doc", "23"), ("none-doc", None)]
+            self.documents = [("topic-doc", "77"), ("none-doc", None)]
             self.segments = {
                 "topic-segment": {
                     "document_id": "topic-doc",
-                    "external_ref": "tg:-1009000:24",
+                    "external_ref": "tg:-10012345:6985",
                     "meta": {"presence": "present"},
                 },
                 "none-segment-1": {
                     "document_id": "none-doc",
-                    "external_ref": "tg:-1009000:201",
+                    "external_ref": "tg:-10012345:201",
                     "meta": {"presence": "present"},
                 },
                 "none-segment-2": {
                     "document_id": "none-doc",
-                    "external_ref": "tg:-1009000:202",
+                    "external_ref": "tg:-10012345:202",
                     "meta": {"presence": "present"},
                 },
             }
@@ -165,7 +165,7 @@ def test_full_chat_without_none_marks_old_none_document_segments_absent(
         topic_scope_cursor,
         "source-id",
         "topic",
-        "23",
+        "77",
         {"topic-doc": topic_refs},
         "topic-snapshot",
     )
@@ -201,7 +201,7 @@ def test_failed_dry_run_does_not_persist_a_failed_run(tmp_path: Path) -> None:
             "archive_size_bytes": 1,
             "archive_uri": "fixture://test.zip",
             "scope": "topic",
-            "scope_topic_id": "23",
+            "scope_topic_id": "77",
             "load": {"status": "not_run"},
         },
     )

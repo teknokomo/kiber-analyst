@@ -13,11 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
-from kiber_analyst.config_paths import data_path, runtime_path
+from kiber_analyst.config_paths import config_path, data_path
 from kiber_analyst.jobapi import api_call
 
 DEFAULT_BACKUP_ROOT = data_path("backups")
-DEFAULT_RCLONE_CONFIG = runtime_path("rclone.conf")
+DEFAULT_DESTINATION: str | None = None
+DEFAULT_RCLONE_CONFIG = config_path("rclone.conf")
 
 
 class BackupError(RuntimeError):
@@ -210,8 +211,10 @@ def publish_backups(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Back up the kiber-analyst queue and knowledge database")
-    configured_destination = os.environ.get("KIBER_ANALYST_BACKUP_DESTINATION")
-    parser.add_argument("--destination", default=configured_destination, required=not configured_destination)
+    parser.add_argument(
+        "--destination",
+        default=os.environ.get("KIBER_ANALYST_BACKUP_DESTINATION", DEFAULT_DESTINATION),
+    )
     parser.add_argument(
         "--backup-root",
         type=Path,
@@ -227,6 +230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=os.environ.get("RCLONE_BIN", "rclone"),
     )
     args = parser.parse_args(argv)
+    if not args.destination:
+        parser.error("provide --destination or KIBER_ANALYST_BACKUP_DESTINATION")
 
     try:
         queue_result = api_call("backup")

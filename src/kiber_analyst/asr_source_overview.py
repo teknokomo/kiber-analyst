@@ -27,6 +27,7 @@ WITH source AS (
 ), expected AS (
     SELECT DISTINCT ON (g.external_ref)
            g.external_ref,
+           g.meta->>'media_type' AS media_type,
            g.meta->>'media_path' AS media_path,
            CASE
              WHEN g.meta->'media_export'->>'size' ~ '^[0-9]+$'
@@ -50,7 +51,7 @@ WITH source AS (
     ORDER BY r.external_ref, (r.status = 'complete') DESC,
              ar.finished_at DESC NULLS LAST, ar.created_at DESC, ar.run_key
 )
-SELECT e.external_ref, e.media_path, e.size_bytes,
+SELECT e.external_ref, e.media_type, e.media_path, e.size_bytes,
        r.status, r.http_code, r.error_class, r.run_key,
        COALESCE(seg.total, 0), COALESCE(seg.empty, 0),
        r.finished_at, r.created_at
@@ -100,12 +101,14 @@ def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
     failed_refs: list[str] = []
     run_keys: set[str] = set()
     skipped = 0
+    skipped_by_reason: dict[str, int] = {}
     segments = 0
     empty = 0
     latest_error: tuple[Any, str] | None = None
     revision_rows = []
     for (
         external_ref,
+        media_type,
         media_path,
         size_bytes,
         status,
@@ -118,19 +121,25 @@ def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
         created_at,
     ) in rows:
         ref = str(external_ref)
-        is_skipped = (
-            media_path is None
-            or (isinstance(size_bytes, int) and size_bytes > _EXPORT_MAX_BYTES)
-            or (isinstance(size_bytes, int) and size_bytes > _PROVIDER_MAX_BYTES)
-        )
-        if is_skipped:
-            skipped += 1
+        skip_reason = None
+        if isinstance(size_bytes, int) and size_bytes > _EXPORT_MAX_BYTES:
+            skip_reason = "over_100_MiB"
+        elif not isinstance(media_path, str) or not media_path:
+            skip_reason = "missing_media"
+        elif not isinstance(size_bytes, int) or size_bytes <= 0:
+            skip_reason = "size_unknown"
+        elif size_bytes > _PROVIDER_MAX_BYTES:
+            skip_reason = "provider_file_limit"
+
         if status == "complete":
             completed.append(ref)
             segments += int(segment_count)
             empty += int(empty_count)
             if isinstance(run_key, str):
                 run_keys.add(run_key)
+        elif skip_reason is not None:
+            skipped += 1
+            skipped_by_reason[skip_reason] = skipped_by_reason.get(skip_reason, 0) + 1
         elif status == "failed":
             failed_refs.append(ref)
             if type(http_code) is int and 400 <= http_code <= 599:
@@ -146,18 +155,22 @@ def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
             ):
                 latest_error = (event_time, code)
         revision_rows.append(
-            [ref, status, run_key, int(segment_count), int(empty_count), is_skipped]
+            [ref, media_type, status, run_key, int(segment_count), int(empty_count), skip_reason]
         )
 
     total = len(rows)
+    eligible = max(0, total - skipped)
+    pending = max(0, eligible - len(completed) - len(failed_refs))
     return {
         "source_id": source_id,
         "documents": int(documents),
         "files_total": total,
+        "files_eligible": eligible,
         "files_done": len(completed),
         "files_failed": len(failed_refs),
         "files_skipped": skipped,
-        "files_pending": max(0, total - len(completed) - len(failed_refs) - skipped),
+        "files_pending": pending,
+        "skipped_by_reason": skipped_by_reason,
         "segments": segments,
         "empty": empty,
         "last_error_code": latest_error[1] if latest_error else None,

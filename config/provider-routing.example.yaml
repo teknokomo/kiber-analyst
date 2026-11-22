@@ -7,9 +7,11 @@ pools:
     profiles: [groq_asr, groq_asr_2]
     strategy: round_robin
     weights: {groq_asr: 1, groq_asr_2: 1}
+    # Profiles sharing an organization or project quota should use the same
+    # scope value so throttling follows the provider's quota boundary.
     quota_scopes:
-      groq_asr: [groq:profile-groq-asr]
-      groq_asr_2: [groq:profile-groq-asr-2]
+      groq_asr: [groq:organization-profile-1]
+      groq_asr_2: [groq:organization-profile-2]
     limits: []
     retry: {max_cycles: 5, initial_seconds: 10, max_seconds: 300, jitter_fraction: 0.2}
 
@@ -20,6 +22,7 @@ pools:
     profiles: [gemini_embed, gemini_embed_2]
     strategy: round_robin
     weights: {gemini_embed: 1, gemini_embed_2: 1}
+    # Profiles sharing a Google project quota should use the same scope.
     quota_scopes:
       gemini_embed: [google:gemini_embed]
       gemini_embed_2: [google:gemini_embed_2]
@@ -51,3 +54,12 @@ pools:
       gemini_embed_2: [google:gemini_embed_2]
     limits: []
     retry: {max_cycles: 5, initial_seconds: 10, max_seconds: 300, jitter_fraction: 0.2}
+
+# Add one or more limits when the project/org quota has been verified:
+# limits:
+#   - {scope: google:project-a, metric: requests, window: minute, window_seconds: 60, limit: 15}
+#   - {scope: google:project-a, metric: tokens, window: minute, window_seconds: 60, limit: 1000000}
+# Supported independent metrics: requests, items (Google Contents / Groq files),
+# tokens, audio_seconds. Groq can have both organization and project scopes:
+# map a profile to [groq:organization-id, groq-project:project-id].
+# To share a Google project budget, assign the same scope to every profile in it.

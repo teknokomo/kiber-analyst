@@ -52,7 +52,9 @@ from kiber_analyst.routing import (
     load_pools,
 )
 
-ROUTING_PATH = Path(os.environ.get("KIBER_ANALYST_ROUTING_CONFIG", str(config_path("provider-routing.yaml"))))
+ROUTING_PATH = Path(
+    os.environ.get("KIBER_ANALYST_ROUTING_CONFIG", str(config_path("provider-routing.yaml")))
+)
 SOCKET_PATH = Path(os.environ.get("KIBER_ANALYST_SOCKET", str(DEFAULT_SOCKET)))
 DATA_ROOT = Path(os.environ.get("KIBER_ANALYST_DATA_ROOT", str(DEFAULT_DATA_ROOT)))
 DATA_UUID = os.environ.get("KIBER_ANALYST_DATA_UUID", DEFAULT_UUID)
@@ -596,6 +598,7 @@ class JobWorker:
         if len(requested_refs)!=len(set(requested_refs)) or any(ref not in audio_by_ref for ref in requested_refs):
             raise JobsError("ASR selection is not present in the prepared source")
         selected_audio=[audio_by_ref[ref] for ref in requested_refs]
+        input_durations={}
         run_id=params.get("run_id") or job.id
         run_dir=job_dir/"asr"/"batches"/run_id
         manifest_path=run_dir/"manifest.json"
@@ -609,7 +612,12 @@ class JobWorker:
 
             report_path=self.store.jobs_dir/job.id/"asr-load-report.json"
             return load_asr(
-                manifest_path,job_dir,project=params["project"],report_path=report_path
+                manifest_path,
+                job_dir,
+                project=params["project"],
+                report_path=report_path,
+                external_refs=requested_refs,
+                input_durations=input_durations,
             )
 
         def saved_result(external_ref:str)->tuple[dict[str,Any],Path]|None:
@@ -661,12 +669,14 @@ class JobWorker:
             cached=saved_result(audio.external_ref)
             if cached is not None:
                 _state,result_path=cached
+                input_durations[audio.external_ref]=_duration_seconds(audio.path)
                 digest=_digest(result_path.read_bytes())
                 self.store.update_item(item["id"],"done",checkpoint={"response_saved":True},artifact_path=str(result_path),artifact_sha256=digest)
                 completed.append(audio.external_ref)
                 continue
             self.store.update_item(item["id"],"running",checkpoint={"external_ref":audio.external_ref,"audio_sha256":audio.sha256})
             duration=_duration_seconds(audio.path)
+            input_durations[audio.external_ref]=duration
             def invoke(
                 profile: str,
                 *,

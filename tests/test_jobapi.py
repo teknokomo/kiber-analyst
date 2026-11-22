@@ -12,11 +12,11 @@ from kiber_analyst.jobqueue import JobsError
 
 def test_job_api_accepts_supported_search_and_fingerprints_filters() -> None:
     operation, params, items = jobapi.parse_job_command(
-        ["search", "кольцо", "--project", "sample-project", "--author", "Example Author"]
+        ["search", "кольцо", "--project", "sample-project", "--author", "Владимир"]
     )
 
     assert operation == "search"
-    assert params["author"] == "Example Author"
+    assert params["author"] == "Владимир"
     assert len(items[0]["fingerprint"]) == 64
 
 
@@ -46,7 +46,7 @@ def test_telegram_ingest_item_fingerprint_matches_worker_import_key(
     "command",
     [
         ["bash", "-c", "touch /tmp/not-allowed"],
-        ["telegram", "load", "--job", "sample-job"],
+        ["telegram", "load", "--job", "/tmp/disallowed-job"],
         ["asr", "load", "--manifest", "manifest.json", "--job", "job", "--project", "sample-project"],
     ],
 )
@@ -113,13 +113,13 @@ def test_asr_job_rejects_routing_and_unbounded_selection(tmp_path: Path) -> None
 def test_asr_embed_accepts_only_valid_source_scope() -> None:
     operation, params, items = jobapi.parse_job_command([
         'asr', 'embed', '--all-runs', '--project', 'sample-project',
-        '--source-id', 'telegram:-1009000:topic:1',
+        '--source-id', 'telegram:-10012345:topic:1',
     ])
     assert operation == 'asr_embed'
-    assert params['source_id'] == 'telegram:-1009000:topic:1'
+    assert params['source_id'] == 'telegram:-10012345:topic:1'
     assert len(items[0]['fingerprint']) == 64
     with pytest.raises(JobsError, match='Invalid Telegram source ID'):
         jobapi.parse_job_command([
             'asr', 'embed', '--all-runs', '--project', 'sample-project',
-            '--source-id', 'telegram:-1009000:topic:../1',
+            '--source-id', 'telegram:-10012345:topic:../1',
         ])

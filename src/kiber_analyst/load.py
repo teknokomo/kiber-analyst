@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
@@ -15,10 +16,9 @@ from kiber_analyst.errors import LoadError
 from kiber_analyst.parse import NO_TOPIC_TITLE, iter_messages
 from kiber_analyst.paths import job_paths, read_json, write_json_atomic
 
-ENV_PATH = config_path("knowledge.env")
-PROJECT_SLUG = "sample-project"
-PROJECT_TITLE = "Example Project"
-CHAT_ID = "-1009000"
+ENV_PATH = config_path("knowledge.conf")
+PROJECT_SLUG = os.environ.get("KIBER_ANALYST_PROJECT", "default")
+PROJECT_TITLE = "Default Project"
 
 
 class _DryRunRollback(Exception):
@@ -132,7 +132,7 @@ def _project_id(cursor: Any, project_slug: str = PROJECT_SLUG) -> str:
     cursor.execute("SELECT id FROM projects WHERE slug = %s", (project_slug,))
     row = cursor.fetchone()
     if not row:
-        raise LoadError("Could not create or find the sample-project project")
+        raise LoadError("Could not create or find the configured project")
     return str(row[0])
 
 
@@ -142,7 +142,10 @@ def _source_id(cursor: Any, project_id: str, manifest: dict[str, Any]) -> str:
     archive_name = str(manifest.get("archive_name") or "")
     archive_date_match = re.search(r"\d{4}-\d{2}-\d{2}", archive_name)
     scope_topic_id = manifest.get("scope_topic_id")
-    chat_id = str(manifest.get("chat_id") or CHAT_ID)
+    chat_value = manifest.get("chat_id")
+    if chat_value is None or not str(chat_value):
+        raise LoadError("manifest.json is missing chat_id")
+    chat_id = str(chat_value)
     internal_chat_id = chat_id.removeprefix("-100").removeprefix("-")
     url = f"https://t.me/c/{internal_chat_id}/{scope_topic_id}" if scope_topic_id is not None else None
     source_meta = {
@@ -736,7 +739,10 @@ def load_job(
                             "services_sha256": service_sha256,
                             "source_id": manifest.get("source_id"),
                         }
-                        chat_id = str(manifest.get("chat_id") or CHAT_ID)
+                        chat_value = manifest.get("chat_id")
+                        if chat_value is None or not str(chat_value):
+                            raise LoadError("manifest.json is missing chat_id")
+                        chat_id = str(chat_value)
                         for _raw, event in _iter_jsonl(service_events_path):
                             if str(event.get("topic_id")) != str(scope_topic_id):
                                 raise LoadError("Telegram service event is outside the exported topic")
