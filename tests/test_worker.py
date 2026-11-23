@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from kiber_analyst.embedding_contract import DIMENSIONS, MODEL, MODEL_KEY
-from kiber_analyst.jobqueue import JobsError, JobStore, utc_now
+from kiber_analyst.jobqueue import JobsError, JobStore, iso_utc, utc_now
 from kiber_analyst.routing import MeteredResult, PermanentProviderError, PoolConfig, WaitForQuota
 from kiber_analyst.worker import JobWorker
 
@@ -83,6 +83,77 @@ def test_agents_cannot_pin_a_provider_profile(tmp_path: Path) -> None:
     submitted = worker.submit(request, uid=0)
     assert submitted["operation"] == "search"
     assert submitted["state"] == "queued"
+
+
+def test_scheduled_submit_and_schedule_control_require_operator_identity(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    request = {
+        "argv": ["search", "query", "--project", "sample-project"],
+        "next_run_at": iso_utc(utc_now() + timedelta(hours=1)),
+        "deadline_at": iso_utc(utc_now() + timedelta(hours=24)),
+    }
+    with pytest.raises(JobsError, match="requires root"):
+        worker.submit(request, uid=1001)
+    submitted = worker.submit(request, uid=0)
+    record = store.get(submitted["job_id"])
+    assert record.next_run_at == request["next_run_at"]
+
+    moved = iso_utc(utc_now() + timedelta(hours=2))
+    with pytest.raises(JobsError, match="requires root"):
+        worker.handle(1001, {"action": "reschedule", "job_id": record.id, "at": moved})
+    result = worker.handle(0, {"action": "reschedule", "job_id": record.id, "at": moved})
+    assert result["next_run_at"] == moved
+    assert store.claim() is None
+
+
+def test_profile_reset_clears_provider_wait_but_preserves_later_operator_schedule(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+
+    provider_wait_job = make_job(store)
+    assert store.claim().id == provider_wait_job.id
+    store.postpone(
+        provider_wait_job.id,
+        "waiting_quota",
+        utc_now() + timedelta(hours=1),
+        {"reason": "all_profiles_disabled"},
+    )
+    worker.reset_profile("profile_a")
+    provider_wait = store.get(provider_wait_job.id)
+    assert provider_wait.state == "queued"
+    assert provider_wait.next_run_at is None
+
+    store.cancel(provider_wait_job.id)
+    operator_job, _ = store.create_job(
+        operation="search",
+        command={"pool": "gemini_query", "params": {"query": "operator-scheduled"}},
+        fingerprint="e" * 64,
+        idempotency_key="operator-schedule-after-quota",
+    )
+    assert store.claim().id == operator_job.id
+    store.postpone(
+        operator_job.id,
+        "waiting_quota",
+        utc_now() + timedelta(hours=1),
+        {"reason": "all_profiles_disabled"},
+    )
+    scheduled = utc_now() + timedelta(hours=2)
+    scheduled_text = iso_utc(scheduled)
+    assert store.reschedule(operator_job.id, scheduled_text).next_run_at == scheduled_text
+
+    worker.reset_profile("profile_a")
+
+    resumed = store.get(operator_job.id)
+    assert resumed.state == "queued"
+    assert resumed.next_run_at == scheduled_text
+    assert store.claim() is None
 
 
 def test_asr_worker_continues_after_one_permanent_file_error(

@@ -39,6 +39,7 @@ from kiber_analyst.jobqueue import (
     JobStore,
     canonical_json,
     iso_utc,
+    parse_rfc3339_utc,
     parse_utc,
     utc_now,
 )
@@ -230,6 +231,17 @@ class JobWorker:
             "strategy":strategy,
             "profile":profile,
         }
+        deadline_at=request.get("deadline_at")
+        next_run_at=request.get("next_run_at")
+        if deadline_at is not None or next_run_at is not None:
+            self._require_root(uid)
+            try:
+                if deadline_at is not None:
+                    parse_rfc3339_utc(deadline_at)
+                if next_run_at is not None:
+                    parse_rfc3339_utc(next_run_at)
+            except (TypeError,ValueError):
+                raise JobsError("Scheduled timestamps must use RFC 3339 UTC") from None
         fingerprint=_digest(canonical_json({"operation":operation,"command":command,"items":items}).encode())
         job,created=self.store.create_job(
             operation=operation,
@@ -243,6 +255,8 @@ class JobWorker:
             rerun_when_terminal=(
                 idempotency_key is None and operation in RERUNNABLE_OPERATIONS
             ),
+            deadline_at=deadline_at,
+            next_run_at=next_run_at,
         )
         return {"job_id":job.id,"state":job.state,"created":created,"deadline_at":job.deadline_at,"operation":job.operation}
 
@@ -254,6 +268,19 @@ class JobWorker:
             return self.query_embedding(request)
         if action=="submit":
             return self.submit(request,uid=uid)
+        if action in {"set-deadline","reschedule"}:
+            self._require_root(uid)
+            job_id=str(request.get("job_id",""))
+            if action=="set-deadline":
+                record=self.store.set_deadline(job_id,str(request.get("deadline_at","")))
+            else:
+                record=self.store.reschedule(job_id,str(request.get("at","")))
+            return {
+                "job_id":record.id,
+                "state":record.state,
+                "deadline_at":record.deadline_at,
+                "next_run_at":record.next_run_at,
+            }
         if action=="status":
             job_id=str(request.get("job_id",""))
             status=self.store.status(job_id)
@@ -403,10 +430,37 @@ class JobWorker:
                 found=True
             if not found:
                 raise JobsError("Profile is not referenced by a routing pool")
-            # A profile reset also releases jobs waiting for an operator fix.
+            # Release provider-disabled waits, but keep a later operator
+            # schedule. A reschedule after the last provider wait owns
+            # next_run_at; otherwise it is only the provider cooldown.
             db.execute(
-                """UPDATE jobs SET state='queued',next_run_at=NULL,updated_at=?
-                   WHERE state='waiting_quota' AND diagnostic_json LIKE ?""",
+                """UPDATE jobs AS j SET state='queued',updated_at=?
+                   WHERE j.state='waiting_quota' AND j.diagnostic_json LIKE ?
+                     AND EXISTS (
+                       SELECT 1 FROM job_events scheduled
+                       WHERE scheduled.job_id=j.id
+                         AND scheduled.kind IN ('scheduled','rescheduled')
+                         AND scheduled.at > COALESCE((
+                           SELECT max(waited.at) FROM job_events waited
+                           WHERE waited.job_id=j.id
+                             AND waited.kind IN ('waiting_quota','waiting_retry')
+                         ), '')
+                     )""",
+                (iso_utc(now),'%"reason":"all_profiles_disabled"%'),
+            )
+            db.execute(
+                """UPDATE jobs AS j SET state='queued',next_run_at=NULL,updated_at=?
+                   WHERE j.state='waiting_quota' AND j.diagnostic_json LIKE ?
+                     AND NOT EXISTS (
+                       SELECT 1 FROM job_events scheduled
+                       WHERE scheduled.job_id=j.id
+                         AND scheduled.kind IN ('scheduled','rescheduled')
+                         AND scheduled.at > COALESCE((
+                           SELECT max(waited.at) FROM job_events waited
+                           WHERE waited.job_id=j.id
+                             AND waited.kind IN ('waiting_quota','waiting_retry')
+                         ), '')
+                     )""",
                 (iso_utc(now),'%"reason":"all_profiles_disabled"%'),
             )
         return {"profile":profile,"reset":True}
