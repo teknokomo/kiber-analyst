@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,9 @@ def _validate_since(since: str | None) -> str | None:
         parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
     except ValueError:
         raise IngestError("--since must be an ISO 8601 date or datetime") from None
+    if parsed.tzinfo is None:
+        # A date-only value is a UTC cutoff, never the host's local timezone.
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
@@ -134,6 +138,7 @@ def run_external_ingest(
     jitter: Any = None,
     transport: Any = None,
     connector: Connector | None = None,
+    check_stop: Any = None,
 ) -> dict[str, Any]:
     """Run the full external ingest pipeline and return its report."""
     if provider not in PROVIDERS:
@@ -162,9 +167,14 @@ def run_external_ingest(
     errors: list[dict[str, str]] = []
     partial_reasons: list[str] = []
 
+    def _check_stop() -> None:
+        if check_stop is not None:
+            check_stop()
+
     # Stage 1: discover (no full comment text is downloaded here).
     refs: list[ThreadRef] = []
     for ref in connector.discover(source_id, {"since": since_effective}):
+        _check_stop()
         refs.append(ref)
         if limit is not None and len(refs) >= limit:
             break
@@ -183,11 +193,47 @@ def run_external_ingest(
 
     # Stage 2: fetch (raw answers are dumped to the job directory by the
     # connector itself); per-thread non-retryable failures are recorded, and
-    # retryable ones propagate to the worker.
+    # retryable ones propagate to the worker. Already fetched threads survive a
+    # job retry: the file is rewritten with valid lines and extended in place.
     fetched_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     max_updated: datetime | None = None
+
+    def _track_watermark(*candidates: Any) -> None:
+        nonlocal max_updated
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            try:
+                parsed_date = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if max_updated is None or parsed_date > max_updated:
+                max_updated = parsed_date
+
+    existing_lines: list[str] = []
+    fetched_refs: set[str] = set()
+    if paths["fetched"].is_file():
+        with paths["fetched"].open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                    thread_ref_value = payload["ref"]["thread_ref"]
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    break
+                existing_lines.append(line.rstrip("\n"))
+                fetched_refs.add(thread_ref_value)
+                _track_watermark(payload["ref"].get("updated_at"),
+                                 (payload.get("body") or {}).get("updated_at"))
     with paths["fetched"].open("w", encoding="utf-8", newline="\n") as stream:
+        for line in existing_lines:
+            stream.write(line + "\n")
+        stream.flush()
         for ref in refs:
+            _check_stop()
+            if ref.thread_ref in fetched_refs:
+                continue
             try:
                 raw = connector.fetch_thread(ref)
             except ConnectorError as exc:
@@ -202,15 +248,10 @@ def run_external_ingest(
                 )
                 partial_reasons.append("thread_fetch_failed")
                 continue
-            for candidate in (ref.updated_at, (raw.body or {}).get("updated_at")):
-                if isinstance(candidate, str) and candidate:
-                    try:
-                        parsed_date = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    if max_updated is None or parsed_date > max_updated:
-                        max_updated = parsed_date
+            _track_watermark(ref.updated_at, (raw.body or {}).get("updated_at"))
             stream.write(_raw_thread_line(ref, raw) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
     # Stage 3: normalize (offline, deterministic). Every discovered thread
     # starts as incomplete; only successfully normalized ones flip to True.
@@ -255,25 +296,44 @@ def run_external_ingest(
                     skipped_empty_count += 1
             errors.extend(raw.errors)
 
+    _check_stop()
     snapshot_sha256 = hashlib.sha256(
         _canonical({"threads": threads_out, "items": items_out})
     ).hexdigest()
+    # Completeness and error codes are part of the identity: an identical
+    # bundle fetched with a different completeness must still reconcile
+    # deletions on reload.
     import_key = hashlib.sha256(
-        _canonical({"source_id": source_id, "snapshot_sha256": snapshot_sha256})
+        _canonical({
+            "source_id": source_id,
+            "snapshot_sha256": snapshot_sha256,
+            "threads_complete": threads_complete,
+            "error_codes": sorted({str(entry.get("code") or "") for entry in errors}),
+        })
     ).hexdigest()
-    watermark = (
-        (max_updated - timedelta(seconds=OVERLAP_SECONDS))
-        .isoformat()
-        .replace("+00:00", "Z")
-        if max_updated is not None
-        else since_effective
-    )
+    # Never advance the incremental watermark past threads that were not
+    # processed: a failed fetch or a pilot limit keeps the previous cutoff.
+    suppressed: str | None = None
+    if partial_reasons:
+        suppressed = "partial"
+    elif limit is not None:
+        suppressed = "limit"
+    if suppressed is not None or max_updated is None:
+        watermark = since_effective
+    else:
+        watermark = (
+            (max_updated - timedelta(seconds=OVERLAP_SECONDS))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
     checkpoint_after = {
         "since": watermark,
         "fetched_at": fetched_at,
         "threads_discovered": len(refs),
         "threads_fetched": len(threads_out),
     }
+    if suppressed is not None:
+        checkpoint_after["watermark_suppressed"] = suppressed
     manifest = {
         "source_id": source_id,
         "provider": provider,
@@ -301,6 +361,7 @@ def run_external_ingest(
     write_json_atomic(paths["manifest"], manifest)
 
     # Stage 4: load (one transaction; dry-run rolls back everything).
+    _check_stop()
     if dry_run:
         load_result = load_external(
             paths["root"], env_path=env_path, project_slug=project_slug, dry_run=True

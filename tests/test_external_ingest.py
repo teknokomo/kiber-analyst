@@ -199,6 +199,8 @@ def test_limit_bounds_discovery_and_is_recorded(artifact, monkeypatch, tmp_path)
     assert result["threads"] == 1
     manifest = json.loads((artifact / "normalized" / "manifest.json").read_text())
     assert manifest["limit_applied"] == 1
+    assert manifest["checkpoint_after"]["watermark_suppressed"] == "limit"
+    assert manifest["checkpoint_after"]["since"] == result["checkpoint_after"]["since"]
 
 
 def test_failed_thread_fetch_records_partial(artifact, monkeypatch, tmp_path) -> None:
@@ -216,6 +218,12 @@ def test_failed_thread_fetch_records_partial(artifact, monkeypatch, tmp_path) ->
     assert "thread_fetch_failed" in result["partial_reasons"]
     manifest = json.loads((artifact / "normalized" / "manifest.json").read_text())
     assert manifest["threads_complete"][f"{SOURCE}:pull:2"] is False
+    # A failed thread must not be skipped by the next incremental run.
+    assert (
+        manifest["checkpoint_after"]["since"]
+        == manifest["checkpoint_before"]["since"]
+    )
+    assert manifest["checkpoint_after"]["watermark_suppressed"] == "partial"
 
 
 def test_invalid_provider_or_source_is_rejected(artifact, tmp_path) -> None:
@@ -242,3 +250,75 @@ def test_bad_since_and_limit_are_rejected(artifact, tmp_path) -> None:
             provider="github", source_id=SOURCE, project_slug="demo",
             limit=0, artifact_dir=artifact, env_path=tmp_path / "env",
         )
+
+
+def test_naive_since_is_interpreted_as_utc(artifact, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "kiber_analyst.external_ingest.load_external",
+        lambda *args, **kwargs: {"status": "dry_run", "inserted": 0},
+    )
+    result = run_external_ingest(
+        provider="github", source_id=SOURCE, project_slug="demo",
+        since="2026-01-01", artifact_dir=artifact, env_path=tmp_path / "env",
+        connector=FakeConnector(),
+    )
+    assert result["checkpoint_after"]["since"].startswith("2026-11-11T09:55:")
+
+
+def test_retryable_failure_keeps_fetched_threads_and_resumes(
+    artifact, monkeypatch, tmp_path
+) -> None:
+    class RetryableConnector(FakeConnector):
+        def fetch_thread(self, ref):
+            if ref.thread_ref == f"{SOURCE}:pull:2":
+                self.fetched.append(ref.thread_ref)
+                raise ConnectorError(
+                    ConnectorCodes.UPSTREAM_UNAVAILABLE, "provider down", status=503
+                )
+            return super().fetch_thread(ref)
+
+    monkeypatch.setattr(
+        "kiber_analyst.external_ingest.load_external",
+        lambda *args, **kwargs: {"status": "dry_run", "inserted": 0},
+    )
+    first = RetryableConnector()
+    with pytest.raises(ConnectorError):
+        run_external_ingest(
+            provider="github", source_id=SOURCE, project_slug="demo",
+            since="2026-11-01", artifact_dir=artifact, env_path=tmp_path / "env",
+            connector=first,
+        )
+    fetched_file = artifact / "fetched.jsonl"
+    assert fetched_file.is_file()
+    lines = [line for line in fetched_file.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1, "the successfully fetched thread must survive the retry"
+
+    second = FakeConnector()
+    result = run_external_ingest(
+        provider="github", source_id=SOURCE, project_slug="demo",
+        since="2026-11-01", artifact_dir=artifact, env_path=tmp_path / "env",
+        connector=second,
+    )
+    assert result["threads"] == 2
+    assert second.fetched == [f"{SOURCE}:pull:2"], "only the missing thread is refetched"
+
+
+def test_stop_hook_interrupts_the_pipeline(artifact, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "kiber_analyst.external_ingest.load_external",
+        lambda *args, **kwargs: {"status": "dry_run", "inserted": 0},
+    )
+    calls = {"n": 0}
+
+    def stop() -> None:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("deadline exceeded")
+
+    with pytest.raises(RuntimeError, match="deadline exceeded"):
+        run_external_ingest(
+            provider="github", source_id=SOURCE, project_slug="demo",
+            artifact_dir=artifact, env_path=tmp_path / "env",
+            connector=FakeConnector(), check_stop=stop,
+        )
+    assert calls["n"] >= 2
