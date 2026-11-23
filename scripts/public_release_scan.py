@@ -57,12 +57,10 @@ SKIP_PARTS = {
     ".pytest_cache",
     "build",
     "dist",
-    # Local, gitignored working directories (private notes, tool indexes,
-    # agent state) are never part of a public release.
+    # Local, gitignored working directories (private notes, tool indexes)
+    # are never part of a public release.
     "memory-bank",
     ".ontoindex",
-    ".claude",
-    ".zcode",
     ".venv",
 }
 
