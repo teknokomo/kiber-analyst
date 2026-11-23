@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kiber-analyst"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Python toolkit for importing and searching structured source archives"
 readme = "README.md"
 license = "LicenseRef-Omsk-Open-License-0.2.0"
@@ -27,6 +27,7 @@ db = ["psycopg[binary]>=3.2,<4"]
 embedding = ["google-genai>=2.34,<3", "httpx[socks]>=0.28.1,<1", "PyYAML>=6,<7"]
 asr = ["groq>=0.37,<1", "httpx[socks]>=0.28.1,<1", "PyYAML>=6,<7"]
 providers = ["google-genai>=2.34,<3", "groq>=0.37,<1", "httpx[socks]>=0.28.1,<1", "PyYAML>=6,<7"]
+connectors = ["httpx[socks]>=0.28.1,<1", "PyYAML>=6,<7"]
 test = ["pytest>=8,<10", "ruff>=0.14,<1"]
 mcp = [
   "mcp==1.30.0",
