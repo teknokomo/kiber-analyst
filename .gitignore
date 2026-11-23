@@ -27,3 +27,5 @@ backups/
 logs/
 memory-bank/
 .ontoindex
+.claude/
+.zcode/
