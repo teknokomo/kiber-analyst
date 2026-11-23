@@ -151,10 +151,16 @@ def _source_row(
     source_id = identity["source_id"]
     external_id = source_id.split(":", 1)[1]
     provider = identity["provider"]
-    url = f"https://{external_id}" if "/" in external_id and provider != "gitlab" else None
-    if provider == "gitlab":
-        host = external_id.split("/", 1)[0]
-        url = f"https://{host}"
+    parsed = parse_source_id(source_id)
+    if parsed is not None and parsed.host is not None:
+        # GitLab always carries the host; GitHub Enterprise carries it too.
+        url = f"https://{external_id}"
+    elif provider == "github":
+        url = f"https://github.com/{external_id}"
+    elif provider == "gitverse":
+        url = f"https://gitverse.ru/{external_id}"
+    else:
+        url = None
     title = external_id
     meta = {"provider": provider}
     cursor.execute(
@@ -270,24 +276,45 @@ def _upsert_external_segment(
     item: dict[str, Any],
     thread: dict[str, Any],
     document_id: str,
-    seq: int,
-) -> str:
+    seq_candidate: int,
+    source_id: str,
+) -> tuple[str, bool]:
+    """Upsert one item; return (outcome, seq_candidate_consumed).
+
+    Existing rows keep their sequence value (deleted rows keep occupying their
+    slot), so a new item never reuses a number held by another row.
+    """
     external_ref = item["external_ref"]
     incoming_meta = _item_meta(item, thread)
     content_hash = item["content_hash"]
     text = item["text"]
     speaker = item.get("author") if isinstance(item.get("author"), str) else None
     posted_at = _posted_at(item)
+    # Scope the lookup to the owning source: the same repository may be loaded
+    # into another project with identical external_ref values.
     cursor.execute(
-        """SELECT id, content_hash, speaker, posted_at, meta
-           FROM segments WHERE external_ref = %s""",
-        (external_ref,),
+        """SELECT s.id, s.content_hash, s.speaker, s.posted_at, s.meta,
+                  s.document_id, s.seq
+           FROM segments s
+           JOIN documents d ON d.id = s.document_id
+           WHERE s.external_ref = %s AND d.source_id = %s::uuid""",
+        (external_ref, source_id),
     )
     existing = cursor.fetchone()
     if existing:
-        segment_id, old_hash, old_speaker, old_posted, old_meta_value = existing
+        (
+            segment_id,
+            old_hash,
+            old_speaker,
+            old_posted,
+            old_meta_value,
+            old_document,
+            old_seq,
+        ) = existing
         old_meta = _db_json(old_meta_value)
         text_changed = old_hash != content_hash
+        was_deleted = old_meta.get("deleted") is True
+        document_moved = str(old_document) != document_id
         metadata_changed = {
             key: value
             for key, value in old_meta.items()
@@ -296,11 +323,25 @@ def _upsert_external_segment(
         } != incoming_meta
         timestamp_changed = old_posted != posted_at
         speaker_changed = old_speaker != speaker
-        if not any((text_changed, metadata_changed, timestamp_changed, speaker_changed)):
-            return "skipped"
+        if not any(
+            (
+                text_changed,
+                was_deleted,
+                document_moved,
+                metadata_changed,
+                timestamp_changed,
+                speaker_changed,
+            )
+        ):
+            return "skipped", False
+        new_seq = seq_candidate if document_moved else int(old_seq)
         new_meta = dict(incoming_meta)
         if "revision" in old_meta:
             new_meta["revision"] = old_meta["revision"]
+        # Metadata-only updates must not erase edit provenance.
+        for key in ("previous_content_hash", "edited_at", "deleted_at"):
+            if key in old_meta and key not in incoming_meta:
+                new_meta[key] = old_meta[key]
         if text_changed:
             new_meta["revision"] = int(old_meta.get("revision", 0)) + 1
             new_meta["previous_content_hash"] = old_hash
@@ -308,8 +349,8 @@ def _upsert_external_segment(
                 incoming_meta.get("edited_at")
                 or datetime.now(UTC).isoformat()
             )
-        # An item that reappears upstream clears the deletion markers.
-        if old_meta.get("deleted"):
+        # An item that reappears upstream clears the deletion marker.
+        if was_deleted:
             new_meta["deleted"] = False
         cursor.execute(
             """UPDATE segments SET document_id = %s::uuid, seq = %s, speaker = %s,
@@ -318,7 +359,7 @@ def _upsert_external_segment(
                    WHERE id = %s""",
             (
                 document_id,
-                seq,
+                new_seq,
                 speaker,
                 text,
                 content_hash,
@@ -330,7 +371,7 @@ def _upsert_external_segment(
                 segment_id,
             ),
         )
-        return "updated"
+        return "updated", document_moved
     cursor.execute(
         """INSERT INTO segments
              (document_id, seq, speaker, text, external_ref, content_hash, meta,
@@ -338,7 +379,7 @@ def _upsert_external_segment(
            VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)""",
         (
             document_id,
-            seq,
+            seq_candidate,
             speaker,
             text,
             external_ref,
@@ -350,19 +391,22 @@ def _upsert_external_segment(
             item["item_kind"],
         ),
     )
-    return "inserted"
+    return "inserted", True
 
 
 def _mark_deleted_items(
     cursor: Any,
+    source_id: str,
     thread_ref_value: str,
     present_refs: set[str],
 ) -> int:
     """Mark items deleted only when their thread was completely re-fetched."""
     cursor.execute(
-        """SELECT id, external_ref, meta FROM segments
-           WHERE thread_ref = %s AND item_kind = ANY(%s)""",
-        (thread_ref_value, list(_TEXT_ITEM_KINDS | {"event"})),
+        """SELECT s.id, s.external_ref, s.meta FROM segments s
+           JOIN documents d ON d.id = s.document_id
+           WHERE s.thread_ref = %s AND d.source_id = %s::uuid
+             AND s.item_kind = ANY(%s)""",
+        (thread_ref_value, source_id, list(_TEXT_ITEM_KINDS | {"event"})),
     )
     changed = 0
     now_iso = datetime.now(UTC).isoformat()
@@ -479,8 +523,23 @@ def load_external(
                     (project_id, identity["import_key"]),
                 )
                 prior_run = cursor.fetchone()
+                items_by_thread: dict[str, list[dict[str, Any]]] = {}
+                for item in items:
+                    items_by_thread.setdefault(item["thread_ref"], []).append(item)
                 if prior_run:
                     counters["skipped"] = len(items)
+                    # An identical bundle must still reconcile deletions for
+                    # threads that were fetched completely in this run.
+                    for thread in threads:
+                        if items_complete.get(thread["thread_ref"]) is not True:
+                            continue
+                        present = {
+                            item["external_ref"]
+                            for item in items_by_thread.get(thread["thread_ref"], [])
+                        }
+                        deleted_count += _mark_deleted_items(
+                            cursor, source_id_value, thread["thread_ref"], present
+                        )
                 else:
                     cursor.execute(
                         """INSERT INTO runs (project_id, kind, status, checkpoint)
@@ -501,13 +560,9 @@ def load_external(
                     run_id = str(run_row[0]) if run_row else None
                     if run_id is None:
                         raise LoadError("Could not create the external ingestion run row")
-                    seq_by_doc: Counter[str] = Counter()
                     doc_by_ref: dict[str, str] = {}
                     for thread in threads:
-                        thread_items = [
-                            item for item in items
-                            if item["thread_ref"] == thread["thread_ref"]
-                        ]
+                        thread_items = items_by_thread.get(thread["thread_ref"], [])
                         document_id = _thread_document(
                             cursor,
                             source_id_value,
@@ -516,21 +571,29 @@ def load_external(
                             len(thread_items),
                         )
                         doc_by_ref[thread["thread_ref"]] = document_id
+                        cursor.execute(
+                            "SELECT coalesce(max(seq), 0) FROM segments WHERE document_id = %s::uuid",
+                            (document_id,),
+                        )
+                        max_seq_row = cursor.fetchone()
+                        next_seq = int(max_seq_row[0]) if max_seq_row else 0
                         present_refs: set[str] = set()
                         for item in thread_items:
-                            seq_by_doc[document_id] += 1
-                            outcome = _upsert_external_segment(
+                            outcome, consumed = _upsert_external_segment(
                                 cursor,
                                 item,
                                 thread,
                                 document_id,
-                                seq_by_doc[document_id],
+                                next_seq + 1,
+                                source_id_value,
                             )
+                            if consumed:
+                                next_seq += 1
                             counters[outcome] += 1
                             present_refs.add(item["external_ref"])
                         if items_complete.get(thread["thread_ref"]) is True:
                             deleted_count += _mark_deleted_items(
-                                cursor, thread["thread_ref"], present_refs
+                                cursor, source_id_value, thread["thread_ref"], present_refs
                             )
                     checkpoint_data = {
                         "job_dir": str(job_dir.resolve()),

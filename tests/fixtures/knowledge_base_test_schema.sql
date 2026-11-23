@@ -64,8 +64,12 @@ CREATE TABLE segments (
   item_kind text,
   UNIQUE (document_id, seq)
 );
-CREATE UNIQUE INDEX uq_segments_external_ref
-  ON segments (external_ref) WHERE external_ref IS NOT NULL;
+CREATE UNIQUE INDEX uq_segments_external_ref_telegram
+  ON segments (external_ref)
+  WHERE external_ref IS NOT NULL AND item_kind IS NULL;
+CREATE UNIQUE INDEX uq_segments_document_external_ref
+  ON segments (document_id, external_ref)
+  WHERE external_ref IS NOT NULL AND item_kind IS NOT NULL;
 CREATE INDEX idx_segments_tsv ON segments USING gin (tsv);
 CREATE INDEX idx_segments_thread_ref ON segments (thread_ref);
 CREATE INDEX idx_segments_parent_external_ref ON segments (parent_external_ref);

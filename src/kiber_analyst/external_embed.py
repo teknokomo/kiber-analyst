@@ -92,10 +92,10 @@ def _write_report(path: Path | None, report: dict[str, Any]) -> None:
         return
     try:
         write_json_atomic(path, report)
-    except OSError as exc:
-        raise EmbedError(
-            f"Cannot write the external embed report ({type(exc).__name__})"
-        ) from exc
+    except OSError:
+        # The report is auxiliary: a failed write must not fail a run whose
+        # vectors are already committed.
+        return
 
 
 def embed_external(
@@ -140,7 +140,10 @@ def embed_external(
             f"Cannot read knowledge database settings ({type(exc).__name__})"
         ) from exc
 
-    counters = {"inserted": 0, "skipped_existing": 0, "skipped_empty": 0, "errors": 0}
+    counters = {
+        "inserted": 0, "skipped_existing": 0, "skipped_empty": 0,
+        "skipped_changed": 0, "errors": 0,
+    }
     characters = 0
     run_id: str | None = None
     last_segment_id: int | None = None
@@ -162,6 +165,20 @@ def embed_external(
             if not project_row:
                 raise EmbedError(f"Project {project!r} does not exist")
             project_id = str(project_row[0])
+            # Serialize invocations that share a resumable run so a second
+            # worker cannot move the cursor backwards.
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"external-embed:{source_id}:{MODEL_KEY}",),
+            )
+            run_id, resume, _ = _get_or_create_run(cursor, project_id, source_id)
+            last_value = resume.get("last_segment_id")
+            last_segment_id = int(last_value) if last_value is not None else None
+            for name in counters:
+                counters[name] = int(resume.get(name, 0))
+            characters = int(resume.get("characters_embedded", 0))
+            # The resume cursor is applied in SQL: the limit must cap the rows
+            # that are still to be processed, not the already embedded prefix.
             cursor.execute(
                 """SELECT s.id, s.external_ref, s.content_hash, s.text,
                           EXISTS (
@@ -177,14 +194,17 @@ def embed_external(
                      AND so.kind = %s AND so.external_id = %s
                      AND s.item_kind IS NOT NULL
                      AND s.thread_ref IS NOT NULL
-                     AND btrim(s.text) <> ''
-                   ORDER BY s.id
+                     AND s.text ~ '[^[:space:]]'
+                     AND (%s::bigint IS NULL OR s.id > %s::bigint)
+                   ORDER BY has_embedding, s.id
                    LIMIT %s""",
                 (
                     MODEL_KEY,
                     project,
                     parsed.provider,
                     parsed.external_id,
+                    last_segment_id,
+                    last_segment_id,
                     limit if limit is not None else _MAX_SOURCE_SEGMENTS,
                 ),
             )
@@ -199,14 +219,6 @@ def embed_external(
                 }
                 for row in rows
             ]
-            run_id, resume, _ = _get_or_create_run(cursor, project_id, source_id)
-            last_value = resume.get("last_segment_id")
-            last_segment_id = int(last_value) if last_value is not None else None
-            for name in counters:
-                counters[name] = int(resume.get(name, 0))
-            characters = int(resume.get("characters_embedded", 0))
-            if last_segment_id is not None:
-                ordered = [row for row in ordered if row["id"] > last_segment_id]
 
         for chunk_start in range(0, len(ordered), BATCH_SIZE):
             chunk = ordered[chunk_start : chunk_start + BATCH_SIZE]
@@ -228,8 +240,19 @@ def embed_external(
             with conn.transaction(), conn.cursor() as cursor:
                 inserted_here = 0
                 skipped_conflict = 0
+                skipped_changed = 0
                 characters_added = 0
                 for item, vector in zip(pending, vectors, strict=True):
+                    # The provider call ran outside a transaction; skip the
+                    # vector if the segment text changed meanwhile.
+                    cursor.execute(
+                        "SELECT content_hash FROM segments WHERE id = %s FOR UPDATE",
+                        (item["id"],),
+                    )
+                    current = cursor.fetchone()
+                    if current is None or current[0] != item["content_hash"]:
+                        skipped_changed += 1
+                        continue
                     vector_value = json.dumps(vector, separators=(",", ":"))
                     cursor.execute(
                         """INSERT INTO embeddings
@@ -246,7 +269,10 @@ def embed_external(
                 committed = dict(counters)
                 committed["inserted"] += inserted_here
                 committed["skipped_existing"] += newly_skipped_existing + skipped_conflict
-                committed_last_id = chunk[-1]["id"] if chunk else last_segment_id
+                committed["skipped_changed"] = committed.get("skipped_changed", 0) + skipped_changed
+                committed_last_id = (
+                    max(item["id"] for item in chunk) if chunk else last_segment_id
+                )
                 committed_characters = characters + characters_added
                 checkpoint = _checkpoint(
                     source_id=source_id,
@@ -309,6 +335,12 @@ def embed_external(
         _write_report(report_path, report)
         raise EmbedError(f"External embedding failed ({exc.code})") from exc
     except Exception as exc:
+        from kiber_analyst.routing import WaitForQuota
+        from kiber_analyst.worker import JobCancelled
+
+        if isinstance(exc, (WaitForQuota, JobCancelled)):
+            # The worker must postpone/cancel the job, not see a failed embed.
+            raise
         counters["errors"] += 1
         safe_message = (
             str(exc) if isinstance(exc, EmbedError) else _safe_db_message(exc)

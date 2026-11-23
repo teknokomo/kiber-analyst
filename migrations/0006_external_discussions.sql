@@ -19,6 +19,19 @@ ALTER TABLE segments
 ALTER TABLE segments
   ADD COLUMN IF NOT EXISTS item_kind text;
 
+-- External items must be unique per source (project), not globally: the same
+-- repository may be ingested into two projects, and each project must keep its
+-- own rows. Telegram rows (item_kind IS NULL) keep their global uniqueness.
+DROP INDEX IF EXISTS uq_segments_external_ref;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_segments_external_ref_telegram
+  ON segments (external_ref)
+  WHERE external_ref IS NOT NULL AND item_kind IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_segments_document_external_ref
+  ON segments (document_id, external_ref)
+  WHERE external_ref IS NOT NULL AND item_kind IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_segments_thread_ref
   ON segments (thread_ref);
 

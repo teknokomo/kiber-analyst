@@ -264,3 +264,330 @@ def test_external_load_embed_and_idempotency(tmp_path: Path) -> None:
             "SELECT count(*) FROM documents WHERE source_id=%s AND meta->>'topic_id'='7'",
             (telegram_source,),
         ).fetchone()[0] == 1
+
+
+def test_same_repository_in_two_projects_stays_isolated(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_load import load_external
+    from kiber_analyst.search_core import execute_search
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/shared-{token}"
+    project_a = f"kiber-a-{uuid.uuid4().hex[:10]}"
+    project_b = f"kiber-b-{uuid.uuid4().hex[:10]}"
+    threads, items = _sample_bundle(source_id, "github")
+
+    job_dir = tmp_path / "shared"
+    _bundle(job_dir, source_id, "github", threads, items)
+    first = load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_a)
+    second = load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_b)
+    assert (first["inserted"], second["inserted"]) == (2, 2)
+
+    with _connect(credentials) as conn:
+        rows = conn.execute(
+            """SELECT p.slug, count(*) FROM segments s
+               JOIN documents d ON d.id=s.document_id
+               JOIN sources so ON so.id=d.source_id
+               JOIN projects p ON p.id=so.project_id
+               WHERE s.external_ref LIKE %s GROUP BY p.slug ORDER BY p.slug""",
+            (f"{source_id}:%",),
+        ).fetchall()
+        assert rows == [(project_a, 2), (project_b, 2)]
+        # Every segment resolves to exactly one project-owned document.
+        cross = conn.execute(
+            """SELECT count(*) FROM segments s
+               JOIN documents d ON d.id=s.document_id
+               JOIN sources so ON so.id=d.source_id
+               JOIN projects p ON p.id=so.project_id
+               WHERE s.external_ref LIKE %s AND p.slug NOT IN (%s, %s)""",
+            (f"{source_id}:%", project_a, project_b),
+        ).fetchone()[0]
+        assert cross == 0
+
+        # Search isolation: both projects must answer their own rows only.
+        conn.execute(
+            "UPDATE segments SET tsv=to_tsvector('russian', text) WHERE external_ref LIKE %s",
+            (f"{source_id}:%",),
+        )
+        for slug in (project_a, project_b):
+            result = execute_search(
+                conn, "connector", project=slug, vector=None,
+                source_id=source_id, limit=10,
+            )
+            assert result["results"], "each project must find its own segments"
+            assert all(row["project_slug"] == slug for row in result["results"])
+            assert all(row["source_id"] == source_id for row in result["results"])
+
+
+def test_seq_reuse_deleted_reappear_and_prior_run_reconciliation(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"gitverse:owner/seq-{token}"
+    project_slug = f"kiber-seq-{uuid.uuid4().hex[:10]}"
+    thread_ref = f"{source_id}:issue:1"
+
+    def bundle(job_dir: Path, comments: list[tuple[str, str]]) -> None:
+        threads = [{
+            "thread_ref": thread_ref, "provider": "gitverse", "kind": "issue", "number": 1,
+            "title": "Seq", "state": "open", "author": "alice",
+            "created_at": "2026-11-01T10:00:00Z", "updated_at": "2026-11-02T10:00:00Z",
+            "url": "https://gitverse.ru/owner/repo/issues/1", "labels": [],
+            "meta": {"events": []},
+        }]
+        items = [{
+            "external_ref": f"{thread_ref}:body", "thread_ref": thread_ref,
+            "item_kind": "body", "parent_external_ref": None, "author": "alice",
+            "text": "Body", "posted_at": "2026-11-01T10:00:00Z",
+            "url": "https://gitverse.ru/owner/repo/issues/1",
+            "content_hash": hashlib.sha256(b"Body").hexdigest(), "meta": {},
+        }]
+        for ref, text in comments:
+            items.append({
+                "external_ref": f"{thread_ref}:comment:{ref}", "thread_ref": thread_ref,
+                "item_kind": "comment", "parent_external_ref": None, "author": "bob",
+                "text": text, "posted_at": "2026-11-02T11:00:00Z",
+                "url": f"https://gitverse.ru/owner/repo/issues/1#issuecomment-{ref}",
+                "content_hash": hashlib.sha256(text.encode()).hexdigest(), "meta": {},
+            })
+        _bundle(job_dir, source_id, "gitverse", threads, items)
+
+    # Bundle 1: body + c1 + c2. Bundle 2 drops c1 and adds c3, which must reuse
+    # no stale sequence value of a skipped segment.
+    bundle(tmp_path / "one", [("c1", "First"), ("c2", "Second")])
+    load_external(tmp_path / "one", env_path=Path(TEST_ENV), project_slug=project_slug)
+    bundle(tmp_path / "two", [("c2", "Second"), ("c3", "Third")])
+    second = load_external(tmp_path / "two", env_path=Path(TEST_ENV), project_slug=project_slug)
+    assert second["deleted"] == 1  # c1 is gone from a complete fetch
+
+    # Bundle 3 brings c1 back unchanged: the deletion marker must clear.
+    bundle(tmp_path / "three", [("c1", "First"), ("c2", "Second"), ("c3", "Third")])
+    third = load_external(tmp_path / "three", env_path=Path(TEST_ENV), project_slug=project_slug)
+    assert third["updated"] == 1
+
+    # A complete re-fetch with an identical bundle still reconciles deletions:
+    # plant a segment that is absent from the bundle, then reload bundle 3.
+    with _connect(credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+        ).fetchone()[0]
+        document_id = conn.execute(
+            """SELECT d.id FROM documents d JOIN sources so ON so.id=d.source_id
+               WHERE so.project_id=%s AND d.external_ref=%s""",
+            (project_id, thread_ref),
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO segments (document_id, seq, text, external_ref, content_hash,
+                                     meta, thread_ref, item_kind)
+               VALUES (%s, 99, 'planted', %s, %s, '{}', %s, 'comment')""",
+            (document_id, f"{thread_ref}:comment:phantom",
+             hashlib.sha256(b"planted").hexdigest(), thread_ref),
+        )
+        conn.execute(
+            "UPDATE segments SET meta='{}'::jsonb WHERE external_ref=%s",
+            (f"{thread_ref}:comment:phantom",),
+        )
+    fourth = load_external(tmp_path / "three", env_path=Path(TEST_ENV), project_slug=project_slug)
+    assert fourth["deleted"] >= 1
+    with _connect(credentials) as conn:
+        meta = conn.execute(
+            "SELECT meta FROM segments WHERE external_ref=%s",
+            (f"{thread_ref}:comment:phantom",),
+        ).fetchone()[0]
+        assert meta.get("deleted") is True
+        seqs = conn.execute(
+            """SELECT s.seq, s.external_ref FROM segments s
+               JOIN documents d ON d.id=s.document_id
+               WHERE d.external_ref=%s ORDER BY s.seq""",
+            (thread_ref,),
+        ).fetchall()
+        assert len({row[0] for row in seqs}) == len(seqs), "sequence values must stay unique"
+
+
+def test_metadata_update_keeps_edit_provenance(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/prov-{token}"
+    project_slug = f"kiber-prov-{uuid.uuid4().hex[:10]}"
+    thread_ref = f"{source_id}:issue:1"
+
+    def bundle(job_dir: Path, text: str, author: str) -> None:
+        threads = [{
+            "thread_ref": thread_ref, "provider": "github", "kind": "issue", "number": 1,
+            "title": "Prov", "state": "open", "author": "alice",
+            "created_at": "2026-11-01T10:00:00Z", "updated_at": "2026-11-02T10:00:00Z",
+            "url": "https://github.com/owner/repo/issues/1", "labels": [], "meta": {},
+        }]
+        items = [
+            {
+                "external_ref": f"{thread_ref}:body", "thread_ref": thread_ref,
+                "item_kind": "body", "parent_external_ref": None, "author": "alice",
+                "text": "Body", "posted_at": "2026-11-01T10:00:00Z",
+                "url": "https://github.com/owner/repo/issues/1",
+                "content_hash": hashlib.sha256(b"Body").hexdigest(), "meta": {},
+            },
+            {
+                "external_ref": f"{thread_ref}:comment:1", "thread_ref": thread_ref,
+                "item_kind": "comment", "parent_external_ref": None, "author": author,
+                "text": text, "posted_at": "2026-11-02T11:00:00Z",
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-1",
+                "content_hash": hashlib.sha256(text.encode()).hexdigest(), "meta": {},
+            },
+        ]
+        _bundle(job_dir, source_id, "github", threads, items)
+
+    bundle(tmp_path / "v1", "Original", "bob")
+    load_external(tmp_path / "v1", env_path=Path(TEST_ENV), project_slug=project_slug)
+    bundle(tmp_path / "v2", "Edited", "bob")
+    load_external(tmp_path / "v2", env_path=Path(TEST_ENV), project_slug=project_slug)
+    bundle(tmp_path / "v3", "Edited", "carol")
+    load_external(tmp_path / "v3", env_path=Path(TEST_ENV), project_slug=project_slug)
+
+    with _connect(credentials) as conn:
+        meta = conn.execute(
+            "SELECT meta, content_hash FROM segments WHERE external_ref=%s",
+            (f"{thread_ref}:comment:1",),
+        ).fetchone()[0:2]
+        meta_value = meta[0]
+        assert meta_value.get("revision") == 1
+        assert meta_value.get("previous_content_hash") == hashlib.sha256(b"Original").hexdigest()
+        assert "edited_at" in meta_value
+        assert meta[1] == hashlib.sha256(b"Edited").hexdigest()
+
+
+def test_source_urls_point_at_the_provider_repository(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    project_slug = f"kiber-url-{uuid.uuid4().hex[:10]}"
+    cases = {
+        "github": (f"github:owner/repo-{token}", f"https://github.com/owner/repo-{token}"),
+        "gitverse": (f"gitverse:owner/repo-{token}", f"https://gitverse.ru/owner/repo-{token}"),
+        "gitlab": (
+            f"gitlab:gitlab.com/group/project-{token}",
+            f"https://gitlab.com/group/project-{token}",
+        ),
+    }
+    for provider, (source_id, expected_url) in cases.items():
+        threads, items = _sample_bundle(source_id, provider)
+        job_dir = tmp_path / f"url-{provider}"
+        _bundle(job_dir, source_id, provider, threads, items)
+        load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_slug)
+        with _connect(credentials) as conn:
+            url = conn.execute(
+                """SELECT so.url FROM sources so JOIN projects p ON p.id=so.project_id
+                   WHERE p.slug=%s AND so.kind=%s AND so.external_id=%s""",
+                (project_slug, provider, source_id.split(":", 1)[1]),
+            ).fetchone()[0]
+        assert url == expected_url
+
+
+def test_embed_limit_applies_after_the_resume_cursor(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_embed import embed_external
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/limit-{token}"
+    project_slug = f"kiber-limit-{uuid.uuid4().hex[:10]}"
+    threads, items = _sample_bundle(source_id, "github")
+    job_dir = tmp_path / "limit"
+    _bundle(job_dir, source_id, "github", threads, items)
+    load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_slug)
+
+    def fake_embedding(texts: list[str]) -> tuple[list[list[float]], int | None]:
+        return [[0.01] * 1536 for _ in texts], None
+
+    first = embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding, limit=1,
+    )
+    second = embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding, limit=1,
+    )
+    assert (first["inserted"], second["inserted"]) == (1, 1)
+    with _connect(credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+        ).fetchone()[0]
+        assert conn.execute(
+            "SELECT count(*) FROM embeddings WHERE project_id=%s", (project_id,)
+        ).fetchone()[0] == 2
+
+
+def test_embed_skips_tab_only_text_and_changed_segments(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_embed import embed_external
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/guard-{token}"
+    project_slug = f"kiber-guard-{uuid.uuid4().hex[:10]}"
+    threads, items = _sample_bundle(source_id, "github")
+    job_dir = tmp_path / "guard"
+    _bundle(job_dir, source_id, "github", threads, items)
+    load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_slug)
+
+    with _connect(credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+        ).fetchone()[0]
+        document_id = conn.execute(
+            """SELECT d.id FROM documents d JOIN sources so ON so.id=d.source_id
+               WHERE so.project_id=%s AND d.external_ref LIKE %s""",
+            (project_id, f"{source_id}:%"),
+        ).fetchone()[0]
+        thread_ref = conn.execute(
+            "SELECT external_ref FROM documents WHERE id=%s", (document_id,)
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO segments (document_id, seq, text, external_ref, content_hash,
+                                     meta, thread_ref, item_kind)
+               VALUES (%s, 10, E'\\t', %s, %s, '{}', %s, 'comment')""",
+            (document_id, f"{thread_ref}:comment:tab",
+             hashlib.sha256(b"\t").hexdigest(), thread_ref),
+        )
+
+    def racing_embedding(texts: list[str]) -> tuple[list[list[float]], int | None]:
+        # Simulate a discussion refresh that changes the text during the call.
+        with _connect(credentials) as conn:
+            conn.execute(
+                "UPDATE segments SET text='changed', content_hash=%s"
+                " WHERE external_ref LIKE %s AND text='Please fix the connector'",
+                (hashlib.sha256(b"changed").hexdigest(), f"{source_id}:%"),
+            )
+        return [[0.02] * 1536 for _ in texts], None
+
+    report = embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=racing_embedding,
+    )
+    assert report["inserted"] == 1  # only the unchanged comment is embedded
+    assert report["skipped_changed"] == 1
+    with _connect(credentials) as conn:
+        tab = conn.execute(
+            "SELECT id FROM segments WHERE external_ref LIKE %s AND text=E'\\t'",
+            (f"{source_id}:%",),
+        ).fetchone()
+        assert tab is not None
+        assert conn.execute(
+            """SELECT count(*) FROM embeddings WHERE project_id=%s AND owner_id=%s""",
+            (project_id, str(tab[0])),
+        ).fetchone()[0] == 0

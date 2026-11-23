@@ -27,6 +27,17 @@ def test_external_discussions_migration_does_not_touch_telegram_or_asr() -> None
     assert "asr_segments" not in sql
 
 
+def test_external_item_uniqueness_is_scoped_per_source() -> None:
+    migration = Path(__file__).parents[1] / "migrations" / "0006_external_discussions.sql"
+    sql = migration.read_text(encoding="utf-8")
+    # The same repository may live in two projects: external refs are unique
+    # per document, while Telegram rows keep their global uniqueness.
+    assert "DROP INDEX IF EXISTS uq_segments_external_ref;" in sql
+    assert "uq_segments_external_ref_telegram" in sql
+    assert "AND item_kind IS NULL" in sql
+    assert "uq_segments_document_external_ref" in sql
+
+
 def test_external_discussions_migration_grants_are_read_write_scoped() -> None:
     migration = Path(__file__).parents[1] / "migrations" / "0006_external_discussions.sql"
     sql = migration.read_text(encoding="utf-8")
