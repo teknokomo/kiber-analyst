@@ -104,3 +104,22 @@ def test_jobs_submit_parser_allows_pool_strategy_and_profile_mode() -> None:
     assert selected_strategy.pool == "groq_asr"
     assert selected_strategy.strategy == "round_robin"
     assert selected_profile.profile == "groq_asr"
+
+
+def test_cli_external_commands_keep_source_and_external_id_separate() -> None:
+    from kiber_analyst.cli import _parser
+
+    parser = _parser()
+    status_args = parser.parse_args(
+        ["external", "status", "--source", "github:owner/repo", "--project", "demo"]
+    )
+    assert status_args.source == "external"
+    assert status_args.command == "status"
+    assert status_args.external_source_id == "github:owner/repo"
+
+    embed_args = parser.parse_args(
+        ["external", "embed", "--source", "gitlab:gitlab.com/g/p", "--project", "demo"]
+    )
+    assert embed_args.source == "external"
+    assert embed_args.command == "embed"
+    assert embed_args.external_source_id == "gitlab:gitlab.com/g/p"

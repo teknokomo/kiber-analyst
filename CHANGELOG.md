@@ -25,6 +25,23 @@ Read-only discussion connectors for GitHub, GitLab, and GitVerse.
 - Documentation: `docs/connectors.md`, updated data model, search, installation,
   security, and an acceptance checklist in `docs/acceptance-0.2.0.md`.
 
+Review hardening included in this release:
+
+- Connector tokens are sent only to the configured HTTPS API host (or
+  explicitly configured `allowed_hosts`), including on every pagination hop.
+- GitHub Discussions use the real GraphQL schema (`closed`, `bodyText`,
+  labels, category) and paginate comments and replies.
+- The same repository can be ingested into two projects without moving rows;
+  external item uniqueness is scoped per source, Telegram uniqueness is
+  unchanged.
+- Partial runs and pilot limits never advance the incremental watermark, and a
+  job retry resumes from already fetched threads.
+- Edits keep their provenance, reappearing items clear deletion markers, and
+  skipped items refresh their sequence position.
+- Embedding runs apply the resume cursor before the limit, skip vectors for
+  segments whose text changed during the provider call, and propagate worker
+  quota/cancellation signals.
+
 Still out of scope: write operations, webhooks, diff/file analysis, attachments,
 OCR, ASR changes, cross-provider deduplication, and UI.
 

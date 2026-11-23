@@ -35,9 +35,11 @@ Results keep the existing Telegram fields (`source`, `source_id`, `chat_id`,
 For external sources `chat_title` is the source title or `owner/repo`,
 `topic_title` is the thread title, and `message_id` is the thread number for
 bodies or the upstream item id for comments and reviews. For Telegram rows the
-new keys are `null`, so existing consumers keep working unchanged. The `topic`
-filter keeps Telegram topic semantics; external threads are filtered through
-`--source-id`/`--source-kind` and the query text.
+new keys are `null`, so existing consumers keep working unchanged. `provider`
+is always equal to `source_kind`, so Telegram rows report
+`"provider": "telegram"` and only the thread/item provenance fields are null.
+The `topic` filter keeps Telegram topic semantics; external threads are
+filtered through `--source-id`/`--source-kind` and the query text.
 
 Broker `search <source_id> <query> [limit]` accepts limits from 1 to 100 for
 both Telegram and external sources.

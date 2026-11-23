@@ -130,3 +130,25 @@ def test_missing_external_source_is_reported() -> None:
         execute_search(
             conn, "q", project="demo", vector=None, source_id="gitverse:o/r",
         )
+
+
+def test_external_source_ids_up_to_200_characters_are_accepted() -> None:
+    long_path = "a" * 120 + "/project"
+    source_id = f"gitlab:gitlab.com/{long_path}"
+    assert 128 < len(source_id) <= 200
+    conn = FakeConn(
+        {
+            "SELECT id FROM projects": [("pid",)],
+            "SELECT 1 FROM sources": [(1,)],
+            "WITH query_args": [],
+        }
+    )
+    result = execute_search(
+        conn, "q", project="demo", vector=None, source_id=source_id, limit=5,
+    )
+    assert result["results"] == []
+    existence = [
+        params for query, params in conn._cursor.statements
+        if "SELECT 1 FROM sources" in query
+    ]
+    assert existence[0][2] == f"gitlab.com/{long_path}"

@@ -20,8 +20,10 @@ Report suspected vulnerabilities privately to the repository maintainers through
   environment or a `0600`/`0640` file owned by the service group, never in the
   repository, `.env.example`, documentation, or logs.
 - A missing token fails with `AUTH_REQUIRED`; no request is sent without one.
-  Tokens, Authorization headers, and response bodies are never written to
-  logs, diagnostics, manifests, or job artifacts.
+  Tokens and Authorization headers are never written to logs, diagnostics,
+  manifests, or job artifacts. Raw provider responses are stored only in the
+  job's private artifact directory (`0700`, files `0600`) so a run can be
+  reproduced; they are never copied into manifests, diagnostics, or logs.
 - Connectors never scrape HTML and never bypass `401/403/429`; they record the
   stable error code and stop.
 - Ingested discussion text is stored in PostgreSQL like Telegram data. Apply the

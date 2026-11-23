@@ -48,10 +48,13 @@ duplicated. The same rule applies to GitVerse.
 
 ## Incremental sync and checkpoints
 
-- `--since` accepts an ISO date or datetime. Without it the first run covers the
-  last 90 days.
+- `--since` accepts an ISO date or datetime; a date without an offset is a UTC
+  cutoff. Without it the first run covers the last 90 days.
 - Subsequent runs use the stored watermark minus a five-minute overlap window,
-  so changes on the boundary are not lost.
+  so changes on the boundary are not lost. The watermark is not advanced when a
+  run is `partial` or when `--limit` was applied, so unprocessed threads are
+  picked up by the next run. Successfully fetched threads survive a job retry:
+  the fetch stage resumes from its artifact file.
 - Pagination always runs to the end (`Link: rel="next"` for GitHub/GitVerse,
   `X-Next-Page` for GitLab). A run that could not complete pagination or an
   optional endpoint finishes as `partial`, never as `done`.
@@ -72,8 +75,12 @@ unavailable.
 ## Idempotency and history
 
 - Sources are unique by `(project_id, kind, external_id)`, thread documents by
-  `(source_id, external_ref)`, and segments by the globally unique
-  `external_ref`; repeated loads create no duplicates.
+  `(source_id, external_ref)`, and external items by
+  `(document_id, external_ref)`; repeated loads create no duplicates. Telegram
+  segments keep their global `external_ref` uniqueness.
+- The same repository may be ingested into two projects: each project gets its
+  own documents and segments, and search/embeddings stay scoped to the project.
+  Rows are never moved between projects.
 - Edited items bump `meta.revision` and keep `meta.previous_content_hash` plus
   `meta.edited_at`.
 - Deleted upstream items are soft-deleted (`meta.deleted`, `meta.deleted_at`)

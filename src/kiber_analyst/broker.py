@@ -132,10 +132,11 @@ def timestamp():
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 
-def search_fingerprint(source_id, query, limit):
+def search_fingerprint(source_id, project, query, limit):
     payload = {
         'cache_version': SEARCH_CACHE_VERSION,
         'source_id': source_id,
+        'project': project,
         'query': query,
         'limit': limit,
     }
@@ -967,7 +968,7 @@ class Broker:
             limit = 5
         elif (
             isinstance(limit_text, str)
-            and re.fullmatch(r'[1-9][0-9]?', limit_text)
+            and re.fullmatch(r'(?:[1-9][0-9]?|100)', limit_text)
         ):
             limit = int(limit_text)
         else:
@@ -985,7 +986,7 @@ class Broker:
         elif overview.get('documents') != 1:
             raise Refused('SOURCE_NOT_FOUND')
         normalized = query.strip()
-        fingerprint = search_fingerprint(source_id, normalized, limit)
+        fingerprint = search_fingerprint(source_id, entry['project'], normalized, limit)
         row = self.db.execute(
             "SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation='search'",
             (owner, source_id, fingerprint),

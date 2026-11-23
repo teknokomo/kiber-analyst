@@ -165,13 +165,17 @@ def _parser(prog: str = "kiber-analyst") -> argparse.ArgumentParser:
     external_embed = external_commands.add_parser(
         "embed", help="queue embeddings for one external source"
     )
-    external_embed.add_argument("--source", required=True, help="e.g. github:owner/repo")
+    external_embed.add_argument(
+        "--source", required=True, dest="external_source_id", help="e.g. github:owner/repo"
+    )
     external_embed.add_argument("--project", required=True)
     external_embed.add_argument("--limit", type=int, help="maximum segments for a pilot run")
     external_status = external_commands.add_parser(
         "status", help="show thread/item/embedding counters for one external source"
     )
-    external_status.add_argument("--source", required=True, help="e.g. github:owner/repo")
+    external_status.add_argument(
+        "--source", required=True, dest="external_source_id", help="e.g. github:owner/repo"
+    )
     external_status.add_argument("--project", required=True)
     external_status.add_argument("--json", action="store_true", dest="as_json")
 
@@ -272,7 +276,7 @@ def _run(args: argparse.Namespace) -> int:
         from kiber_analyst.jobapi import api_call
 
         overview = api_call(
-            "source-overview", source_id=args.source, project=args.project
+            "source-overview", source_id=args.external_source_id, project=args.project
         )
         if args.as_json:
             _print_json(overview)

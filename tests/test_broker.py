@@ -214,14 +214,15 @@ def test_search_ignores_legacy_unversioned_completed_request(setup):
     assert app.db.execute("SELECT count(*) FROM requests WHERE operation='search'").fetchone()[0] == 2
 
 
-def test_search_fingerprint_scopes_source_query_limit_and_version(monkeypatch):
+def test_search_fingerprint_scopes_source_project_query_limit_and_version(monkeypatch):
     monkeypatch.setattr(broker, 'SEARCH_CACHE_VERSION', 'build-a')
-    baseline = broker.search_fingerprint(SOURCE, 'Example Station', 5)
-    assert broker.search_fingerprint(SOURCE, 'Example Station', 1) != baseline
-    assert broker.search_fingerprint(SOURCE, 'Sample Station', 5) != baseline
-    assert broker.search_fingerprint(SOURCE + ':other', 'Example Station', 5) != baseline
+    baseline = broker.search_fingerprint(SOURCE, 'fixture', 'Example Station', 5)
+    assert broker.search_fingerprint(SOURCE, 'fixture', 'Example Station', 1) != baseline
+    assert broker.search_fingerprint(SOURCE, 'fixture', 'Sample Station', 5) != baseline
+    assert broker.search_fingerprint(SOURCE, 'other', 'Example Station', 5) != baseline
+    assert broker.search_fingerprint(SOURCE + ':other', 'fixture', 'Example Station', 5) != baseline
     monkeypatch.setattr(broker, 'SEARCH_CACHE_VERSION', 'build-b')
-    assert broker.search_fingerprint(SOURCE, 'Example Station', 5) != baseline
+    assert broker.search_fingerprint(SOURCE, 'fixture', 'Example Station', 5) != baseline
 
 
 def test_source_search_refuses_missing_topic_explicitly(setup):

@@ -214,7 +214,7 @@ def execute_search(
         raise SearchError("Source kind is invalid")
     external_source = None
     if source_id is not None:
-        if not isinstance(source_id, str) or len(source_id) > 128:
+        if not isinstance(source_id, str) or len(source_id) > 200:
             raise SearchError("Source ID is invalid")
         from kiber_analyst.connectors.source_ids import parse_source_id
 

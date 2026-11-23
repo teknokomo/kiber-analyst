@@ -346,3 +346,27 @@ def test_retry_after_is_never_reduced_by_jitter_or_cap(monkeypatch) -> None:
     client.request_json("GET", "/x")
     assert sleeps and sleeps[0] >= 600
     client.close()
+
+
+def test_malformed_connector_yaml_is_rejected(tmp_path) -> None:
+    from kiber_analyst.connectors.config import load_provider_config
+
+    path = tmp_path / "connectors.yaml"
+    path.write_text("github: [\n", encoding="utf-8")
+    with pytest.raises(ConnectorError) as exc:
+        load_provider_config("github", config_file=path)
+    assert exc.value.code == ConnectorCodes.UNSUPPORTED_PROVIDER
+
+
+def test_allowed_hosts_config_is_validated(tmp_path) -> None:
+    from kiber_analyst.connectors.config import load_provider_config
+
+    path = tmp_path / "connectors.yaml"
+    path.write_text(
+        "github:\n  allowed_hosts: [github.example.com]\n", encoding="utf-8"
+    )
+    config = load_provider_config("github", config_file=path)
+    assert config.allowed_hosts == ("github.example.com",)
+    path.write_text("github:\n  allowed_hosts: [bad host]\n", encoding="utf-8")
+    with pytest.raises(ConnectorError):
+        load_provider_config("github", config_file=path)

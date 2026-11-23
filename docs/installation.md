@@ -37,6 +37,15 @@ A missing token fails with `AUTH_REQUIRED` before any network call. Tokens are
 sent only in `Authorization` headers and are never logged, not even their
 length.
 
+The token must be present in the **worker's** environment: the CLI submits a
+job over the control socket and the worker performs every provider request.
+Exporting a token in an interactive shell does not affect an already running
+worker; configure it in the worker's private service environment (for example a
+`0600`/`0640` environment file owned by the service group) and restart the
+worker so it picks the value up. The token is sent only to the configured
+`api_url` host and to hosts listed in `allowed_hosts`; any other host fails
+with `SOURCE_NOT_ALLOWED` before a request is made.
+
 Optional API tuning lives in `~/.config/kiber-analyst/connectors.yaml`; copy
 `config/connectors.example.yaml` as a starting point. The file is validated at
 startup (`api_url` must be https, `page_size` 1–100, `timeout_seconds` 1–300,
