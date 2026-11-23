@@ -325,8 +325,7 @@ def select_profile(
         profile_wakes: list[datetime] = []
         scope_wakes: list[datetime] = []
         for profile in candidates:
-            if exclude_profiles and profile in exclude_profiles:
-                continue
+            excluded = bool(exclude_profiles and profile in exclude_profiles)
             if profile in disabled:
                 continue
             profile_until = cooldowns.get(profile)
@@ -342,19 +341,23 @@ def select_profile(
             if scope_until:
                 scope_wakes.append(scope_until)
                 continue
+            if excluded:
+                continue
             eligible.append(profile)
         if not eligible:
             _persist_state(db, pool.name, cursor=cursor, weighted=weighted, disabled=list(disabled), cooldowns=cooldowns)
-            if exclude_profiles and all(profile in exclude_profiles or profile in disabled for profile in candidates):
-                return None, None, "cycle_exhausted"
             if all(profile in disabled for profile in candidates):
                 return None, None, "all_profiles_disabled"
-            all_wakes=profile_wakes+scope_wakes
+            all_wakes = profile_wakes + scope_wakes
             if all_wakes:
-                earliest=min(all_wakes)
+                earliest = min(all_wakes)
                 if earliest in scope_wakes:
                     return None, earliest, "quota_cooldown"
                 return None, earliest, "profile_retry_cooldown"
+            if exclude_profiles and all(
+                profile in exclude_profiles or profile in disabled for profile in candidates
+            ):
+                return None, None, "cycle_exhausted"
             return None, None, "no_profile_available"
         if explicit_profile or strategy == "failover":
             chosen = eligible[0]
