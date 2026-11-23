@@ -35,13 +35,14 @@ _MAX_SOURCE_SEGMENTS = 500_000
 
 def _checkpoint(
     *, source_id: str, last_segment_id: int | None, inserted: int,
-    skipped_existing: int, skipped_empty: int, errors: int,
-    characters_embedded: int,
+    updated_vectors: int = 0, skipped_existing: int, skipped_empty: int,
+    errors: int, characters_embedded: int,
 ) -> dict[str, Any]:
     return {
         "source_id": source_id,
         "last_segment_id": last_segment_id,
         "inserted": inserted,
+        "updated_vectors": updated_vectors,
         "skipped_existing": skipped_existing,
         "skipped_empty": skipped_empty,
         "errors": errors,
@@ -141,8 +142,8 @@ def embed_external(
         ) from exc
 
     counters = {
-        "inserted": 0, "skipped_existing": 0, "skipped_empty": 0,
-        "skipped_changed": 0, "errors": 0,
+        "inserted": 0, "updated_vectors": 0, "skipped_existing": 0,
+        "skipped_empty": 0, "skipped_changed": 0, "errors": 0,
     }
     characters = 0
     run_id: str | None = None
@@ -185,6 +186,7 @@ def embed_external(
                             SELECT 1 FROM embeddings e
                             WHERE e.owner_table = 'segments'
                               AND e.owner_id = s.id::text AND e.model = %s
+                              AND e.content_hash = s.content_hash
                           ) AS has_embedding
                    FROM segments s
                    JOIN documents d ON d.id = s.document_id
@@ -239,6 +241,7 @@ def embed_external(
                     )
             with conn.transaction(), conn.cursor() as cursor:
                 inserted_here = 0
+                updated_here = 0
                 skipped_conflict = 0
                 skipped_changed = 0
                 characters_added = 0
@@ -256,18 +259,35 @@ def embed_external(
                     vector_value = json.dumps(vector, separators=(",", ":"))
                     cursor.execute(
                         """INSERT INTO embeddings
-                             (project_id, owner_table, owner_id, model, embedding)
-                           VALUES (%s::uuid, 'segments', %s, %s, %s::vector)
-                           ON CONFLICT (owner_table, owner_id, model) DO NOTHING""",
-                        (project_id, str(item["id"]), MODEL_KEY, vector_value),
+                             (project_id, owner_table, owner_id, model, embedding,
+                              content_hash)
+                           VALUES (%s::uuid, 'segments', %s, %s, %s::vector, %s)
+                           ON CONFLICT (owner_table, owner_id, model) DO UPDATE
+                             SET embedding = EXCLUDED.embedding,
+                                 content_hash = EXCLUDED.content_hash
+                             WHERE embeddings.content_hash
+                                   IS DISTINCT FROM EXCLUDED.content_hash
+                           RETURNING (xmax = 0) AS inserted""",
+                        (
+                            project_id,
+                            str(item["id"]),
+                            MODEL_KEY,
+                            vector_value,
+                            item["content_hash"],
+                        ),
                     )
-                    if cursor.rowcount == 1:
+                    returned = cursor.fetchone()
+                    if returned is None:
+                        skipped_conflict += 1
+                    elif returned[0]:
                         inserted_here += 1
                         characters_added += len(item["text"])
                     else:
-                        skipped_conflict += 1
+                        updated_here += 1
+                        characters_added += len(item["text"])
                 committed = dict(counters)
                 committed["inserted"] += inserted_here
+                committed["updated_vectors"] += updated_here
                 committed["skipped_existing"] += newly_skipped_existing + skipped_conflict
                 committed["skipped_changed"] = committed.get("skipped_changed", 0) + skipped_changed
                 committed_last_id = (
@@ -278,6 +298,7 @@ def embed_external(
                     source_id=source_id,
                     last_segment_id=committed_last_id,
                     inserted=committed["inserted"],
+                    updated_vectors=committed["updated_vectors"],
                     skipped_existing=committed["skipped_existing"],
                     skipped_empty=committed["skipped_empty"],
                     errors=committed["errors"],
@@ -309,6 +330,7 @@ def embed_external(
             source_id=source_id,
             last_segment_id=last_segment_id,
             inserted=counters["inserted"],
+            updated_vectors=counters["updated_vectors"],
             skipped_existing=counters["skipped_existing"],
             skipped_empty=counters["skipped_empty"],
             errors=counters["errors"],
@@ -351,6 +373,7 @@ def embed_external(
                     source_id=source_id,
                     last_segment_id=last_segment_id,
                     inserted=counters["inserted"],
+                    updated_vectors=counters["updated_vectors"],
                     skipped_existing=counters["skipped_existing"],
                     skipped_empty=counters["skipped_empty"],
                     errors=counters["errors"],

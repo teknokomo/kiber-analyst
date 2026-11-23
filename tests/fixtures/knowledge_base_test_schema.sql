@@ -82,6 +82,7 @@ CREATE TABLE embeddings (
   owner_id text NOT NULL,
   model text NOT NULL,
   embedding vector(1536) NOT NULL,
+  content_hash text,
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (owner_table, owner_id, model)
 );

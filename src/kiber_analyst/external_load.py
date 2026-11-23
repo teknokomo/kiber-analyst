@@ -494,9 +494,14 @@ def load_external(
     for item in items:
         _validate_item(item, thread_refs)
     items_complete = manifest["threads_complete"]
-    for thread_ref_value in items_complete:
-        if thread_ref_value not in thread_refs:
-            raise LoadError("External manifest threads_complete has unknown threads")
+    if not all(type(value) is bool for value in items_complete.values()):
+        raise LoadError("External manifest threads_complete values must be booleans")
+    # A partial bundle intentionally omits threads whose fetch failed; those
+    # refs stay in threads_complete as False. Every loaded thread, however,
+    # must carry a completeness flag.
+    missing_flags = thread_refs - set(items_complete)
+    if missing_flags:
+        raise LoadError("External manifest threads_complete misses loaded threads")
     started_at = datetime.now(UTC)
     counters: Counter[str] = Counter()
     deleted_count = 0
@@ -514,15 +519,23 @@ def load_external(
                     (f"external-ingest:{identity['source_id']}",),
                 )
                 snapshot_id = _snapshot_row(cursor, source_id_value, manifest, identity)
-                prior_run = None
                 cursor.execute(
-                    """SELECT id FROM runs WHERE project_id = %s::uuid
-                       AND kind = 'external_ingest' AND status = 'done'
-                       AND checkpoint->>'import_key' = %s
-                       ORDER BY started_at DESC LIMIT 1""",
-                    (project_id, identity["import_key"]),
+                    """SELECT id, checkpoint->>'import_key' FROM runs
+                       WHERE project_id = %s::uuid AND kind = 'external_ingest'
+                         AND status = 'done'
+                       ORDER BY started_at DESC, id DESC LIMIT 1""",
+                    (project_id,),
                 )
-                prior_run = cursor.fetchone()
+                latest_run = cursor.fetchone()
+                # Only an identical *latest* snapshot is a no-op. Re-importing
+                # an older snapshot after a newer one must restore its text
+                # (A -> B -> A), so the check is against the newest run only.
+                prior_run = (
+                    latest_run
+                    if latest_run is not None
+                    and latest_run[1] == identity["import_key"]
+                    else None
+                )
                 items_by_thread: dict[str, list[dict[str, Any]]] = {}
                 for item in items:
                     items_by_thread.setdefault(item["thread_ref"], []).append(item)

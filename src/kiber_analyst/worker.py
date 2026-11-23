@@ -58,6 +58,9 @@ ROUTING_PATH = Path(
 SOCKET_PATH = Path(os.environ.get("KIBER_ANALYST_SOCKET", str(DEFAULT_SOCKET)))
 DATA_ROOT = Path(os.environ.get("KIBER_ANALYST_DATA_ROOT", str(DEFAULT_DATA_ROOT)))
 DATA_UUID = os.environ.get("KIBER_ANALYST_DATA_UUID", DEFAULT_UUID)
+TERMINAL_JOB_STATES = {"done", "failed", "timed_out", "cancelled"}
+RERUNNABLE_OPERATIONS = {"external_ingest", "external_embed"}
+
 DEFAULT_POOLS = {
     "telegram_asr": "groq_asr",
     "embed": "gemini_embed",
@@ -229,14 +232,33 @@ class JobWorker:
             "profile":profile,
         }
         fingerprint=_digest(canonical_json({"operation":operation,"command":command,"items":items}).encode())
+        default_key = idempotency_key or _digest(
+            canonical_json({"operation": operation, "fingerprint": fingerprint}).encode()
+        )
         job,created=self.store.create_job(
             operation=operation,
             command=command,
             fingerprint=fingerprint,
             priority=100 if operation=="search" else 0,
             items=items,
-            idempotency_key=idempotency_key,
+            idempotency_key=default_key,
         )
+        if (
+            not created
+            and idempotency_key is None
+            and operation in RERUNNABLE_OPERATIONS
+            and job.state in TERMINAL_JOB_STATES
+        ):
+            # An explicit new run of a finished external operation must query
+            # the provider again; only an active identical job is deduplicated.
+            job,created=self.store.create_job(
+                operation=operation,
+                command=command,
+                fingerprint=fingerprint,
+                priority=100 if operation=="search" else 0,
+                items=items,
+                idempotency_key=f"{default_key}:rerun:{uuid.uuid4().hex}",
+            )
         return {"job_id":job.id,"state":job.state,"created":created,"deadline_at":job.deadline_at,"operation":job.operation}
 
     def handle(self,uid:int,request:dict[str,Any]) -> dict[str,Any]:
@@ -963,7 +985,7 @@ class JobWorker:
                 if entry["key"].startswith("external-embed:") and entry["state"] == "done"
             ),
         }
-        for key in ("inserted", "skipped_existing", "skipped_empty"):
+        for key in ("inserted", "updated_vectors", "skipped_existing", "skipped_empty"):
             if isinstance(result.get(key), int):
                 progress[key]=result[key]
         self.store.update_progress(job.id,progress)

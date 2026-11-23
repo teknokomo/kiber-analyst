@@ -202,3 +202,34 @@ def test_search_accepts_the_documented_limit_of_100(setup, monkeypatch) -> None:
     ]
     with pytest.raises(broker.Refused, match="INVALID_LIMIT"):
         app.handle("client", "search", GITHUB_SOURCE, "query", "101")
+
+
+def test_completed_ingest_does_not_suppress_a_new_provider_check(setup) -> None:
+    app, jobs, argv_log = setup
+    first = app.handle("client", "ingest", GITHUB_SOURCE)
+    jobs[first["job_id"]].update(state="done")
+
+    second = app.handle("client", "ingest", GITHUB_SOURCE)
+
+    assert second["request_id"] != first["request_id"]
+    assert second["job_id"] != first["job_id"]
+    assert len(argv_log) == 2
+    # A duplicate is still prevented while the request is active.
+    active = app.handle("client", "ingest", GITHUB_SOURCE)
+    assert active["request_id"] == second["request_id"]
+    assert len(argv_log) == 2
+
+
+def test_embed_after_completed_ingest_creates_a_new_run(setup) -> None:
+    app, jobs, argv_log = setup
+    ingest = app.handle("client", "ingest", GITHUB_SOURCE)
+    jobs[ingest["job_id"]].update(state="done")
+    first = app.handle("client", "embed", GITHUB_SOURCE)
+    jobs[first["job_id"]].update(state="done")
+
+    second = app.handle("client", "embed", GITHUB_SOURCE)
+
+    assert second["request_id"] != first["request_id"]
+    assert argv_log[-1] == [
+        "external", "embed", "--source", GITHUB_SOURCE, "--project", "demo-github",
+    ]

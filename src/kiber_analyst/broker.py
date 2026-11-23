@@ -900,6 +900,12 @@ class Broker:
                             (request_id, owner, source_id, fingerprint, operation, json.dumps(argv), now, now))
         return self.dispatch(self.row(owner, request_id))
 
+    @staticmethod
+    def _base_fingerprint(value):
+        # New runs use "<base>:<nonce>" so the requests uniqueness constraint
+        # still allows a fresh request while the source revision stays stable.
+        return str(value).split(':', 1)[0]
+
     def start_external(self, owner, operation, source_id, entry, fingerprint):
         # External sources: no staged files, the connector fetches from the API.
         provider, external_id = source_id.split(':', 1)
@@ -910,10 +916,13 @@ class Broker:
             (owner, source_id, operation),
         ).fetchall()
         for row in relevant:
-            if row['source_fingerprint'] == fingerprint:
-                if operation == 'embed' and self.status(row)['retryable']:
-                    return self.handle(owner, 'retry', row['id'])
-                return self.dispatch(row)
+            if self._base_fingerprint(row['source_fingerprint']) == fingerprint:
+                if self.status(row)['status'] not in TERMINAL:
+                    # An active identical request is never duplicated.
+                    return self.dispatch(row)
+                # A finished request must not suppress a new provider check;
+                # fall through and create a fresh run below.
+                break
             if self.status(row)['status'] not in TERMINAL:
                 raise Refused('SOURCE_BUSY')
         if operation == 'ingest':
@@ -924,21 +933,35 @@ class Broker:
             else:
                 argv = [provider, 'ingest', '--repo', external_id, '--project', entry['project']]
         elif operation == 'embed':
-            ingest = self.db.execute(
-                'SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
-                (owner, source_id, fingerprint, 'ingest'),
-            ).fetchone()
+            ingests = self.db.execute(
+                'SELECT * FROM requests WHERE owner=? AND source=? AND operation=?'
+                ' ORDER BY created DESC',
+                (owner, source_id, 'ingest'),
+            ).fetchall()
+            ingest = next(
+                (row for row in ingests
+                 if self._base_fingerprint(row['fingerprint']) == fingerprint),
+                None,
+            )
             if ingest is None or self.status(ingest)['status'] != 'done':
                 raise Refused('INGEST_REQUIRED')
             argv = ['external', 'embed', '--source', source_id, '--project', entry['project']]
         else:
             raise Refused('COMMAND_NOT_ALLOWED')
+        existing = self.db.execute(
+            'SELECT 1 FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
+            (owner, source_id, fingerprint, operation),
+        ).fetchone()
+        request_fingerprint = fingerprint if existing is None else (
+            f"{fingerprint}:{uuid.uuid4().hex}"
+        )
         now = timestamp()
         request_id = str(uuid.uuid4())
         with self.db:
             self.db.execute(
                 'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) VALUES(?,?,?,?,?,?,?,?)',
-                (request_id, owner, source_id, fingerprint, operation, json.dumps(argv), now, now),
+                (request_id, owner, source_id, request_fingerprint, operation,
+                 json.dumps(argv), now, now),
             )
         return self.dispatch(self.row(owner, request_id))
 

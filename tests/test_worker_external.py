@@ -153,3 +153,27 @@ def test_retryable_connector_exhaustion_is_reported_retryable(
     assert result["status"] == "failed"
     assert result["error"]["category"] == "rate_limited"
     assert result["error"]["code"] == ConnectorCodes.RATE_LIMITED
+
+
+def test_submit_reruns_external_ingest_only_after_the_previous_job_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = _make_worker(store, monkeypatch)
+    argv = {"argv": ["github", "ingest", "--repo", "owner/repo", "--project", "demo"]}
+
+    first = worker.submit(argv, uid=0)
+    active = worker.submit(argv, uid=0)
+    assert active["job_id"] == first["job_id"]
+    assert active["created"] is False
+
+    job = store.claim()
+    assert job is not None and job.id == first["job_id"]
+    worker.process(job)
+    assert store.status(job.id)["state"] == "done"
+
+    rerun = worker.submit(argv, uid=0)
+    assert rerun["job_id"] != first["job_id"]
+    assert rerun["created"] is True
+    assert store.status(rerun["job_id"])["state"] == "queued"

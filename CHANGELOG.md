@@ -41,6 +41,14 @@ Review hardening included in this release:
 - Embedding runs apply the resume cursor before the limit, skip vectors for
   segments whose text changed during the provider call, and propagate worker
   quota/cancellation signals.
+- Vectors record their source text hash: edited text is re-embedded, while
+  metadata-only updates keep the vector.
+- A partial bundle with failed threads loads its good threads and returns
+  `partial` with the previous checkpoint; an explicit ingest after a finished
+  run queries the provider again, while an active request stays deduplicated.
+- Re-importing a previously seen snapshot restores its text (A → B → A), and
+  malformed or non-advancing pagination fails the chain instead of reporting a
+  truncated result as complete.
 
 Still out of scope: write operations, webhooks, diff/file analysis, attachments,
 OCR, ASR changes, cross-provider deduplication, and UI.

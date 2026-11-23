@@ -56,8 +56,10 @@ duplicated. The same rule applies to GitVerse.
   picked up by the next run. Successfully fetched threads survive a job retry:
   the fetch stage resumes from its artifact file.
 - Pagination always runs to the end (`Link: rel="next"` for GitHub/GitVerse,
-  `X-Next-Page` for GitLab). A run that could not complete pagination or an
-  optional endpoint finishes as `partial`, never as `done`.
+  `X-Next-Page` for GitLab). A next-page marker that is malformed, non-advancing,
+  or points outside the configured HTTPS hosts fails the page chain instead of
+  silently truncating the collection; the run then finishes as `partial`, never
+  as `done`.
 - Retryable failures are HTTP 429, 5xx, timeouts, and network errors. `429`
   honours `Retry-After`; otherwise exponential backoff with jitter is used, up
   to five attempts. `401/403`, source `404`, `422`, and malformed payloads are
@@ -86,8 +88,13 @@ unavailable.
 - Deleted upstream items are soft-deleted (`meta.deleted`, `meta.deleted_at`)
   only when their thread was re-fetched completely; text is never dropped.
 - Embeddings use the same model contract as 0.1.0
-  (`gemini-embedding-2:1536`), batches of up to 64 non-empty texts, and
-  `ON CONFLICT DO NOTHING`, so re-embedding is idempotent.
+  (`gemini-embedding-2:1536`) and batches of up to 64 non-empty texts. Each
+  vector stores the text hash it was computed from: edited text is re-embedded,
+  while metadata-only changes keep the vector, so re-embedding is idempotent.
+- An explicit new `ingest`/`embed` after a finished run creates a new run and
+  queries the provider again; an identical request that is still active is
+  deduplicated. Re-importing a previously seen snapshot restores its text when
+  it is no longer the latest run (A → B → A).
 
 ## Configuration and errors
 

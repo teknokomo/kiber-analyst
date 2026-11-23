@@ -370,3 +370,67 @@ def test_allowed_hosts_config_is_validated(tmp_path) -> None:
     path.write_text("github:\n  allowed_hosts: [bad host]\n", encoding="utf-8")
     with pytest.raises(ConnectorError):
         load_provider_config("github", config_file=path)
+
+
+def test_relative_next_link_is_not_treated_as_completion(monkeypatch) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=[{"n": 1}], headers={"Link": '</page2>; rel="next"'}
+        )
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ConnectorError) as exc:
+        list(client.iter_pages("/repos/o/r/issues"))
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    client.close()
+
+
+def test_invalid_next_page_cursor_is_not_treated_as_completion(monkeypatch) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"n": 1}], headers={"X-Next-Page": "abc"})
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ConnectorError) as exc:
+        list(client.iter_pages("/projects/p/issues", paging="header"))
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    client.close()
+
+
+def test_repeating_next_page_cursor_is_rejected(monkeypatch) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"n": 1}], headers={"X-Next-Page": "2"})
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ConnectorError) as exc:
+        list(client.iter_pages("/projects/p/issues", paging="header"))
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    client.close()
+
+
+def test_repeating_next_link_is_rejected(monkeypatch) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=[{"n": 1}],
+            headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+        )
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ConnectorError) as exc:
+        list(client.iter_pages("/repos/o/r/issues"))
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    client.close()
+
+
+def test_target_with_embedded_credentials_is_rejected(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=[])
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ConnectorError) as exc:
+        client.request_json("GET", "https://user:secret@api.github.com/x")
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    assert calls["n"] == 0
+    client.close()

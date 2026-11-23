@@ -591,3 +591,255 @@ def test_embed_skips_tab_only_text_and_changed_segments(tmp_path: Path) -> None:
             """SELECT count(*) FROM embeddings WHERE project_id=%s AND owner_id=%s""",
             (project_id, str(tab[0])),
         ).fetchone()[0] == 0
+
+
+def test_partial_ingest_loads_good_threads_with_the_real_loader(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.connectors.base import (
+        NormalizedThread,
+        RawItem,
+        RawThread,
+        ThreadRef,
+    )
+    from kiber_analyst.connectors.errors import ConnectorCodes, ConnectorError
+    from kiber_analyst.connectors.normalize import item_record, thread_record
+    from kiber_analyst.external_ingest import run_external_ingest
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/partial-{token}"
+    project_slug = f"kiber-partial-{uuid.uuid4().hex[:10]}"
+
+    class PartialConnector:
+        provider = "github"
+        discovery_errors: list[dict[str, str]] = []
+
+        def validate_source(self, source_id: str) -> None:
+            return None
+
+        def discover(self, source_id: str, checkpoint: dict | None = None):
+            for number in (1, 2):
+                yield ThreadRef(
+                    provider="github", source_id=source_id,
+                    thread_ref=f"{source_id}:issue:{number}", kind="issue",
+                    number=number, updated_at="2026-11-10T10:00:00Z",
+                    state="open", title=f"Issue {number}",
+                )
+
+        def fetch_thread(self, ref: ThreadRef) -> RawThread:
+            if ref.number == 2:
+                raise ConnectorError(
+                    ConnectorCodes.THREAD_NOT_FOUND, "thread disappeared", status=404
+                )
+            body = {
+                "number": 1, "title": "Issue 1", "state": "open",
+                "user": {"login": "alice"},
+                "created_at": "2026-11-01T10:00:00Z",
+                "updated_at": "2026-11-10T10:00:00Z",
+                "html_url": "https://github.com/owner/repo/issues/1",
+                "body": "Good body", "labels": [],
+            }
+            return RawThread(
+                ref=ref, body=body,
+                items=[RawItem(item_kind="body", external_id=None, data=body)],
+            )
+
+        def normalize(self, raw: RawThread) -> NormalizedThread:
+            body = raw.body or {}
+            thread = thread_record(
+                thread_ref_value=raw.ref.thread_ref,
+                title=body.get("title") or "",
+                state=body.get("state"),
+                author="alice",
+                created_at=body.get("created_at"),
+                updated_at=body.get("updated_at"),
+                url=body.get("html_url"),
+                labels=[],
+                meta={},
+            )
+            item = item_record(
+                thread_ref_value=raw.ref.thread_ref,
+                item_kind="body",
+                external_id=None,
+                author="alice",
+                text=body.get("body") or "",
+                posted_at=body.get("created_at"),
+                url=body.get("html_url"),
+                meta={},
+            )
+            return NormalizedThread(thread=thread, items=[item])
+
+    result = run_external_ingest(
+        provider="github", source_id=source_id, project_slug=project_slug,
+        since="2026-11-01", artifact_dir=tmp_path / "partial",
+        env_path=Path(TEST_ENV), connector=PartialConnector(),
+    )
+    assert result["status"] == "partial"
+    assert result["threads"] == 1
+    assert result["load"]["inserted"] == 1
+    assert result["checkpoint_after"]["since"] == "2026-11-01T00:00:00Z"
+    assert result["checkpoint_after"]["watermark_suppressed"] == "partial"
+
+    with _connect(credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+        ).fetchone()[0]
+        assert conn.execute(
+            """SELECT count(*) FROM segments s JOIN documents d ON d.id=s.document_id
+               JOIN sources so ON so.id=d.source_id
+               WHERE so.project_id=%s AND s.thread_ref LIKE %s""",
+            (project_id, f"{source_id}:%"),
+        ).fetchone()[0] == 1
+        run = conn.execute(
+            """SELECT status, checkpoint->>'since' FROM runs
+               WHERE project_id=%s AND kind='external_ingest'
+               ORDER BY started_at DESC LIMIT 1""",
+            (project_id,),
+        ).fetchone()
+        assert run[0] == "done"
+        assert run[1] == "2026-11-01T00:00:00Z"
+
+
+def test_embedding_refreshes_only_when_the_text_changes(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_embed import embed_external
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/embed-{token}"
+    project_slug = f"kiber-embed-{uuid.uuid4().hex[:10]}"
+    thread_ref = f"{source_id}:issue:1"
+
+    def bundle(job_dir: Path, text: str, author: str) -> None:
+        threads = [{
+            "thread_ref": thread_ref, "provider": "github", "kind": "issue", "number": 1,
+            "title": "Embed", "state": "open", "author": "alice",
+            "created_at": "2026-11-01T10:00:00Z", "updated_at": "2026-11-02T10:00:00Z",
+            "url": "https://github.com/owner/repo/issues/1", "labels": [], "meta": {},
+        }]
+        items = [
+            {
+                "external_ref": f"{thread_ref}:body", "thread_ref": thread_ref,
+                "item_kind": "body", "parent_external_ref": None, "author": "alice",
+                "text": "Body", "posted_at": "2026-11-01T10:00:00Z",
+                "url": "https://github.com/owner/repo/issues/1",
+                "content_hash": hashlib.sha256(b"Body").hexdigest(), "meta": {},
+            },
+            {
+                "external_ref": f"{thread_ref}:comment:1", "thread_ref": thread_ref,
+                "item_kind": "comment", "parent_external_ref": None, "author": author,
+                "text": text, "posted_at": "2026-11-02T11:00:00Z",
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-1",
+                "content_hash": hashlib.sha256(text.encode()).hexdigest(), "meta": {},
+            },
+        ]
+        _bundle(job_dir, source_id, "github", threads, items)
+
+    def fake_embedding(texts: list[str]) -> tuple[list[list[float]], int | None]:
+        vectors = []
+        for text in texts:
+            digest = hashlib.sha256(text.encode()).digest() * 48
+            vectors.append([float(byte % 7) for byte in digest[:1536]])
+        return vectors, None
+
+    bundle(tmp_path / "e1", "Original", "bob")
+    load_external(tmp_path / "e1", env_path=Path(TEST_ENV), project_slug=project_slug)
+    first = embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding,
+    )
+    assert (first["inserted"], first["updated_vectors"]) == (2, 0)
+
+    bundle(tmp_path / "e2", "Edited", "bob")
+    load_external(tmp_path / "e2", env_path=Path(TEST_ENV), project_slug=project_slug)
+    edited = embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding,
+    )
+    assert (edited["inserted"], edited["updated_vectors"], edited["skipped_existing"]) == (0, 1, 1)
+
+    bundle(tmp_path / "e3", "Edited", "carol")  # metadata-only change
+    load_external(tmp_path / "e3", env_path=Path(TEST_ENV), project_slug=project_slug)
+    metadata_only = embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding,
+    )
+    assert (
+        metadata_only["inserted"],
+        metadata_only["updated_vectors"],
+        metadata_only["skipped_existing"],
+    ) == (0, 0, 2)
+    with _connect(credentials) as conn:
+        stored = conn.execute(
+            """SELECT e.content_hash FROM embeddings e
+               JOIN segments s ON s.id::text=e.owner_id
+               WHERE s.external_ref=%s""",
+            (f"{thread_ref}:comment:1",),
+        ).fetchone()[0]
+    assert stored == hashlib.sha256(b"Edited").hexdigest()
+
+
+def test_reimporting_an_older_snapshot_restores_its_text(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_embed import embed_external
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/aba-{token}"
+    project_slug = f"kiber-aba-{uuid.uuid4().hex[:10]}"
+    thread_ref = f"{source_id}:issue:1"
+
+    def bundle(job_dir: Path, text: str) -> None:
+        threads = [{
+            "thread_ref": thread_ref, "provider": "github", "kind": "issue", "number": 1,
+            "title": "ABA", "state": "open", "author": "alice",
+            "created_at": "2026-11-01T10:00:00Z", "updated_at": "2026-11-02T10:00:00Z",
+            "url": "https://github.com/owner/repo/issues/1", "labels": [], "meta": {},
+        }]
+        items = [{
+            "external_ref": f"{thread_ref}:comment:1", "thread_ref": thread_ref,
+            "item_kind": "comment", "parent_external_ref": None, "author": "bob",
+            "text": text, "posted_at": "2026-11-02T11:00:00Z",
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-1",
+            "content_hash": hashlib.sha256(text.encode()).hexdigest(), "meta": {},
+        }]
+        _bundle(job_dir, source_id, "github", threads, items)
+
+    def fake_embedding(texts: list[str]) -> tuple[list[list[float]], int | None]:
+        return [[0.03] * 1536 for _ in texts], None
+
+    bundle(tmp_path / "a1", "Version A")
+    load_external(tmp_path / "a1", env_path=Path(TEST_ENV), project_slug=project_slug)
+    embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding,
+    )
+    bundle(tmp_path / "b1", "Version B")
+    load_external(tmp_path / "b1", env_path=Path(TEST_ENV), project_slug=project_slug)
+    embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding,
+    )
+    # Re-import the previously seen snapshot: the database must return to A,
+    # and the embedding must be refreshed for the restored text.
+    restored = load_external(
+        tmp_path / "a1", env_path=Path(TEST_ENV), project_slug=project_slug
+    )
+    assert restored["updated"] >= 1
+    refreshed = embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding,
+    )
+    assert refreshed["updated_vectors"] == 1
+    with _connect(credentials) as conn:
+        row = conn.execute(
+            "SELECT text, content_hash FROM segments WHERE external_ref=%s",
+            (f"{thread_ref}:comment:1",),
+        ).fetchone()
+        assert row[0] == "Version A"
+        assert row[1] == hashlib.sha256(b"Version A").hexdigest()

@@ -19,6 +19,11 @@ ALTER TABLE segments
 ALTER TABLE segments
   ADD COLUMN IF NOT EXISTS item_kind text;
 
+-- Embeddings record the text hash they were computed from: an edited segment
+-- must be re-embedded, while metadata-only updates keep the vector.
+ALTER TABLE embeddings
+  ADD COLUMN IF NOT EXISTS content_hash text;
+
 -- External items must be unique per source (project), not globally: the same
 -- repository may be ingested into two projects, and each project must keep its
 -- own rows. Telegram rows (item_kind IS NULL) keep their global uniqueness.

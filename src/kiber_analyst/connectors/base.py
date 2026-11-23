@@ -19,7 +19,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from kiber_analyst.connectors.config import ProviderConfig
 from kiber_analyst.connectors.errors import ConnectorCodes, ConnectorError
@@ -116,20 +116,25 @@ class ConnectorHttpClient:
         return frozenset(self._allowed_hosts)
 
     def _validate_target(self, url: str) -> None:
-        """Reject any authenticated request outside the configured HTTPS hosts."""
-        if url.startswith("//"):
+        """Reject any authenticated request outside the configured HTTPS hosts.
+
+        The target is resolved against the configured API base first, so
+        relative paths, protocol-relative references, and pagination links are
+        all checked before the Authorization header can be attached.
+        """
+        target = urljoin(self._config.api_url.rstrip("/") + "/", url)
+        parts = urlsplit(target)
+        host = (parts.hostname or "").lower()
+        if parts.scheme != "https" or not host or host not in self._allowed_hosts:
             raise ConnectorError(
                 ConnectorCodes.MALFORMED_RESPONSE,
-                f"{self._config.provider} pagination target is not an absolute HTTPS URL",
+                f"{self._config.provider} request target is not an allowed HTTPS endpoint",
             )
-        if url.startswith(("http://", "https://")):
-            parts = urlsplit(url)
-            host = (parts.hostname or "").lower()
-            if parts.scheme != "https" or not host or host not in self._allowed_hosts:
-                raise ConnectorError(
-                    ConnectorCodes.MALFORMED_RESPONSE,
-                    f"{self._config.provider} request target is not an allowed HTTPS endpoint",
-                )
+        if parts.username or parts.password:
+            raise ConnectorError(
+                ConnectorCodes.MALFORMED_RESPONSE,
+                f"{self._config.provider} request target contains credentials",
+            )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -311,9 +316,15 @@ class ConnectorHttpClient:
         paging: str = "link",
         page_param: str = "page",
     ) -> Iterator[tuple[list, dict[str, str]]]:
-        """Yield (items, headers) per page, following the provider's paging style."""
+        """Yield (items, headers) per page, following the provider's paging style.
+
+        A page chain ends only when the provider omits the next-page marker.
+        Malformed or unparsable markers raise MALFORMED_RESPONSE instead of
+        silently reporting a truncated result as complete.
+        """
         next_url: str | None = url
         next_params = dict(params or {})
+        seen_targets: set[tuple[str | None, str | None]] = set()
         while next_url is not None:
             payload, _not_modified = self.request_json(
                 "GET", next_url, params=next_params, headers=headers
@@ -339,7 +350,20 @@ class ConnectorHttpClient:
                 page_param=page_param,
                 current_params=next_params,
                 current_url=next_url,
+                provider=self._config.provider,
             )
+            marker = (
+                (next_url, None)
+                if next_url is not None
+                else (None, next_params.get(page_param))
+            )
+            if next_url is not None or next_params.get(page_param) is not None:
+                if marker in seen_targets:
+                    raise ConnectorError(
+                        ConnectorCodes.MALFORMED_RESPONSE,
+                        f"{self._config.provider} pagination does not advance",
+                    )
+                seen_targets.add(marker)
 
     def request_raw(self, method: str, url: str, *, params=None, headers=None):
         """Return the httpx.Response itself (used for header-only probes)."""
@@ -363,18 +387,33 @@ def _next_page(
     page_param: str,
     current_params: dict[str, Any],
     current_url: str | None,
+    provider: str,
 ) -> tuple[str | None, dict[str, Any]]:
     if response is None:
-        return None, current_params
+        return None, {}
     if paging == "link":
         link = response.headers.get("Link") or ""
         match = re.search(r'<([^>]+)>;\s*rel="next"', link)
         if match is None:
-            return None, current_params
-        return match.group(1), {}
-    header = response.headers.get("X-Next-Page")
+            return None, {}
+        target = match.group(1).strip()
+        parts = urlsplit(target)
+        if parts.scheme != "https" or not parts.hostname:
+            # A next link we cannot resolve to an absolute HTTPS URL must not
+            # be treated as the end of the collection.
+            raise ConnectorError(
+                ConnectorCodes.MALFORMED_RESPONSE,
+                f"{provider} returned an unusable next-page link",
+            )
+        return target, {}
+    header = (response.headers.get("X-Next-Page") or "").strip()
     if not header:
-        return None, current_params
+        return None, {}
+    if re.fullmatch(r"[1-9][0-9]{0,9}", header) is None:
+        raise ConnectorError(
+            ConnectorCodes.MALFORMED_RESPONSE,
+            f"{provider} returned an invalid next-page cursor",
+        )
     params = dict(current_params)
     params[page_param] = header
     return current_url, params
