@@ -155,7 +155,8 @@ def test_search_uses_read_only_hybrid_reciprocal_rank_fusion_sql() -> None:
 def test_search_sql_uses_group_title_and_preserves_sender_identity() -> None:
     normalized = " ".join(SEARCH_SQL.lower().split())
     assert normalized.count(
-        "case when so.kind = 'telegram' then p.title else so.title end as chat_title"
+        "case when so.kind = 'telegram' then p.title "
+        "else coalesce(so.title, so.external_id) end as chat_title"
     ) == 2
     assert normalized.count(
         "coalesce(nullif(s.speaker, ''), nullif(s.meta->>'author_id', ''), "

@@ -10,7 +10,162 @@ from typing import Any
 from kiber_analyst.embedding_contract import MODEL_KEY
 from kiber_analyst.errors import SearchError
 
-SEARCH_SQL = "\nWITH query_args AS (\n  SELECT websearch_to_tsquery('russian', %(query)s) AS tsq,\n         %(vector)s::vector AS query_vector\n),\nsearch_units AS (\n  SELECT\n    'segment:' || s.id::text AS unit_key,\n    'segment'::text AS source,\n    s.id AS segment_id,\n    NULL::bigint AS asr_segment_id,\n    s.document_id,\n    s.text,\n    s.tsv,\n    s.posted_at,\n    COALESCE(NULLIF(s.speaker, ''), NULLIF(s.meta->>'author_id', ''),\n             NULLIF(s.meta->>'sender_id', ''), 'Unknown') AS author,\n    s.meta,\n    s.meta->>'url' AS url,\n    NULL::bigint AS start_ms,\n    NULL::bigint AS end_ms,\n    NULL::uuid AS asr_run_id,\n    so.kind AS source_kind,\n    p.id AS project_id,\n    p.slug AS project_slug,\n    ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id')) AS source_id,\n    so.external_id AS chat_id,\n    CASE WHEN so.kind = 'telegram' THEN p.title ELSE so.title END AS chat_title,\n    s.meta->>'topic_id' AS topic_id,\n    COALESCE(s.meta->>'topic_title', d.meta->>'topic_title') AS topic_title,\n    split_part(s.external_ref, ':', 3) AS message_id\n  FROM segments s\n  JOIN documents d ON d.id = s.document_id\n  JOIN sources so ON so.id = d.source_id\n  JOIN projects p ON p.id = so.project_id\n\n  UNION ALL\n\n  SELECT\n    'asr:' || a.id::text AS unit_key,\n    'asr'::text AS source,\n    s.id AS segment_id,\n    a.id AS asr_segment_id,\n    s.document_id,\n    a.text,\n    a.tsv,\n    s.posted_at,\n    COALESCE(NULLIF(s.speaker, ''), NULLIF(s.meta->>'author_id', ''),\n             NULLIF(s.meta->>'sender_id', ''), 'Unknown') AS author,\n    s.meta,\n    s.meta->>'url' AS url,\n    a.start_ms,\n    a.end_ms,\n    a.run_id AS asr_run_id,\n    so.kind AS source_kind,\n    p.id AS project_id,\n    p.slug AS project_slug,\n    ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id')) AS source_id,\n    so.external_id AS chat_id,\n    CASE WHEN so.kind = 'telegram' THEN p.title ELSE so.title END AS chat_title,\n    s.meta->>'topic_id' AS topic_id,\n    COALESCE(s.meta->>'topic_title', d.meta->>'topic_title') AS topic_title,\n    split_part(s.external_ref, ':', 3) AS message_id\n  FROM asr_segments a\n  JOIN asr_runs ar ON ar.id = a.run_id\n    AND ar.status IN ('done', 'partial')\n  JOIN asr_results r ON r.run_id = a.run_id\n    AND r.external_ref = a.external_ref\n    AND r.status = 'complete'\n  JOIN segments s ON s.external_ref = a.external_ref\n  JOIN documents d ON d.id = s.document_id\n  JOIN sources so ON so.id = d.source_id\n  JOIN projects p ON p.id = so.project_id\n    AND p.id = ar.project_id\n  WHERE btrim(a.text) <> ''\n),\nbase AS (\n  SELECT u.*\n  FROM search_units u\n  WHERE u.project_slug = %(project)s\n    AND (%(source)s::text IS NULL OR u.source = %(source)s::text)\n    AND (%(source_kind)s::text IS NULL OR u.source_kind = %(source_kind)s::text)\n    AND (%(date_from)s::date IS NULL OR u.posted_at >=\n         (%(date_from)s::date::timestamp AT TIME ZONE 'Europe/Moscow'))\n    AND (%(date_to)s::date IS NULL OR u.posted_at <\n         ((%(date_to)s::date + 1)::timestamp AT TIME ZONE 'Europe/Moscow'))\n    AND (%(author)s::text IS NULL OR u.author ILIKE '%%' || %(author)s::text || '%%')\n    AND (%(topic)s::text IS NULL OR u.meta->>'topic_id' = %(topic)s::text)\n    AND (%(source_id)s::text IS NULL OR u.source_id = %(source_id)s::text)\n),\nlexical_rank AS (\n  SELECT b.unit_key,\n         row_number() OVER (\n           ORDER BY ts_rank_cd(b.tsv, q.tsq) DESC, b.unit_key\n         ) AS position\n  FROM base b CROSS JOIN query_args q\n  WHERE b.tsv @@ q.tsq\n),\nsemantic_rank AS (\n  SELECT b.unit_key,\n         row_number() OVER (\n           ORDER BY e.embedding <=> q.query_vector, b.unit_key\n         ) AS position\n  FROM base b\n  JOIN embeddings e\n    ON e.project_id = b.project_id\n   AND e.model = %(model)s\n   AND e.owner_table = CASE\n         WHEN b.source = 'asr' THEN 'asr_segments'\n         ELSE 'segments'\n       END\n   AND e.owner_id = CASE\n         WHEN b.source = 'asr' THEN b.asr_segment_id::text\n         ELSE b.segment_id::text\n       END\n  CROSS JOIN query_args q\n  WHERE q.query_vector IS NOT NULL\n),\nrank_contributions AS (\n  SELECT unit_key, 1.0 / (60 + position) AS contribution FROM lexical_rank\n  UNION ALL\n  SELECT unit_key, 1.0 / (60 + position) AS contribution FROM semantic_rank\n),\nfused AS (\n  SELECT unit_key, sum(contribution) AS score\n  FROM rank_contributions\n  GROUP BY unit_key\n)\nSELECT b.source, b.segment_id, b.asr_segment_id, b.document_id,\n       b.asr_run_id, b.start_ms, b.end_ms, fused.score, b.text, b.url,\n       b.posted_at, b.author, b.source_kind, b.project_slug,\n       b.source_id, b.chat_id, b.chat_title, b.topic_id, b.topic_title, b.message_id\nFROM fused\nJOIN base b USING (unit_key)\nORDER BY fused.score DESC, b.unit_key\nLIMIT %(limit)s\n"
+SEARCH_SQL = """
+WITH query_args AS (
+  SELECT websearch_to_tsquery('russian', %(query)s) AS tsq,
+         %(vector)s::vector AS query_vector
+),
+search_units AS (
+  SELECT
+    'segment:' || s.id::text AS unit_key,
+    'segment'::text AS source,
+    s.id AS segment_id,
+    NULL::bigint AS asr_segment_id,
+    s.document_id,
+    s.text,
+    s.tsv,
+    s.posted_at,
+    COALESCE(NULLIF(s.speaker, ''), NULLIF(s.meta->>'author_id', ''),
+             NULLIF(s.meta->>'sender_id', ''), 'Unknown') AS author,
+    s.meta,
+    s.meta->>'url' AS url,
+    NULL::bigint AS start_ms,
+    NULL::bigint AS end_ms,
+    NULL::uuid AS asr_run_id,
+    so.kind AS source_kind,
+    p.id AS project_id,
+    p.slug AS project_slug,
+    (CASE WHEN so.kind = 'telegram'
+      THEN ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id'))
+      ELSE (so.kind || ':' || so.external_id) END) AS source_id,
+    so.external_id AS chat_id,
+    CASE WHEN so.kind = 'telegram' THEN p.title
+         ELSE COALESCE(so.title, so.external_id) END AS chat_title,
+    s.meta->>'topic_id' AS topic_id,
+    COALESCE(s.meta->>'topic_title', d.meta->>'topic_title') AS topic_title,
+    COALESCE(s.meta->>'message_id', split_part(s.external_ref, ':', 3)) AS message_id,
+    s.thread_ref AS thread_ref,
+    (CASE WHEN s.item_kind IS NOT NULL THEN s.external_ref END) AS item_ref,
+    s.parent_external_ref AS parent_ref,
+    s.item_kind AS item_kind,
+    d.meta->>'state' AS state,
+    d.meta->'labels' AS labels
+  FROM segments s
+  JOIN documents d ON d.id = s.document_id
+  JOIN sources so ON so.id = d.source_id
+  JOIN projects p ON p.id = so.project_id
+
+  UNION ALL
+
+  SELECT
+    'asr:' || a.id::text AS unit_key,
+    'asr'::text AS source,
+    s.id AS segment_id,
+    a.id AS asr_segment_id,
+    s.document_id,
+    a.text,
+    a.tsv,
+    s.posted_at,
+    COALESCE(NULLIF(s.speaker, ''), NULLIF(s.meta->>'author_id', ''),
+             NULLIF(s.meta->>'sender_id', ''), 'Unknown') AS author,
+    s.meta,
+    s.meta->>'url' AS url,
+    a.start_ms,
+    a.end_ms,
+    a.run_id AS asr_run_id,
+    so.kind AS source_kind,
+    p.id AS project_id,
+    p.slug AS project_slug,
+    (CASE WHEN so.kind = 'telegram'
+      THEN ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id'))
+      ELSE (so.kind || ':' || so.external_id) END) AS source_id,
+    so.external_id AS chat_id,
+    CASE WHEN so.kind = 'telegram' THEN p.title
+         ELSE COALESCE(so.title, so.external_id) END AS chat_title,
+    s.meta->>'topic_id' AS topic_id,
+    COALESCE(s.meta->>'topic_title', d.meta->>'topic_title') AS topic_title,
+    COALESCE(s.meta->>'message_id', split_part(s.external_ref, ':', 3)) AS message_id,
+    s.thread_ref AS thread_ref,
+    (CASE WHEN s.item_kind IS NOT NULL THEN s.external_ref END) AS item_ref,
+    s.parent_external_ref AS parent_ref,
+    s.item_kind AS item_kind,
+    d.meta->>'state' AS state,
+    d.meta->'labels' AS labels
+  FROM asr_segments a
+  JOIN asr_runs ar ON ar.id = a.run_id
+    AND ar.status IN ('done', 'partial')
+  JOIN asr_results r ON r.run_id = a.run_id
+    AND r.external_ref = a.external_ref
+    AND r.status = 'complete'
+  JOIN segments s ON s.external_ref = a.external_ref
+  JOIN documents d ON d.id = s.document_id
+  JOIN sources so ON so.id = d.source_id
+  JOIN projects p ON p.id = so.project_id
+    AND p.id = ar.project_id
+  WHERE btrim(a.text) <> ''
+),
+base AS (
+  SELECT u.*
+  FROM search_units u
+  WHERE u.project_slug = %(project)s
+    AND (%(source)s::text IS NULL OR u.source = %(source)s::text)
+    AND (%(source_kind)s::text IS NULL OR u.source_kind = %(source_kind)s::text)
+    AND (%(date_from)s::date IS NULL OR u.posted_at >=
+         (%(date_from)s::date::timestamp AT TIME ZONE 'Europe/Moscow'))
+    AND (%(date_to)s::date IS NULL OR u.posted_at <
+         ((%(date_to)s::date + 1)::timestamp AT TIME ZONE 'Europe/Moscow'))
+    AND (%(author)s::text IS NULL OR u.author ILIKE '%%' || %(author)s::text || '%%')
+    AND (%(topic)s::text IS NULL OR u.meta->>'topic_id' = %(topic)s::text)
+    AND (%(source_id)s::text IS NULL OR u.source_id = %(source_id)s::text)
+),
+lexical_rank AS (
+  SELECT b.unit_key,
+         row_number() OVER (
+           ORDER BY ts_rank_cd(b.tsv, q.tsq) DESC, b.unit_key
+         ) AS position
+  FROM base b CROSS JOIN query_args q
+  WHERE b.tsv @@ q.tsq
+),
+semantic_rank AS (
+  SELECT b.unit_key,
+         row_number() OVER (
+           ORDER BY e.embedding <=> q.query_vector, b.unit_key
+         ) AS position
+  FROM base b
+  JOIN embeddings e
+    ON e.project_id = b.project_id
+   AND e.model = %(model)s
+   AND e.owner_table = CASE
+         WHEN b.source = 'asr' THEN 'asr_segments'
+         ELSE 'segments'
+       END
+   AND e.owner_id = CASE
+         WHEN b.source = 'asr' THEN b.asr_segment_id::text
+         ELSE b.segment_id::text
+       END
+  CROSS JOIN query_args q
+  WHERE q.query_vector IS NOT NULL
+),
+rank_contributions AS (
+  SELECT unit_key, 1.0 / (60 + position) AS contribution FROM lexical_rank
+  UNION ALL
+  SELECT unit_key, 1.0 / (60 + position) AS contribution FROM semantic_rank
+),
+fused AS (
+  SELECT unit_key, sum(contribution) AS score
+  FROM rank_contributions
+  GROUP BY unit_key
+)
+SELECT b.source, b.segment_id, b.asr_segment_id, b.document_id,
+       b.asr_run_id, b.start_ms, b.end_ms, fused.score, b.text, b.url,
+       b.posted_at, b.author, b.source_kind, b.project_slug,
+       b.source_id, b.chat_id, b.chat_title, b.topic_id, b.topic_title, b.message_id,
+       b.thread_ref, b.item_ref, b.parent_ref, b.item_kind, b.state, b.labels
+FROM fused
+JOIN base b USING (unit_key)
+ORDER BY fused.score DESC, b.unit_key
+LIMIT %(limit)s
+"""
 
 
 def _timecode(milliseconds: int | None) -> str | None:
@@ -46,14 +201,28 @@ def execute_search(
         raise SearchError("Project is invalid")
     if source not in {None, "segment", "asr"}:
         raise SearchError("Source must be all, segment, or asr")
-    if source_kind not in {None, "telegram", "document", "web", "video"}:
+    if source_kind not in {
+        None,
+        "telegram",
+        "document",
+        "web",
+        "video",
+        "github",
+        "gitlab",
+        "gitverse",
+    }:
         raise SearchError("Source kind is invalid")
-    if source_id is not None and (
-        not isinstance(source_id, str)
-        or len(source_id) > 128
-        or not re.fullmatch(r"telegram:-[1-9][0-9]{0,18}:topic:[1-9][0-9]{0,9}", source_id)
-    ):
-        raise SearchError("Source ID is invalid")
+    external_source = None
+    if source_id is not None:
+        if not isinstance(source_id, str) or len(source_id) > 128:
+            raise SearchError("Source ID is invalid")
+        from kiber_analyst.connectors.source_ids import parse_source_id
+
+        external_source = parse_source_id(source_id)
+        if external_source is None and not re.fullmatch(
+            r"telegram:-[1-9][0-9]{0,18}:topic:[1-9][0-9]{0,9}", source_id
+        ):
+            raise SearchError("Source ID is invalid")
     if type(limit) is not int or not 1 <= limit <= 100:
         raise SearchError("Limit must be between 1 and 100")
     if date_from and date_to and date_from > date_to:
@@ -70,18 +239,31 @@ def execute_search(
             if not cursor.fetchone():
                 raise SearchError(f"Project {project!r} does not exist")
             if source_id is not None:
-                cursor.execute(
-                    """SELECT 1 FROM sources so
-                       JOIN projects p ON p.id = so.project_id
-                       JOIN documents d ON d.source_id = so.id
-                       WHERE p.slug = %s AND so.kind = 'telegram'
-                         AND ('telegram:' || so.external_id || ':topic:' ||
-                              (d.meta->>'topic_id')) = %s
-                       LIMIT 1""",
-                    (project, source_id),
-                )
-                if not cursor.fetchone():
-                    raise SearchError("Telegram source or topic does not exist")
+                if external_source is not None:
+                    cursor.execute(
+                        """SELECT 1 FROM sources so
+                           JOIN projects p ON p.id = so.project_id
+                           JOIN documents d ON d.source_id = so.id
+                           WHERE p.slug = %s AND so.kind = %s
+                             AND so.external_id = %s
+                           LIMIT 1""",
+                        (project, external_source.provider, external_source.external_id),
+                    )
+                    if not cursor.fetchone():
+                        raise SearchError("External source does not exist")
+                else:
+                    cursor.execute(
+                        """SELECT 1 FROM sources so
+                           JOIN projects p ON p.id = so.project_id
+                           JOIN documents d ON d.source_id = so.id
+                           WHERE p.slug = %s AND so.kind = 'telegram'
+                             AND ('telegram:' || so.external_id || ':topic:' ||
+                                  (d.meta->>'topic_id')) = %s
+                           LIMIT 1""",
+                        (project, source_id),
+                    )
+                    if not cursor.fetchone():
+                        raise SearchError("Telegram source or topic does not exist")
             cursor.execute(
                 SEARCH_SQL,
                 {
@@ -132,6 +314,13 @@ def execute_search(
                 "topic_id": row[17],
                 "topic_title": row[18],
                 "message_id": row[19],
+                "provider": row[12],
+                "thread_ref": row[20],
+                "item_ref": row[21],
+                "parent_ref": row[22],
+                "item_kind": row[23],
+                "state": row[24],
+                "labels": row[25] if isinstance(row[25], list) else None,
             }
         )
     return {

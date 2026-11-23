@@ -141,7 +141,7 @@ class ToolService:
                 raise ToolFailure("invalid_argument","limit must be between 1 and 50")
             if source not in {"all","segment","asr"}:
                 raise ToolFailure("invalid_argument","source is invalid")
-            if source_kind not in {None,"telegram","document","web","video"}:
+            if source_kind not in {None,"telegram","document","web","video","github","gitlab","gitverse"}:
                 raise ToolFailure("invalid_argument","source_kind is invalid")
             dates=[]
             for value in (date_from,date_to):
@@ -230,23 +230,25 @@ class ToolService:
                            (SELECT count(*) FROM asr_results r JOIN segments s ON s.external_ref=r.external_ref
                              JOIN asr_runs ar ON ar.id=r.run_id
                              WHERE s.document_id=d.id AND r.status='complete'
-                               AND ar.status IN ('done','partial'))
+                               AND ar.status IN ('done','partial')),
+                           d.external_ref, d.meta->>'state', d.meta->>'topic_title'
                            FROM documents d JOIN sources so ON so.id=d.source_id WHERE d.id=%s""",
                         (parsed,),
                     )
                     row=cur.fetchone()
                     if row is None:
                         raise ToolFailure("not_found","Document was not found")
-                    document={"id":str(row[0]),"source_kind":row[1],"doc_type":row[2],"language":row[3],"created_at":row[4].isoformat() if row[4] else None,"segments_count":int(row[5]),"asr_results_count":int(row[6])}
+                    document={"id":str(row[0]),"source_kind":row[1],"doc_type":row[2],"language":row[3],"created_at":row[4].isoformat() if row[4] else None,"segments_count":int(row[5]),"asr_results_count":int(row[6]),"external_ref":row[7],"state":row[8],"title":row[9]}
                     cur.execute(
                         """SELECT id,external_ref,posted_at,speaker,text,meta->>'url',
-                                  meta->>'media_type',meta->>'topic_id'
+                                  meta->>'media_type',meta->>'topic_id',
+                                  thread_ref,parent_external_ref,item_kind
                            FROM segments WHERE document_id=%s AND id>%s ORDER BY id LIMIT %s""",
                         (parsed,after,limit+1),
                     )
                     rows=cur.fetchall()
                     page=rows[:limit]
-                    segments=[{"segment_id":int(r[0]),"external_ref":r[1],"posted_at":r[2].isoformat() if r[2] else None,"author":r[3],"text":r[4],"url":r[5],"media_type":r[6],"topic_id":r[7]} for r in page]
+                    segments=[{"segment_id":int(r[0]),"external_ref":r[1],"posted_at":r[2].isoformat() if r[2] else None,"author":r[3],"text":r[4],"url":r[5],"media_type":r[6],"topic_id":r[7],"thread_ref":r[8],"parent_ref":r[9],"item_kind":r[10]} for r in page]
                     asr_results=[]
                     if include_asr and page:
                         refs=[r[1] for r in page if r[1] is not None]

@@ -17,7 +17,7 @@ from kiber_analyst_mcp.auth import BearerAuthMiddleware
 from kiber_analyst_mcp.config import MCPConfig
 from kiber_analyst_mcp.tools import ToolFailure, ToolService
 
-SourceKind = Literal["telegram", "document", "web", "video"]
+SourceKind = Literal["telegram", "document", "web", "video", "github", "gitlab", "gitverse"]
 Source = Literal["all", "segment", "asr"]
 
 

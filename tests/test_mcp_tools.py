@@ -45,7 +45,10 @@ class FakeCursor:
             self.rows = self.connection.search_rows(params)
             return
         if "SELECT d.id,so.kind,d.doc_type" in query:
-            self.rows = [(DOCUMENT_ID, "telegram", "export", "ru", CREATED_AT, 403, 9)]
+            self.rows = [
+                (DOCUMENT_ID, "telegram", "export", "ru", CREATED_AT, 403, 9,
+                 None, None, None),
+            ]
             return
         if "FROM segments WHERE document_id=%s AND id>%s" in query:
             assert isinstance(params, tuple)
@@ -110,6 +113,7 @@ class FakeConnection:
             "source message", "https://t.me/example", CREATED_AT, "Test User",
             "telegram", "sample-project", "telegram:-10012345:topic:77",
             "-10012345", "Group title", "77", "Kibervoyna", "7087",
+            None, None, None, None, None, None,
         )
         asr = (
             "asr", 12, 22, DOCUMENT_ID, "00000000-0000-0000-0000-000000000003",
@@ -117,6 +121,7 @@ class FakeConnection:
             CREATED_AT, "Test User", "telegram", "sample-project",
             "telegram:-10012345:topic:77", "-10012345",
             "Group title", "77", "Kibervoyna", "7087",
+            None, None, None, None, None, None,
         )
         source = params["source"]
         if source == "segment":
@@ -136,6 +141,9 @@ class FakeConnection:
             "https://t.me/example",
             "voice_message" if number <= 9 else None,
             "77",
+            None,
+            None,
+            None,
         )
 
 
