@@ -63,6 +63,7 @@ DEFAULT_POOLS = {
     "embed": "gemini_embed",
     "asr_embed": "gemini_asr_embed",
     "search": "gemini_query",
+    "external_embed": "gemini_embed",
 }
 MAX_TELEGRAM_INGEST_ATTEMPTS = 3
 
@@ -197,16 +198,18 @@ class JobWorker:
         profile=request.get("profile")
         strategy=request.get("strategy")
         requested_pool=request.get("pool")
-        if operation == "telegram_ingest":
+        if operation in {"telegram_ingest", "external_ingest"}:
             if requested_pool is not None or profile is not None or strategy is not None:
-                raise JobsError("Telegram ingestion does not accept provider routing options")
+                raise JobsError("Ingestion does not accept provider routing options")
             pool_name=None
         else:
             pool_name=requested_pool or DEFAULT_POOLS[operation]
             if not isinstance(pool_name,str) or pool_name not in self.pools:
                 raise JobsError("Unknown provider pool")
             pool=self.pools[pool_name]
-            if pool.operation!=operation:
+            if pool.operation!=operation and not (
+                pool.operation=="embed" and operation=="external_embed"
+            ):
                 raise JobsError("Selected provider pool does not support this operation")
         if profile is not None and (request.get("pool") or strategy):
             raise JobsError("--profile cannot be combined with --pool or --strategy")
@@ -340,9 +343,17 @@ class JobWorker:
                     return asr_source_overview(
                         request.get("source_id"), request.get("project")
                     )
+                from kiber_analyst.connectors.source_ids import parse_source_id
                 from kiber_analyst.source_overview import source_overview
 
-                return source_overview(request.get("source_id"), request.get("project"))
+                source_value = request.get("source_id")
+                if parse_source_id(source_value) is not None:
+                    from kiber_analyst.external_source_overview import (
+                        external_source_overview,
+                    )
+
+                    return external_source_overview(source_value, request.get("project"))
+                return source_overview(source_value, request.get("project"))
             except Exception:
                 raise JobsError("Source overview is unavailable") from None
         if action=="doctor":
@@ -847,6 +858,98 @@ class JobWorker:
             return result
         raise JobsError("Telegram ingestion retry limit exceeded")
 
+    def _run_external_ingest(self,job:JobRecord)->dict[str,Any]:
+        from kiber_analyst.errors import IngestError
+        from kiber_analyst.external_ingest import run_external_ingest
+        from kiber_analyst.load import ENV_PATH
+
+        params=job.command["params"]
+        item=self.store.ensure_item(job.id,"external-source",params["source_id"])
+        self.store.update_item(item["id"],"running",checkpoint={
+            "provider":params["provider"],
+            "since":params.get("since"),
+            "limit":params.get("limit"),
+        })
+        artifact_dir=self.store.jobs_dir/job.id/"external-ingest"
+        last_code="UNKNOWN"
+        for attempt in range(1,MAX_TELEGRAM_INGEST_ATTEMPTS+1):
+            self._check_cancel_deadline(job)
+            try:
+                result=run_external_ingest(
+                    provider=params["provider"],source_id=params["source_id"],
+                    project_slug=params["project"],since=params.get("since"),
+                    limit=params.get("limit"),dry_run=params.get("dry_run",False),
+                    artifact_dir=artifact_dir,env_path=ENV_PATH,
+                )
+            except IngestError as exc:
+                code=getattr(exc,"code","")
+                retryable_connector=getattr(exc,"retryable",False)
+                last_code=code or type(exc).__name__
+                if attempt < MAX_TELEGRAM_INGEST_ATTEMPTS and (
+                    retryable_connector or self._retryable_ingest_error(exc)
+                ):
+                    self.store.update_item(item["id"],"waiting",checkpoint={
+                        "attempt":attempt,"retry":code or "transient_error",
+                    })
+                    time.sleep(min(2 ** (attempt-1),4))
+                    self.store.update_item(item["id"],"running",checkpoint={"attempt":attempt+1})
+                    continue
+                self.store.update_item(item["id"],"failed",checkpoint={
+                    "attempt":attempt,"error_code":last_code,
+                })
+                raise JobsError(f"External ingestion failed ({last_code})") from exc
+            self.store.update_item(item["id"],"done",checkpoint={
+                "attempts":attempt,
+                "threads":result.get("threads",0),
+                "items":result.get("items",0),
+                "inserted":result.get("load",{}).get("inserted",0),
+                "updated":result.get("load",{}).get("updated",0),
+                "skipped":result.get("load",{}).get("skipped",0),
+                "deleted":result.get("load",{}).get("deleted",0),
+                "status":result.get("status"),
+            })
+            result["retry_attempts"]=attempt
+            self.store.update_progress(job.id,{
+                "threads":result.get("threads",0),
+                "items":result.get("items",0),
+                "nonempty":result.get("nonempty",0),
+                "skipped_empty":result.get("skipped_empty",0),
+                "status":result.get("status"),
+                "inserted":result.get("load",{}).get("inserted",0),
+                "updated":result.get("load",{}).get("updated",0),
+                "skipped":result.get("load",{}).get("skipped",0),
+                "deleted":result.get("load",{}).get("deleted",0),
+            })
+            return result
+        raise JobsError("External ingestion retry limit exceeded")
+
+    def _run_external_embedding(self,job:JobRecord)->dict[str,Any]:
+        from kiber_analyst.external_embed import embed_external
+
+        params=job.command["params"]
+        callback=self._embedding_callback(job,"external-embed")
+        report_path=self.store.jobs_dir/job.id/"external-embed-report.json"
+        result=embed_external(
+            params["source_id"],project=params["project"],limit=params.get("limit"),
+            embedding_call=callback,report_path=report_path,
+        )
+        for item_id in callback.item_ids:
+            item=next((entry for entry in self.store.job_items(job.id) if entry["id"]==item_id),None)
+            if item:
+                self.store.update_item(item_id,"done",checkpoint={"response_saved":True,"embedding_status":result.get("status")})
+        progress={
+            "completed_batches":sum(
+                1 for entry in self.store.job_items(job.id)
+                if entry["key"].startswith("external-embed:") and entry["state"] == "done"
+            ),
+        }
+        for key in ("inserted", "skipped_existing", "skipped_empty"):
+            if isinstance(result.get(key), int):
+                progress[key]=result[key]
+        self.store.update_progress(job.id,progress)
+        result["provider_attempts"]=self.store.attempts_summary(job.id)
+        return result
+
     def _run_embedding(self,job:JobRecord,*,asr:bool)->dict[str,Any]:
         callback=self._embedding_callback(job,"asr-embed" if asr else "telegram-embed")
         params=job.command["params"]
@@ -955,6 +1058,10 @@ class JobWorker:
                 result=self._search(job)
             elif job.operation=="telegram_ingest":
                 result=self._run_telegram_ingest(job)
+            elif job.operation=="external_ingest":
+                result=self._run_external_ingest(job)
+            elif job.operation=="external_embed":
+                result=self._run_external_embedding(job)
             else:
                 raise JobsError("Unsupported queued operation")
             self.store.complete(job.id,{**result,"job_id":job.id},state="done")

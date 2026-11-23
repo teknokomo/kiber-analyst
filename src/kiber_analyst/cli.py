@@ -130,12 +130,58 @@ def _parser(prog: str = "kiber-analyst") -> argparse.ArgumentParser:
     embed.add_argument("--job", type=Path, required=True)
     embed.add_argument("--project", help="override project slug from the job manifest")
 
+    for provider_name in ("github", "gitlab", "gitverse"):
+        provider_parser = top.add_parser(
+            provider_name,
+            help=f"ingest {provider_name} discussions (read-only)",
+        )
+        provider_commands = provider_parser.add_subparsers(dest="command", required=True)
+        ingest_parser = provider_commands.add_parser(
+            "ingest", help="queue a read-only discussions ingest"
+        )
+        if provider_name == "gitlab":
+            ingest_parser.add_argument(
+                "--host", default="gitlab.com", help="GitLab host, always required in source_id"
+            )
+            ingest_parser.add_argument(
+                "--project", required=True, help="namespace/project path"
+            )
+            ingest_parser.add_argument(
+                "--project-slug", required=True, help="target project slug"
+            )
+        else:
+            ingest_parser.add_argument("--repo", required=True, help="owner/repo")
+            ingest_parser.add_argument("--project", required=True, help="target project slug")
+        ingest_parser.add_argument("--since", help="ISO date or datetime for incremental sync")
+        ingest_parser.add_argument("--limit", type=int, help="maximum threads for a pilot run")
+        ingest_parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="discover and normalize without persisting anything",
+        )
+
+    external = top.add_parser("external", help="status and embeddings for external sources")
+    external_commands = external.add_subparsers(dest="command", required=True)
+    external_embed = external_commands.add_parser(
+        "embed", help="queue embeddings for one external source"
+    )
+    external_embed.add_argument("--source", required=True, help="e.g. github:owner/repo")
+    external_embed.add_argument("--project", required=True)
+    external_embed.add_argument("--limit", type=int, help="maximum segments for a pilot run")
+    external_status = external_commands.add_parser(
+        "status", help="show thread/item/embedding counters for one external source"
+    )
+    external_status.add_argument("--source", required=True, help="e.g. github:owner/repo")
+    external_status.add_argument("--project", required=True)
+    external_status.add_argument("--json", action="store_true", dest="as_json")
+
     search = top.add_parser("search", help="search the knowledge corpus")
     search.add_argument("query")
     search.add_argument("--project", required=True)
     search.add_argument("--limit", type=int, default=10)
     search.add_argument(
-        "--source-kind", choices=("telegram", "document", "web", "video")
+        "--source-kind",
+        choices=("telegram", "document", "web", "video", "github", "gitlab", "gitverse"),
     )
     search.add_argument("--source", choices=("segment", "asr"), dest="source_filter")
     search.add_argument("--date-from", type=date.fromisoformat)
@@ -221,6 +267,18 @@ def _run(args: argparse.Namespace) -> int:
         from kiber_analyst.jobapi import api_call
 
         _print_json(api_call("doctor"))
+        return 0
+    if args.source == "external" and args.command == "status":
+        from kiber_analyst.jobapi import api_call
+
+        overview = api_call(
+            "source-overview", source_id=args.source, project=args.project
+        )
+        if args.as_json:
+            _print_json(overview)
+        else:
+            for key in sorted(overview):
+                print(f"{key}: {overview[key]}")
         return 0
     if args.source == "provider-check":
         from kiber_analyst.provider_preflight import preflight
@@ -337,6 +395,11 @@ def _main(argv: Sequence[str] | None, prog: str) -> int:
             args.source in {"embed", "search"}
             or (args.source == "asr" and args.command == "embed")
             or (args.source == "telegram" and args.command in {"asr", "ingest"})
+            or (
+                args.source in {"github", "gitlab", "gitverse"}
+                and args.command == "ingest"
+            )
+            or (args.source == "external" and args.command == "embed")
         )
         if is_worker_operation:
             from kiber_analyst.jobapi import api_call, submit_command, wait_job
