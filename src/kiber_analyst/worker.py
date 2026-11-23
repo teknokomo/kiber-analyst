@@ -185,7 +185,7 @@ class JobWorker:
         self.store=store or JobStore(DATA_ROOT,expected_uuid=DATA_UUID)
         self.routing_path=routing_path
         self.socket_path=socket_path
-        self.pools=pools or load_pools(routing_path)
+        self.pools=pools if pools is not None else load_pools(routing_path)
         self.router=ProviderRouter(self.store,self.pools)
         self.stop_event=threading.Event()
         self._server: ControlServer | None=None
@@ -864,7 +864,10 @@ class JobWorker:
         from kiber_analyst.load import ENV_PATH
 
         params=job.command["params"]
-        item=self.store.ensure_item(job.id,"external-source",params["source_id"])
+        # The job API registered this item with the parameter digest; the worker
+        # must use the same fingerprint or ensure_item rejects the job.
+        item_fingerprint=_digest(canonical_json(params).encode())
+        item=self.store.ensure_item(job.id,"external-source",item_fingerprint)
         self.store.update_item(item["id"],"running",checkpoint={
             "provider":params["provider"],
             "since":params.get("since"),
@@ -880,6 +883,7 @@ class JobWorker:
                     project_slug=params["project"],since=params.get("since"),
                     limit=params.get("limit"),dry_run=params.get("dry_run",False),
                     artifact_dir=artifact_dir,env_path=ENV_PATH,
+                    check_stop=lambda: self._check_cancel_deadline(job),
                 )
             except IngestError as exc:
                 code=getattr(exc,"code","")
@@ -897,6 +901,10 @@ class JobWorker:
                 self.store.update_item(item["id"],"failed",checkpoint={
                     "attempt":attempt,"error_code":last_code,
                 })
+                if retryable_connector:
+                    # Preserve the retryable connector code so process() can
+                    # report a retryable failure to the broker.
+                    raise
                 raise JobsError(f"External ingestion failed ({last_code})") from exc
             self.store.update_item(item["id"],"done",checkpoint={
                 "attempts":attempt,
@@ -927,16 +935,28 @@ class JobWorker:
         from kiber_analyst.external_embed import embed_external
 
         params=job.command["params"]
+        item_fingerprint=_digest(canonical_json(params).encode())
+        item=self.store.ensure_item(job.id,"external-embed",item_fingerprint)
+        self.store.update_item(item["id"],"running",checkpoint={"source_id":params["source_id"]})
         callback=self._embedding_callback(job,"external-embed")
         report_path=self.store.jobs_dir/job.id/"external-embed-report.json"
-        result=embed_external(
-            params["source_id"],project=params["project"],limit=params.get("limit"),
-            embedding_call=callback,report_path=report_path,
-        )
+        try:
+            result=embed_external(
+                params["source_id"],project=params["project"],limit=params.get("limit"),
+                embedding_call=callback,report_path=report_path,
+            )
+        except Exception:
+            self.store.update_item(item["id"],"failed",checkpoint={"source_id":params["source_id"]})
+            raise
+        items_by_id={entry["id"]:entry for entry in self.store.job_items(job.id)}
         for item_id in callback.item_ids:
-            item=next((entry for entry in self.store.job_items(job.id) if entry["id"]==item_id),None)
-            if item:
+            if item_id in items_by_id:
                 self.store.update_item(item_id,"done",checkpoint={"response_saved":True,"embedding_status":result.get("status")})
+        self.store.update_item(item["id"],"done",checkpoint={
+            "source_id":params["source_id"],
+            "inserted":result.get("inserted",0),
+            "skipped_existing":result.get("skipped_existing",0),
+        })
         progress={
             "completed_batches":sum(
                 1 for entry in self.store.job_items(job.id)
@@ -963,9 +983,9 @@ class JobWorker:
         else:
             from kiber_analyst.embed import embed_job
             result=embed_job(Path(params["job_dir"]),project=params["project"],embedding_call=callback)
+        items_by_id={entry["id"]:entry for entry in self.store.job_items(job.id)}
         for item_id in callback.item_ids:
-            item=next((entry for entry in self.store.job_items(job.id) if entry["id"]==item_id),None)
-            if item:
+            if item_id in items_by_id:
                 self.store.update_item(item_id,"done",checkpoint={"response_saved":True,"embedding_status":result.get("status")})
         progress={
             "completed_batches":sum(
@@ -1083,7 +1103,25 @@ class JobWorker:
                 job.operation == "telegram_ingest" and self._retryable_ingest_error(exc)
             )
             category = "transient_database_error" if temporary_database_error else "worker_error"
-            self.store.complete(job.id,{"job_id":job.id,"status":"failed","error":{"category":category,"type":type(exc).__name__},"attempts":self.store.attempts_summary(job.id)},state="failed")
+            error_detail = {"category": category, "type": type(exc).__name__}
+            connector_code = getattr(exc, "code", None)
+            if job.operation == "external_ingest" and isinstance(
+                connector_code, str
+            ) and connector_code:
+                # Map stable connector codes onto broker categories: retryable
+                # throttling/unavailability stays retryable for the broker.
+                if connector_code == "RATE_LIMITED":
+                    category = "rate_limited"
+                elif getattr(exc, "retryable", False):
+                    category = "server_error"
+                else:
+                    category = "connector_error"
+                error_detail = {
+                    "category": category,
+                    "code": connector_code,
+                    "type": type(exc).__name__,
+                }
+            self.store.complete(job.id,{"job_id":job.id,"status":"failed","error":error_detail,"attempts":self.store.attempts_summary(job.id)},state="failed")
 
     def serve(self)->None:
         self.store.verify_storage()
