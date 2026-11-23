@@ -180,6 +180,74 @@ def test_earliest_profile_retry_wake_is_not_delayed_by_later_quota_reset(
     assert reason == "profile_retry_cooldown"
 
 
+def test_excluded_profile_short_cooldown_drives_next_wake(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    pool = make_pool()
+    now = utc_now()
+    profile_ready = now.replace(microsecond=0) + timedelta(seconds=5)
+    quota_ready = now.replace(microsecond=0) + timedelta(seconds=100)
+    with store.transaction() as db:
+        db.execute(
+            """INSERT INTO routing_state
+               (pool_name,cursor_index,weighted_current_json,disabled_profiles_json,cooldowns_json,updated_at)
+               VALUES(?,0,'{}','[]',?,?)""",
+            (pool.name, json.dumps({"profile_b": iso_utc(profile_ready)}), iso_utc(now)),
+        )
+        db.execute(
+            """INSERT INTO quota_buckets
+               (scope,provider,model,metric,window_name,window_seconds,available_at,updated_at)
+               VALUES('google:profile_a','google',?,'*','cooldown',0,?,?)""",
+            (pool.model, iso_utc(quota_ready), iso_utc(now)),
+        )
+
+    selected, next_at, reason = select_profile(
+        store, pool, exclude_profiles={"profile_b"}, now=now
+    )
+
+    assert selected is None
+    assert next_at is not None and 0 < (next_at - now).total_seconds() < 10
+    assert reason == "profile_retry_cooldown"
+
+
+def test_router_call_uses_short_profile_cooldown_after_429(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    pool = make_pool(max_cycles=2)
+    job = make_job(store, "short-cooldown")
+    now = utc_now()
+    quota_ready = now.replace(microsecond=0) + timedelta(seconds=100)
+    with store.transaction() as db:
+        db.execute(
+            """INSERT INTO quota_buckets
+               (scope,provider,model,metric,window_name,window_seconds,available_at,updated_at)
+               VALUES('google:profile_a','google',?,'*','cooldown',0,?,?)""",
+            (pool.model, iso_utc(quota_ready), iso_utc(now)),
+        )
+    router = ProviderRouter(store, {pool.name: pool})
+    calls: list[str] = []
+
+    def invoke(profile: str):
+        calls.append(profile)
+        raise ProviderFailure(429, {"retry-after": "33"})
+
+    with pytest.raises(WaitForQuota) as caught:
+        router.call(
+            pool_name=pool.name,
+            job_id=job.id,
+            item_id=None,
+            invoke=invoke,
+            usage={"requests": 1},
+        )
+
+    assert calls == ["profile_b"]
+    assert caught.value.next_run_at is not None
+    remaining = (caught.value.next_run_at - utc_now()).total_seconds()
+    assert 0 < remaining < 60
+
+
 def test_weighted_round_robin_observes_configured_ratio(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     pool = make_pool(strategy="weighted_round_robin")
