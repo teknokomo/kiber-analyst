@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from kiber_analyst.connectors.config import ProviderConfig
 from kiber_analyst.connectors.errors import ConnectorCodes, ConnectorError
@@ -92,19 +93,43 @@ class ConnectorHttpClient:
         config: ProviderConfig,
         *,
         transport: Any = None,
-        sleep: Any = time.sleep,
+        sleep: Any = None,
         jitter: Any = None,
         raw_dir: Path | None = None,
         default_headers: dict[str, str] | None = None,
     ) -> None:
         self._config = config
-        self._sleep = sleep
+        self._sleep = sleep or time.sleep
         self._jitter = jitter or (lambda seconds: random.uniform(seconds * 0.8, seconds * 1.2))
         self._raw_dir = raw_dir
         self._client: Any = None
         self._transport = transport
         self._default_headers = default_headers or {}
         self._last_response: Any = None
+        config_host = urlsplit(config.api_url).hostname or ""
+        self._allowed_hosts = {config_host.lower()} | {
+            host.lower() for host in config.allowed_hosts
+        }
+
+    @property
+    def allowed_hosts(self) -> frozenset[str]:
+        return frozenset(self._allowed_hosts)
+
+    def _validate_target(self, url: str) -> None:
+        """Reject any authenticated request outside the configured HTTPS hosts."""
+        if url.startswith("//"):
+            raise ConnectorError(
+                ConnectorCodes.MALFORMED_RESPONSE,
+                f"{self._config.provider} pagination target is not an absolute HTTPS URL",
+            )
+        if url.startswith(("http://", "https://")):
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+            if parts.scheme != "https" or not host or host not in self._allowed_hosts:
+                raise ConnectorError(
+                    ConnectorCodes.MALFORMED_RESPONSE,
+                    f"{self._config.provider} request target is not an allowed HTTPS endpoint",
+                )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -165,6 +190,7 @@ class ConnectorHttpClient:
         json_body: Any = None,
     ) -> tuple[Any, bool]:
         """Return (response, not_modified); retryable failures back off and retry."""
+        self._validate_target(url)
         client = self._ensure_client()
         attempt = 0
         while True:
@@ -200,16 +226,22 @@ class ConnectorHttpClient:
                         else ConnectorCodes.UPSTREAM_UNAVAILABLE
                     )
                     raise ConnectorError(
-                        code, f"{self._config.provider} is throttling or unavailable"
+                        code,
+                        f"{self._config.provider} is throttling or unavailable",
+                        status=status,
                     )
                 delay = _backoff_seconds(attempt)
                 retry_after = response.headers.get("Retry-After")
                 if status == 429 and retry_after is not None:
+                    # A server-provided interval is a lower bound: never jitter
+                    # or cap it below what the provider asked for.
                     try:
                         delay = max(float(retry_after), delay)
                     except ValueError:
                         pass
-                self._sleep(min(self._jitter(delay), 300.0))
+                    self._sleep(min(delay, 3600.0))
+                else:
+                    self._sleep(min(self._jitter(delay), 60.0))
                 continue
             if status in (401, 403):
                 raise ConnectorError(
@@ -233,11 +265,13 @@ class ConnectorHttpClient:
                 raise ConnectorError(
                     ConnectorCodes.UPSTREAM_UNAVAILABLE,
                     f"{self._config.provider} redirected {method} {url}; base URL is wrong",
+                    status=status,
                 )
             if status != 200 and status != 201:
                 raise ConnectorError(
                     ConnectorCodes.UPSTREAM_UNAVAILABLE,
                     f"{self._config.provider} returned {status} for {method} {url}",
+                    status=status,
                 )
             return response, False
 

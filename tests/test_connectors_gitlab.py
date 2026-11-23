@@ -171,3 +171,51 @@ def test_missing_host_in_source_id_is_invalid(monkeypatch) -> None:
         connector.validate_source("gitlab:group/project")
     assert exc.value.code == ConnectorCodes.SEARCH_INVALID_SOURCE
     connector.close()
+
+
+def test_configured_api_path_is_honored_for_the_matching_host(monkeypatch) -> None:
+    captured = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.url.raw_path.decode().split("?", 1)[0])
+        return httpx.Response(200, json=[])
+
+    monkeypatch.setenv("KIBER_GITLAB_TOKEN", "test-token")
+    config = ProviderConfig(
+        provider="gitlab", api_url="https://gitlab.com/custom/api/v4",
+        page_size=100, timeout_seconds=30, max_retries=2,
+    )
+    connector = GitLabConnector(
+        config=config,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: None,
+        jitter=lambda seconds: seconds,
+    )
+    list(connector.discover(SOURCE, None))
+    assert captured[0] == "/custom/api/v4/projects/group%2Fproject/issues"
+    connector.close()
+
+
+def test_unconfigured_self_hosted_host_is_rejected(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=[])
+
+    monkeypatch.setenv("KIBER_GITLAB_TOKEN", "test-token")
+    config = ProviderConfig(
+        provider="gitlab", api_url="https://gitlab.com/api/v4",
+        page_size=100, timeout_seconds=30, max_retries=2,
+    )
+    connector = GitLabConnector(
+        config=config,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: None,
+        jitter=lambda seconds: seconds,
+    )
+    with pytest.raises(ConnectorError) as exc:
+        list(connector.discover("gitlab:gitlab.evil.example/group/project", None))
+    assert exc.value.code == ConnectorCodes.SOURCE_NOT_ALLOWED
+    assert calls["n"] == 0
+    connector.close()

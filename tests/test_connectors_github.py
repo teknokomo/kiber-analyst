@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import httpx
 import pytest
 
@@ -173,24 +176,22 @@ def test_discussion_replies_keep_parent_links_and_answer_flag(monkeypatch) -> No
     discussion = {
         "number": 7,
         "title": "Design question",
-        "state": "OPEN",
+        "state": "open",
         "createdAt": "2026-11-05T09:00:00Z",
         "updatedAt": "2026-11-05T10:00:00Z",
         "url": "https://github.com/teknokomo/kiber-analyst/discussions/7",
-        "author": {"login": "alice"},
+        "user": {"login": "alice"},
         "body": "How should we model this?",
-        "answer": {"id": "ans1", "bodyText": "Use documents + segments.",
-                   "author": {"login": "bob"},
-                   "createdAt": "2026-11-05T10:00:00Z", "url": "https://x"},
-        "comments": {"nodes": [
+        "answer": {"id": "ans1"},
+        "kiber_comments": [
             {"id": "c1", "bodyText": "First idea", "createdAt": "2026-11-05T09:30:00Z",
              "url": "https://u1", "author": {"login": "bob"},
-             "replies": {"nodes": [
+             "kiber_replies": [
                  {"id": "ans1", "bodyText": "Use documents + segments.",
                   "createdAt": "2026-11-05T10:00:00Z", "url": "https://x",
                   "author": {"login": "bob"}},
-             ]}},
-        ]},
+             ]},
+        ],
     }
     ref = ThreadRef(
         provider="github", source_id=SOURCE,
@@ -206,6 +207,119 @@ def test_discussion_replies_keep_parent_links_and_answer_flag(monkeypatch) -> No
     assert answer["parent_external_ref"] == f"{SOURCE}:discussion:7:reply:c1"
     assert answer["meta"]["is_answer"] is True
     assert top["meta"]["is_answer"] is False
+    connector.close()
+
+
+def _discussion_handler(requests_log: list[str]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/teknokomo/kiber-analyst/issues":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/repos/teknokomo/kiber-analyst/pulls":
+            return httpx.Response(200, json=[])
+        if request.url.path != "/graphql":
+            return httpx.Response(404)
+        body = json.loads(request.content)
+        query = body["query"]
+        variables = body.get("variables") or {}
+        if "discussions(first" in query:
+            requests_log.append("list")
+            return httpx.Response(200, json={"data": {"repository": {"discussions": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"number": 7, "title": "Design question", "closed": True,
+                           "updatedAt": "2026-11-05T10:00:00Z",
+                           "url": "https://github.com/o/r/discussions/7"}],
+            }}}})
+        if "bodyText" in query and "comments(first" not in query and "node(id" not in query:
+            requests_log.append("core")
+            return httpx.Response(200, json={"data": {"repository": {"discussion": {
+                "number": 7, "title": "Design question", "closed": True, "locked": False,
+                "createdAt": "2026-11-05T09:00:00Z",
+                "updatedAt": "2026-11-05T10:00:00Z",
+                "url": "https://github.com/o/r/discussions/7",
+                "bodyText": "How should we model this?",
+                "author": {"login": "alice"},
+                "answer": {"id": "ans1"},
+                "labels": {"nodes": [{"name": "design"}]},
+                "category": {"name": "Ideas"},
+            }}}})
+        if "comments(first" in query:
+            cursor = variables.get("cursor")
+            requests_log.append(f"comments:{cursor}")
+            if cursor is None:
+                return httpx.Response(200, json={"data": {"repository": {"discussion": {
+                    "comments": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "c-page-2"},
+                        "nodes": [{
+                            "id": "c1", "bodyText": "First idea",
+                            "createdAt": "2026-11-05T09:30:00Z",
+                            "url": "https://u1", "author": {"login": "bob"},
+                            "replies": {
+                                "pageInfo": {"hasNextPage": True, "endCursor": "r-page-2"},
+                                "nodes": [{
+                                    "id": "r1", "bodyText": "A reply",
+                                    "createdAt": "2026-11-05T09:40:00Z",
+                                    "url": "https://r1", "author": {"login": "bob"},
+                                }],
+                            },
+                        }],
+                    },
+                }}}})
+            return httpx.Response(200, json={"data": {"repository": {"discussion": {
+                "comments": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [{
+                        "id": "c2", "bodyText": "Second idea",
+                        "createdAt": "2026-11-05T09:45:00Z",
+                        "url": "https://u2", "author": {"login": "carol"},
+                        "replies": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                    "nodes": []},
+                    }],
+                },
+            }}}})
+        if "node(id" in query:
+            requests_log.append(f"replies:{variables.get('cursor')}")
+            return httpx.Response(200, json={"data": {"node": {"replies": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{
+                    "id": "ans1", "bodyText": "Use documents + segments.",
+                    "createdAt": "2026-11-05T10:00:00Z",
+                    "url": "https://x", "author": {"login": "bob"},
+                }],
+            }}}})
+        return httpx.Response(200, json={"errors": [{"type": "FORBIDDEN"}]})
+
+    return handler
+
+
+def test_discussion_fetch_uses_real_schema_and_paginates_comments(monkeypatch) -> None:
+    requests_log: list[str] = []
+    connector = make_connector(monkeypatch, _discussion_handler(requests_log))
+    refs = list(connector.discover(SOURCE, None))
+    discussion_ref = next(ref for ref in refs if ref.kind == "discussion")
+    assert discussion_ref.state == "closed"
+    raw = connector.fetch_thread(discussion_ref)
+    normalized = connector.normalize(raw)
+    assert requests_log == ["list", "core", "comments:None", "comments:c-page-2",
+                            "replies:r-page-2"]
+    thread = normalized.thread
+    assert thread["state"] == "closed"
+    assert thread["title"] == "Design question"
+    assert thread["author"] == "alice"
+    assert thread["labels"] == ["design"]
+    assert thread["meta"]["category"] == "Ideas"
+    assert thread["meta"]["locked"] is False
+    body = normalized.items[0]
+    assert body["item_kind"] == "body"
+    assert body["text"] == "How should we model this?"
+    assert body["url"] == "https://github.com/o/r/discussions/7"
+    replies = [item for item in normalized.items if item["item_kind"] == "reply"]
+    refs_by_kind = {item["external_ref"]: item for item in replies}
+    assert f"{SOURCE}:discussion:7:reply:c1" in refs_by_kind
+    assert f"{SOURCE}:discussion:7:reply:c2" in refs_by_kind
+    answer = refs_by_kind[f"{SOURCE}:discussion:7:reply:ans1"]
+    assert answer["parent_external_ref"] == f"{SOURCE}:discussion:7:reply:c1"
+    assert answer["meta"]["is_answer"] is True
+    assert answer["text"] == "Use documents + segments."
     connector.close()
 
 
@@ -246,6 +360,7 @@ def test_enterprise_host_uses_its_own_api_base(monkeypatch) -> None:
     config = ProviderConfig(
         provider="github", api_url="https://api.github.com",
         page_size=100, timeout_seconds=30, max_retries=2,
+        allowed_hosts=("github.example.com",),
     )
     connector = GitHubConnector(
         config=config,
@@ -257,6 +372,21 @@ def test_enterprise_host_uses_its_own_api_base(monkeypatch) -> None:
     assert [ref.number for ref in refs] == [1]
     assert all(ref.kind != "discussion" for ref in refs)
     assert connector.discovery_errors
+    connector.close()
+
+
+def test_unconfigured_enterprise_host_is_rejected_before_any_request(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=[])
+
+    connector = make_connector(monkeypatch, handler)
+    with pytest.raises(ConnectorError) as exc:
+        list(connector.discover("github:evil.example.com/team/repo", None))
+    assert exc.value.code == ConnectorCodes.SOURCE_NOT_ALLOWED
+    assert calls["n"] == 0, "no request may leave for an unconfigured host"
     connector.close()
 
 

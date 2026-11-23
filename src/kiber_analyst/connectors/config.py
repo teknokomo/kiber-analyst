@@ -8,6 +8,7 @@ settings; ``config/connectors.example.yaml`` documents the shape.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ _CONNECTOR_YAML = "connectors.yaml"
 _PAGE_SIZE_RANGE = (1, 100)
 _TIMEOUT_RANGE = (1, 300)
 _RETRIES_RANGE = (0, 10)
+_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z")
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,9 @@ class ProviderConfig:
     page_size: int
     timeout_seconds: int
     max_retries: int
+    # Extra hosts (self-hosted GitLab, GitHub Enterprise) that may receive the
+    # token. The api_url host is always allowed implicitly.
+    allowed_hosts: tuple[str, ...] = ()
 
     @property
     def token(self) -> str:
@@ -80,6 +85,19 @@ def _validated_int(provider: str, key: str, value: Any, bounds: tuple[int, int])
     return value
 
 
+def _validated_hosts(provider: str, value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(
+        isinstance(host, str) and _HOST.fullmatch(host) for host in value
+    ):
+        raise ConnectorError(
+            ConnectorCodes.UNSUPPORTED_PROVIDER,
+            f"{provider} config allowed_hosts must be a list of host names",
+        )
+    return tuple(host.lower() for host in value)
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
         import yaml
@@ -90,7 +108,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         ) from exc
     try:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, UnicodeError, yaml.YAMLError):
         raise ConnectorError(
             ConnectorCodes.UNSUPPORTED_PROVIDER,
             "Connector configuration file is unreadable or invalid",
@@ -121,7 +139,7 @@ def load_provider_config(provider: str, *, config_file: Path | None = None) -> P
             f"{provider} connector configuration must be a mapping",
         )
     for key in section:
-        if key not in {"api_url", "page_size", "timeout_seconds", "max_retries"}:
+        if key not in {"api_url", "page_size", "timeout_seconds", "max_retries", "allowed_hosts"}:
             raise ConnectorError(
                 ConnectorCodes.UNSUPPORTED_PROVIDER,
                 f"{provider} connector configuration has an unknown key",
@@ -147,6 +165,7 @@ def load_provider_config(provider: str, *, config_file: Path | None = None) -> P
         max_retries=_validated_int(
             provider, "max_retries", section.get("max_retries", base.max_retries), _RETRIES_RANGE
         ),
+        allowed_hosts=_validated_hosts(provider, section.get("allowed_hosts")),
     )
 
 

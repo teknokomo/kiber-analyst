@@ -10,9 +10,9 @@ from kiber_analyst.connectors.config import ProviderConfig
 from kiber_analyst.connectors.errors import ConnectorCodes, ConnectorError
 
 
-def make_client(monkeypatch, transport, *, raw_dir=None, sleeps=None):
+def make_client(monkeypatch, transport, *, raw_dir=None, sleeps=None, config=None):
     monkeypatch.setenv("KIBER_GITHUB_TOKEN", "test-token")
-    config = ProviderConfig(
+    config = config or ProviderConfig(
         provider="github",
         api_url="https://api.github.com",
         page_size=100,
@@ -228,4 +228,121 @@ def test_non_json_response_is_malformed(monkeypatch) -> None:
     with pytest.raises(ConnectorError) as exc:
         client.request_json("GET", "/x")
     assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    client.close()
+
+
+def test_default_sleep_callback_is_used_when_none_is_passed(monkeypatch) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda seconds: slept.append(seconds))
+    attempts = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json=[])
+
+    config = ProviderConfig(
+        provider="github", api_url="https://api.github.com",
+        page_size=100, timeout_seconds=30, max_retries=2,
+    )
+    monkeypatch.setenv("KIBER_GITHUB_TOKEN", "test-token")
+    client = ConnectorHttpClient(
+        config, transport=httpx.MockTransport(handler), sleep=None,
+        jitter=lambda seconds: seconds,
+    )
+    client.request_json("GET", "/x")
+    assert slept, "default time.sleep must be used for retries"
+    client.close()
+
+
+def test_http_pagination_link_is_rejected_before_sending_the_token(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            200, json=[{"n": 1}],
+            headers={"Link": '<http://api.github.com/x?page=2>; rel="next"'},
+        )
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    collected = []
+    with pytest.raises(ConnectorError) as exc:
+        for items, _headers in client.iter_pages("/repos/o/r/issues"):
+            collected.extend(items)
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    assert calls["n"] == 1, "the HTTP pagination target must not be requested"
+    client.close()
+
+
+def test_foreign_host_pagination_link_is_rejected(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            200, json=[{"n": 1}],
+            headers={"Link": '<https://evil.example.com/x?page=2>; rel="next"'},
+        )
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ConnectorError) as exc:
+        list(client.iter_pages("/repos/o/r/issues"))
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    assert calls["n"] == 1
+    client.close()
+
+
+def test_allowed_extra_host_is_accepted_for_absolute_urls(monkeypatch) -> None:
+    config = ProviderConfig(
+        provider="github", api_url="https://api.github.com",
+        page_size=100, timeout_seconds=30, max_retries=2,
+        allowed_hosts=("github.example.com",),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "github.example.com"
+        return httpx.Response(200, json=[])
+
+    client, _sleeps, _calls = make_client(
+        monkeypatch, httpx.MockTransport(handler), config=config
+    )
+    client.request_json("GET", "https://github.example.com/api/v3/repos/o/r/issues")
+    client.close()
+
+
+def test_501_is_preserved_for_conditional_endpoint_handling(monkeypatch) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(501)
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ConnectorError) as exc:
+        client.request_json("GET", "/x")
+    assert exc.value.status == 501
+    client.close()
+
+
+def test_retry_after_is_never_reduced_by_jitter_or_cap(monkeypatch) -> None:
+    attempts = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "600"})
+        return httpx.Response(200, json=[])
+
+    monkeypatch.setenv("KIBER_GITHUB_TOKEN", "test-token")
+    sleeps: list[float] = []
+    config = ProviderConfig(
+        provider="github", api_url="https://api.github.com",
+        page_size=100, timeout_seconds=30, max_retries=2,
+    )
+    client = ConnectorHttpClient(
+        config, transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: sleeps.append(seconds),
+        jitter=lambda seconds: seconds * 0.5,
+    )
+    client.request_json("GET", "/x")
+    assert sleeps and sleeps[0] >= 600
     client.close()

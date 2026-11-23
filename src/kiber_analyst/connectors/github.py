@@ -81,10 +81,20 @@ class GitHubConnector:
                 ConnectorCodes.SEARCH_INVALID_SOURCE,
                 "source_id is not a valid GitHub repository identifier",
             )
-        owner, repo = parsed.path.split("/", 1)
         host = parsed.host
-        api_base = f"https://{host}/api/v3" if host else self._config.api_url
-        graphql_base = f"https://{host}/api/graphql" if host else _graphql_url(self._config.api_url)
+        if host is not None:
+            # An Enterprise host receives the token only when the operator
+            # configured it explicitly (api_url host or allowed_hosts).
+            if host.lower() not in self._http.allowed_hosts:
+                raise ConnectorError(
+                    ConnectorCodes.SOURCE_NOT_ALLOWED,
+                    "GitHub host is not configured for this provider",
+                )
+            api_base = f"https://{host}/api/v3"
+            graphql_base = f"https://{host}/api/graphql"
+        else:
+            api_base = self._config.api_url
+            graphql_base = _graphql_url(self._config.api_url)
         return host, api_base, graphql_base
 
     def _api(self, source_id: str) -> tuple[str, str]:
@@ -205,7 +215,7 @@ class GitHubConnector:
                     kind="discussion",
                     number=number,
                     updated_at=node.get("updatedAt"),
-                    state=node.get("state") if isinstance(node.get("state"), str) else None,
+                    state="closed" if node.get("closed") is True else "open",
                     title=node.get("title") if isinstance(node.get("title"), str) else None,
                 )
             page_info = discussions.get("pageInfo") or {}
@@ -358,16 +368,14 @@ class GitHubConnector:
         raw.body["kiber_timeline_events"] = events[-_MAX_TIMELINE_EVENTS:]
         return []
 
-    def _fetch_discussion(self, ref: ThreadRef) -> dict[str, Any]:
+    def _discussion_target(self, ref: ThreadRef) -> tuple[str, str, str]:
         _host, _api_base, graphql_base = self._repo(ref.source_id)
         parsed = parse_source_id(ref.source_id)
         assert parsed is not None
         owner, name = parsed.path.split("/", 1)
-        payload = self._graphql(
-            graphql_base,
-            _DISCUSSION_QUERY,
-            {"owner": owner, "name": name, "number": ref.number},
-        )
+        return graphql_base, owner, name
+
+    def _discussion_object(self, payload: dict[str, Any] | None) -> dict[str, Any]:
         if payload is None:
             raise ConnectorError(
                 ConnectorCodes.THREAD_NOT_FOUND,
@@ -382,12 +390,90 @@ class GitHubConnector:
             )
         return discussion
 
+    def _fetch_discussion(self, ref: ThreadRef) -> dict[str, Any]:
+        graphql_base, owner, name = self._discussion_target(ref)
+        core = self._discussion_object(
+            self._graphql(
+                graphql_base,
+                _DISCUSSION_CORE_QUERY,
+                {"owner": owner, "name": name, "number": ref.number},
+            )
+        )
+        comments = self._fetch_discussion_comments(
+            graphql_base, owner, name, ref.number
+        )
+        for comment in comments:
+            comment["kiber_replies"] = self._fetch_discussion_replies(
+                graphql_base, comment
+            )
+        # Map the real GraphQL shape onto the REST-like fields normalize reads.
+        core["body"] = core.get("bodyText") or ""
+        core["user"] = core.get("author")
+        core["html_url"] = core.get("url")
+        core["created_at"] = core.get("createdAt")
+        core["updated_at"] = core.get("updatedAt")
+        core["state"] = "closed" if core.get("closed") is True else "open"
+        core["labels"] = (core.get("labels") or {}).get("nodes") or []
+        core["kiber_comments"] = comments
+        return core
+
+    def _fetch_discussion_comments(
+        self, graphql_base: str, owner: str, name: str, number: int
+    ) -> list[dict[str, Any]]:
+        comments: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            payload = self._graphql(
+                graphql_base,
+                _DISCUSSION_COMMENTS_QUERY,
+                {"owner": owner, "name": name, "number": number, "cursor": cursor},
+            )
+            discussion = self._discussion_object(payload)
+            connection = discussion.get("comments") or {}
+            comments.extend(
+                node for node in (connection.get("nodes") or []) if isinstance(node, dict)
+            )
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                return comments
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                return comments
+
+    def _fetch_discussion_replies(
+        self, graphql_base: str, comment: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        connection = comment.get("replies") or {}
+        replies = [
+            node for node in (connection.get("nodes") or []) if isinstance(node, dict)
+        ]
+        page_info = connection.get("pageInfo") or {}
+        comment_id = comment.get("id")
+        while page_info.get("hasNextPage") and isinstance(comment_id, str):
+            payload = self._graphql(
+                graphql_base,
+                _DISCUSSION_REPLIES_QUERY,
+                {"id": comment_id, "cursor": page_info.get("endCursor")},
+            )
+            if payload is None:
+                raise ConnectorError(
+                    ConnectorCodes.THREAD_NOT_FOUND,
+                    "GitHub discussion replies are unavailable for this token",
+                )
+            node = (payload.get("data") or {}).get("node") or {}
+            connection = node.get("replies") or {}
+            replies.extend(
+                item for item in (connection.get("nodes") or []) if isinstance(item, dict)
+            )
+            page_info = connection.get("pageInfo") or {}
+        return replies
+
     def _discussion_reply_items(self, discussion: dict[str, Any]) -> list[RawItem]:
         # Flatten discussion comments and nested replies, preserving ancestry;
         # the accepted answer gets the is_answer flag on its item.
         answer_id = normalize_external_id((discussion.get("answer") or {}).get("id"))
         items: list[RawItem] = []
-        for comment in (discussion.get("comments") or {}).get("nodes") or []:
+        for comment in discussion.get("kiber_comments") or []:
             comment_id = normalize_external_id(comment.get("id"))
             items.append(
                 RawItem(
@@ -401,7 +487,7 @@ class GitHubConnector:
                     url=comment.get("url"),
                 )
             )
-            for reply in (comment.get("replies") or {}).get("nodes") or []:
+            for reply in comment.get("kiber_replies") or []:
                 reply_id = normalize_external_id(reply.get("id"))
                 items.append(
                     RawItem(
@@ -429,6 +515,12 @@ class GitHubConnector:
             "milestone": _milestone_name(body.get("milestone")),
             "assignees": _logins(body.get("assignees")),
         }
+        if isinstance(body.get("category"), dict):
+            category = body["category"].get("name")
+            if isinstance(category, str) and category:
+                meta["category"] = category
+        if body.get("locked") is not None:
+            meta["locked"] = body.get("locked") is True
         events = body.get("kiber_timeline_events")
         if events is not None:
             meta["events"] = [
@@ -541,27 +633,53 @@ query($owner:String!, $name:String!, $cursor:String) {
   repository(owner:$owner, name:$name) {
     discussions(first:50, after:$cursor, orderBy:{field:UPDATED_AT, direction:DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title state updatedAt url }
+      nodes { number title closed updatedAt url }
     }
   }
 }
 """
 
-_DISCUSSION_QUERY = """
+# Discussion has `closed`/`locked`, not `state`; the root body is `bodyText`.
+_DISCUSSION_CORE_QUERY = """
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
     discussion(number:$number) {
-      number title state createdAt updatedAt url answer {
-        id bodyText author { login } createdAt url
-      }
+      number title closed locked createdAt updatedAt url bodyText
       author { login }
-      comments(first:50) {
+      answer { id }
+      labels(first:100) { nodes { name } }
+      category { name }
+    }
+  }
+}
+"""
+
+_DISCUSSION_COMMENTS_QUERY = """
+query($owner:String!, $name:String!, $number:Int!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    discussion(number:$number) {
+      comments(first:100, after:$cursor) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           id bodyText createdAt url author { login }
-          replies(first:50) {
+          replies(first:100) {
+            pageInfo { hasNextPage endCursor }
             nodes { id bodyText createdAt url author { login } }
           }
         }
+      }
+    }
+  }
+}
+"""
+
+_DISCUSSION_REPLIES_QUERY = """
+query($id:ID!, $cursor:String) {
+  node(id:$id) {
+    ... on DiscussionComment {
+      replies(first:100, after:$cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id bodyText createdAt url author { login } }
       }
     }
   }

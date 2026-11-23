@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
+from urllib.parse import urlsplit
 
 from kiber_analyst.connectors.base import (
     ConnectorHttpClient,
@@ -71,7 +72,18 @@ class GitLabConnector:
                 ConnectorCodes.SEARCH_INVALID_SOURCE,
                 "GitLab source_id must include the host",
             )
-        api_base = f"https://{parsed.host}/api/v4"
+        host = parsed.host.lower()
+        config_host = (urlsplit(self._config.api_url).hostname or "").lower()
+        if host == config_host:
+            # Honor a configured base path such as https://host/gitlab/api/v4.
+            api_base = self._config.api_url.rstrip("/")
+        elif host in {item.lower() for item in self._config.allowed_hosts}:
+            api_base = f"https://{host}/api/v4"
+        else:
+            raise ConnectorError(
+                ConnectorCodes.SOURCE_NOT_ALLOWED,
+                "GitLab host is not configured for this provider",
+            )
         project_path = quote_reserved(parsed.path)
         return api_base, project_path
 
