@@ -13,16 +13,70 @@ SELECT attgenerated::text
 FROM pg_attribute
 WHERE attrelid='segments'::regclass AND attname='tsv';
 
+SELECT attnotnull
+FROM pg_attribute
+WHERE attrelid='segments'::regclass AND attname='text';
+
+SELECT pg_get_expr(adbin, adrelid)
+FROM pg_attrdef
+WHERE adrelid='segments'::regclass
+  AND adnum=(SELECT attnum FROM pg_attribute
+             WHERE attrelid='segments'::regclass AND attname='tsv');
+
+SELECT indexdef
+FROM pg_indexes
+WHERE schemaname='public' AND tablename='segments'
+  AND indexname='idx_segments_tsv';
+
+SELECT count(*)
+FROM schema_migrations
+WHERE version='0007_segments_tsv_generated';
+
 SELECT tgname, pg_get_triggerdef(oid)
 FROM pg_trigger
 WHERE tgrelid='segments'::regclass AND NOT tgisinternal;
 ```
 
-- Ожидается `attgenerated = ''` и ноль не-внутренних триггеров.
-- `attgenerated = 's'` — миграция уже применена: ничего не делать, проверить
-  только индекс (`idx_segments_tsv`) и выполнить `ANALYZE segments;`.
+- Ожидаются `segments.text NOT NULL` и ноль не-внутренних триггеров.
 - Любой не-внутренний триггер — **остановиться и сообщить**: миграция 0007
   намеренно падает (`RAISE EXCEPTION`), обходить её нельзя.
+- Для `segments.tsv` ожидается `attgenerated = ''` (обычный столбец) либо
+  `attgenerated = 's'` (stored generated column). Любое другое значение —
+  остановиться и выяснить состояние схемы.
+- Для generated-столбца выражение должно соответствовать
+  `to_tsvector('russian'::regconfig, coalesce(text, ''))`, а индекс
+  `idx_segments_tsv` должен быть GIN по `tsv`.
+
+### Если `attgenerated = 's'`
+
+Сравни выражение `pg_get_expr` и определение индекса с ожидаемыми выше.
+
+- Если выражение совпадает, но строки
+  `0007_segments_tsv_generated` нет в `schema_migrations`, после backup и
+  проверки восстановления повторно запусти миграцию из раздела 3. Она
+  проверит/создаст индекс, выполнит `ANALYZE` и зарегистрирует версию.
+  **Не добавляй версию ручным `INSERT`.**
+- Если выражение отличается, сначала проверь `segments.text NOT NULL`.
+  Если `text` nullable — остановись: различие может менять семантику и
+  требует отдельного разбора. Перед исправлением сделай и проверь backup,
+  затем запланируй maintenance window: изменение generated-выражения
+  переписывает `segments` и требует `ACCESS EXCLUSIVE`.
+- На PostgreSQL 17 и новее исправь выражение штатной командой ниже; после
+  неё проверь `pg_get_expr` и только при точном совпадении повторно запусти
+  0007 из раздела 3:
+
+  ```bash
+  psql -1 -v ON_ERROR_STOP=1 -d knowledge \
+    -c "ALTER TABLE segments ALTER COLUMN tsv SET EXPRESSION AS (to_tsvector('russian'::regconfig, coalesce(text, ''))); ANALYZE segments;"
+  ```
+
+  `SET EXPRESSION` документирован в
+  [PostgreSQL 17 ALTER TABLE](https://www.postgresql.org/docs/17/sql-altertable.html).
+  На PostgreSQL 16 этой команды нет: **не запускай её и не добавляй её в
+  миграцию 0007**, которая должна работать на PostgreSQL 16. Подготовь
+  отдельную совместимую процедуру и остановись до её согласования.
+- Если `attgenerated = ''`, сделай backup и применяй 0007 обычным способом
+  из раздела 3.
 
 ## 2. Backup
 
@@ -64,6 +118,13 @@ psql -1 -v ON_ERROR_STOP=1 -d knowledge \
 ```sql
 SELECT attgenerated::text FROM pg_attribute
 WHERE attrelid='segments'::regclass AND attname='tsv';          -- ожидается 's'
+
+SELECT pg_get_expr(adbin, adrelid)
+FROM pg_attrdef
+WHERE adrelid='segments'::regclass
+  AND adnum=(SELECT attnum FROM pg_attribute
+             WHERE attrelid='segments'::regclass AND attname='tsv');
+-- ожидается выражение с to_tsvector('russian'::regconfig, coalesce(text, ''))
 
 SELECT count(*) FROM segments WHERE tsv IS NULL;                 -- ожидается 0
 
