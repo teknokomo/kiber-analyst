@@ -47,9 +47,13 @@ kiber-analyst-broker-client = "kiber_analyst.broker_client:main"
 kiber-analyst-queue-backup = "kiber_analyst.queue_backup:main"
 kiber-analyst-backup = "kiber_analyst.backup:main"
 kiber-analyst-queue-restore = "kiber_analyst.queue_restore:main"
+kiber-analyst-migrate = "kiber_analyst.migrate:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.data-files]
+"share/kiber-analyst/migrations" = ["migrations/*.sql", "migrations/checksums.json"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

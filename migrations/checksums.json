@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "baseline": {
+    "version": "0001_init",
+    "file": null,
+    "sha256": null
+  },
+  "migrations": [
+    {
+      "version": "0002_telegram",
+      "file": "0002_telegram.sql",
+      "sha256": "ddf69f45031225cf44f7633ce892ba5d5c1753e8cf529920f214b5cb38db12a1"
+    },
+    {
+      "version": "0003_asr",
+      "file": "0003_asr.sql",
+      "sha256": "c8ae1b9071be14bfa49cd3c311a14d7910ffc912485a851d50142187f1754ce7"
+    },
+    {
+      "version": "0004_mcp_reader",
+      "file": "0004_mcp_reader.sql",
+      "sha256": "cad87ca885bee4d03cff9e4dd76fe3875311b3ed9fc5df0a398cc7d6dd83dd9c"
+    },
+    {
+      "version": "0005_telegram_services",
+      "file": "0005_telegram_services.sql",
+      "sha256": "de0564cc9a83508fb7aff1f9671a5f87203d3dc88fac94f32a35079ec2a2e4b4"
+    },
+    {
+      "version": "0006_external_discussions",
+      "file": "0006_external_discussions.sql",
+      "sha256": "a6150d72bd154b95119ba2c4ab175bf0ab6a392a9898c8cbaf206b5ff616befa"
+    },
+    {
+      "version": "0007_segments_tsv_generated",
+      "file": "0007_segments_tsv_generated.sql",
+      "sha256": "b87f14ce84f8a3dfa76f910de5a33c712917afccfc01258abff3c6541f58ec9c"
+    }
+  ]
+}
