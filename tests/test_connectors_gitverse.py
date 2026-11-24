@@ -21,6 +21,12 @@ ISSUE = {
     "body": "Check the API",
     "labels": [{"name": "question"}],
 }
+SECOND_ISSUE = {
+    **ISSUE,
+    "number": 6,
+    "title": "Second page issue",
+    "html_url": "https://gitverse.ru/example-owner/example-repo/issues/6",
+}
 COMMENT = {
     "id": 33,
     "user": {"login": "bob"},
@@ -52,21 +58,36 @@ def gitverse_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     assert request.headers.get("Accept") == "application/vnd.gitverse.object+json;version=1"
     if path == "/repos/example-owner/example-repo/issues":
-        return httpx.Response(200, json=[ISSUE, {**PULL, "pull_request": {"url": "x"}}])
+        if request.url.params.get("page") == "2":
+            return httpx.Response(200, json=[SECOND_ISSUE])
+        return httpx.Response(
+            200,
+            json=[ISSUE, {**PULL, "pull_request": {"url": "x"}}],
+            headers={
+                "Link": (
+                    "<https://gitverse.ru/public/api/repos/example-owner/"
+                    "example-repo/issues?page=2&per_page=100>; rel=\"next\""
+                )
+            },
+        )
     if path == "/repos/example-owner/example-repo/pulls":
         return httpx.Response(200, json=[PULL])
     if path == "/repos/example-owner/example-repo/issues/5":
         return httpx.Response(200, json=ISSUE)
     if path == "/repos/example-owner/example-repo/issues/5/comments":
+        assert "per_page" not in request.url.params
         return httpx.Response(200, json=[COMMENT])
     if path == "/repos/example-owner/example-repo/issues/5/timeline":
+        assert "per_page" not in request.url.params
         return httpx.Response(200, json=[{"event": "commented", "user": {"login": "bob"},
                                           "created_at": "2026-11-02T12:00:00Z"}])
     if path == "/repos/example-owner/example-repo/pulls/9":
         return httpx.Response(200, json={**PULL, "merged": False})
     if path == "/repos/example-owner/example-repo/pulls/9/reviews":
+        assert "per_page" not in request.url.params
         return httpx.Response(200, json=[REVIEW])
     if path == "/repos/example-owner/example-repo/pulls/9/comments":
+        assert "per_page" not in request.url.params
         return httpx.Response(404)
     if path == "/repos/example-owner/example-repo/issues/9/timeline":
         return httpx.Response(200, json=[])
@@ -92,8 +113,19 @@ def test_discover_excludes_pull_entries_and_sends_required_headers(monkeypatch) 
     refs = list(connector.discover(SOURCE, None))
     issue_numbers = [ref.number for ref in refs if ref.kind == "issue"]
     pull_numbers = [ref.number for ref in refs if ref.kind == "pull"]
-    assert issue_numbers == [5]
+    assert issue_numbers == [5, 6]
     assert pull_numbers == [9]
+    connector.close()
+
+
+def test_public_api_pagination_link_is_rewritten_to_configured_host(monkeypatch) -> None:
+    connector = make_connector(monkeypatch)
+    refs = list(connector.discover(SOURCE, None))
+    assert [(ref.kind, ref.number) for ref in refs] == [
+        ("issue", 5),
+        ("issue", 6),
+        ("pull", 9),
+    ]
     connector.close()
 
 

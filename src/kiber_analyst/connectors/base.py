@@ -17,7 +17,7 @@ import math
 import random
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -331,6 +331,7 @@ class ConnectorHttpClient:
         headers: dict[str, str] | None = None,
         paging: str = "link",
         page_param: str = "page",
+        link_rewrite: Callable[[str], str] | None = None,
     ) -> Iterator[tuple[list, dict[str, str]]]:
         """Yield (items, headers) per page, following the provider's paging style.
 
@@ -367,6 +368,7 @@ class ConnectorHttpClient:
                 current_params=next_params or {},
                 current_url=next_url,
                 provider=self._config.provider,
+                link_rewrite=link_rewrite,
             )
             if next_url is not None:
                 marker = _page_marker(next_url, next_params, self._config.api_url)
@@ -426,6 +428,7 @@ def _next_page(
     current_params: dict[str, Any],
     current_url: str | None,
     provider: str,
+    link_rewrite: Callable[[str], str] | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     if response is None:
         return None, {}
@@ -435,6 +438,8 @@ def _next_page(
         if match is None:
             return None, {}
         target = match.group(1).strip()
+        if link_rewrite is not None:
+            target = link_rewrite(target)
         parts = urlsplit(target)
         if parts.scheme != "https" or not parts.hostname:
             # A next link we cannot resolve to an absolute HTTPS URL must not
