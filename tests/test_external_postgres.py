@@ -1028,3 +1028,152 @@ def test_telegram_semantic_ranking_is_unchanged(tmp_path: Path) -> None:
     row = result["results"][0]
     assert row["source_kind"] == "telegram"
     assert row["message_id"] == message_ref.split(":")[2]
+
+
+def test_tsv_migration_converts_plain_column_and_is_idempotent(tmp_path: Path) -> None:
+    """Apply 0007 for real to an old-schema database (plain segments.tsv).
+
+    Requires the disposable database to be reachable and the file pointed to by
+    KIBER_ANALYST_INGEST_TEST_ENV to also contain TEST_OWNER_PASSWORD for the
+    database owner (the migration rewrites the table, so the application role
+    cannot run it).
+    """
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    owner_password = credentials.get("TEST_OWNER_PASSWORD")
+    if not owner_password:
+        pytest.skip("TEST_OWNER_PASSWORD is required to apply migration 0007")
+
+    def owner_connect(autocommit: bool = True):
+        return psycopg.connect(
+            host=credentials["KNOWLEDGE_HOST"],
+            port=int(credentials["KNOWLEDGE_PORT"]),
+            dbname=credentials["KNOWLEDGE_DB"],
+            user="postgres",
+            password=owner_password,
+            autocommit=autocommit,
+        )
+
+    migration_sql = (
+        Path(__file__).parents[1] / "migrations" / "0007_segments_tsv_generated.sql"
+    ).read_text(encoding="utf-8")
+
+    def tsv_state(conn) -> tuple[bool, bool]:
+        row = conn.execute(
+            """SELECT attgenerated = 's' AS generated,
+                      attgenerated IS NULL OR attgenerated = '' AS plain
+               FROM pg_attribute
+               WHERE attrelid='segments'::regclass AND attname='tsv'
+                 AND NOT attisdropped"""
+        ).fetchone()
+        assert row is not None, "segments.tsv must exist"
+        return bool(row[0]), bool(row[1])
+
+    with owner_connect() as conn:
+        # Force the old mechanism: a plain, manually filled column.
+        conn.execute("DROP INDEX IF EXISTS idx_segments_tsv")
+        conn.execute("ALTER TABLE segments DROP COLUMN IF EXISTS tsv")
+        conn.execute("ALTER TABLE segments ADD COLUMN tsv tsvector")
+        conn.execute("DROP TRIGGER IF EXISTS kiber_migration_guard ON segments")
+        conn.execute("DROP FUNCTION IF EXISTS kiber_migration_guard_fn()")
+        generated, plain = tsv_state(conn)
+        assert (generated, plain) == (False, True)
+
+        # An existing row that predates the migration must get its tsv back.
+        # Own project/source/document keeps this test repeatable.
+        token = uuid.uuid4().hex[:10]
+        project_id = conn.execute(
+            "INSERT INTO projects (slug, title) VALUES (%s, 'TsvOld') RETURNING id",
+            (f"kiber-tsvold-{token}",),
+        ).fetchone()[0]
+        source_id = conn.execute(
+            "INSERT INTO sources (project_id, kind, external_id, meta)"
+            " VALUES (%s, 'telegram', '-100777', '{}') RETURNING id",
+            (project_id,),
+        ).fetchone()[0]
+        document_id = conn.execute(
+            'INSERT INTO documents (source_id, doc_type, meta)'
+            " VALUES (%s, 'export', '{\"topic_id\": \"9\"}') RETURNING id",
+            (source_id,),
+        ).fetchone()[0]
+        existing = conn.execute(
+            """INSERT INTO segments (document_id, seq, text, external_ref)
+               VALUES (%s, 1, 'pre-migration text', %s) RETURNING id""",
+            (document_id, f"tg:-100777:{token}"),
+        ).fetchone()
+
+    # Apply 0007 for real, then again: idempotent both times.
+    with owner_connect() as conn:
+        conn.execute(migration_sql)
+        conn.execute(migration_sql)
+        generated, plain = tsv_state(conn)
+        assert (generated, plain) == (True, False)
+    with owner_connect() as conn:
+        versions = conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE version='0007_segments_tsv_generated'"
+        ).fetchone()[0]
+        assert versions == 1
+        assert conn.execute(
+            "SELECT tsv IS NOT NULL FROM segments WHERE id=%s", (existing[0],)
+        ).fetchone()[0] is True
+
+    # The standard load path fills tsv through the generated column: no manual
+    # UPDATE anywhere in this test.
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/tsv-{token}"
+    project_slug = f"kiber-tsv-{uuid.uuid4().hex[:10]}"
+    threads, items = _sample_bundle(source_id, "github")
+    job_dir = tmp_path / "tsv"
+    _bundle(job_dir, source_id, "github", threads, items)
+    load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_slug)
+
+    with _connect(credentials) as conn:
+        null_tsv = conn.execute(
+            """SELECT count(*) FROM segments s
+               JOIN documents d ON d.id=s.document_id
+               JOIN sources so ON so.id=d.source_id
+               WHERE so.project_id=%s AND s.tsv IS NULL""",
+            (project_id_of(conn, project_slug),),
+        ).fetchone()[0]
+        assert null_tsv == 0
+        fts = conn.execute(
+            """SELECT count(*) FROM segments s
+               WHERE s.tsv @@ to_tsquery('russian', 'good')""",
+        ).fetchone()[0]
+        assert fts >= 1
+
+    # Unsupported state: a foreign trigger must abort the migration and keep
+    # the version unrecorded.
+    with owner_connect() as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_segments_tsv")
+        conn.execute("ALTER TABLE segments DROP COLUMN IF EXISTS tsv")
+        conn.execute("ALTER TABLE segments ADD COLUMN tsv tsvector")
+        conn.execute(
+            "CREATE OR REPLACE FUNCTION kiber_migration_guard_fn() RETURNS trigger"
+            " LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+        )
+        conn.execute(
+            "CREATE TRIGGER kiber_migration_guard BEFORE INSERT ON segments"
+            " FOR EACH STATEMENT EXECUTE FUNCTION kiber_migration_guard_fn()"
+        )
+    with owner_connect() as conn:
+        with pytest.raises(Exception, match="custom trigger"):
+            conn.execute(migration_sql)
+        versions = conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE version='0007_segments_tsv_generated'"
+        ).fetchone()[0]
+        assert versions == 1, "the unsupported state must not record the version"
+    # Restore the supported state for any later tests.
+    with owner_connect() as conn:
+        conn.execute("DROP TRIGGER IF EXISTS kiber_migration_guard ON segments")
+        conn.execute("DROP FUNCTION IF EXISTS kiber_migration_guard_fn()")
+        conn.execute(migration_sql)
+
+
+def project_id_of(conn, project_slug: str) -> str:
+    return conn.execute(
+        "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+    ).fetchone()[0]

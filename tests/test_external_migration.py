@@ -80,7 +80,13 @@ def test_tsv_migration_checks_the_existing_mechanism_first() -> None:
     sql = migration.read_text(encoding="utf-8")
     assert "pg_attribute" in sql and "attgenerated" in sql
     assert "pg_trigger" in sql
-    assert "left untouched" in sql
+    # A foreign trigger must abort the migration (version stays unrecorded)
+    # instead of being silently bypassed.
+    assert "RAISE EXCEPTION 'segments has % custom trigger(s)" in sql
+    # Plain columns (attgenerated IS NULL or '') must be converted, and any
+    # other generation kind must abort with an exception.
+    assert "IF generated_kind IS NOT NULL AND generated_kind <> ''" in sql
+    assert "RAISE EXCEPTION 'segments.tsv generation kind % is not supported'" in sql
 
 
 def test_base_schema_fixture_declares_generated_tsv() -> None:

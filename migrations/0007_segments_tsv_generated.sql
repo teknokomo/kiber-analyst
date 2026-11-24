@@ -5,11 +5,13 @@
 -- configuration: the one-argument form depends on default_text_search_config
 -- and is not immutable, which generated columns require.
 --
--- Pre-checks (implemented in the DO block below, per review):
---   - if custom triggers maintain tsv, the existing mechanism is left in place;
---   - if tsv is already a stored generated column, only the GIN index and
---     statistics are ensured;
---   - otherwise the plain column is converted to a stored generated column.
+-- Pre-checks (implemented in the DO block below):
+--   - non-internal triggers on segments abort the migration with an
+--     exception (the version stays unrecorded until they are resolved);
+--   - an already stored generated column only gets its GIN index and
+--     statistics ensured;
+--   - any other attgenerated value aborts with an exception;
+--   - a plain column (attgenerated IS NULL or '') is converted.
 --
 -- Production note: this rewrite takes ACCESS EXCLUSIVE on segments and rewrites
 -- the table and its indexes. Check the actual mechanism first:
@@ -33,22 +35,24 @@ BEGIN
      WHERE tgrelid = 'segments'::regclass AND NOT tgisinternal;
 
     IF custom_triggers > 0 THEN
-        RAISE NOTICE 'segments has custom triggers; tsv mechanism left untouched';
-        RETURN;
-    END IF;
-
-    IF generated_kind IS NOT NULL AND generated_kind <> 's' THEN
-        RAISE NOTICE 'segments.tsv generation kind % is not supported; left untouched', generated_kind;
-        RETURN;
+        -- A foreign trigger must not silently disable the migration: the
+        -- operator has to resolve the conflict, and the version stays
+        -- unrecorded so the migration can be re-applied afterwards.
+        RAISE EXCEPTION 'segments has % custom trigger(s); resolve them before converting tsv', custom_triggers;
     END IF;
 
     IF generated_kind = 's' THEN
-        RAISE NOTICE 'segments.tsv is already a stored generated column';
+        -- Already a stored generated column: only ensure the index.
         CREATE INDEX IF NOT EXISTS idx_segments_tsv ON segments USING gin (tsv);
         ANALYZE segments;
         RETURN;
     END IF;
 
+    IF generated_kind IS NOT NULL AND generated_kind <> '' THEN
+        RAISE EXCEPTION 'segments.tsv generation kind % is not supported', generated_kind;
+    END IF;
+
+    -- attgenerated IS NULL (column missing) or '' (plain column): convert.
     DROP INDEX IF EXISTS idx_segments_tsv;
     ALTER TABLE segments DROP COLUMN IF EXISTS tsv;
     ALTER TABLE segments
