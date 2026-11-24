@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from kiber_analyst.connectors.base import (
     ConnectorHttpClient,
@@ -32,7 +33,7 @@ from kiber_analyst.connectors.source_ids import (
 
 DEFAULT_HEADERS = {"Accept": "application/vnd.gitverse.object+json;version=1"}
 _MAX_TIMELINE_EVENTS = 200
-_UNSUPPORTED_STATUSES = frozenset({404, 501})
+_UNSUPPORTED_STATUSES = frozenset({400, 404, 501})
 
 
 class GitVerseConnector:
@@ -75,6 +76,39 @@ class GitVerseConnector:
             )
         return parsed.path
 
+    @staticmethod
+    def _rewrite_public_link(target: str) -> str:
+        """Map GitVerse's public API links to the configured API host.
+
+        GitVerse returns pagination links on https://gitverse.ru/public/api/...
+        even when the request used https://api.gitverse.ru. The public host
+        returns 502 for those links; the same path on api.gitverse.ru serves
+        the next page and is the only host allowed to receive the token.
+        """
+        parts = urlsplit(target)
+        if (
+            parts.scheme == "https"
+            and (parts.hostname or "").lower() == "gitverse.ru"
+            and parts.path.startswith("/public/api/")
+        ):
+            return urlunsplit(
+                (
+                    "https",
+                    "api.gitverse.ru",
+                    parts.path[len("/public/api") :],
+                    parts.query,
+                    parts.fragment,
+                )
+            )
+        return target
+
+    def _iter_pages(self, url: str, *, params: dict[str, Any] | None = None):
+        return self._http.iter_pages(
+            url,
+            params=params,
+            link_rewrite=self._rewrite_public_link,
+        )
+
     # -- discover ----------------------------------------------------------
 
     def discover(
@@ -91,14 +125,14 @@ class GitVerseConnector:
         since = (checkpoint or {}).get("since")
         if isinstance(since, str) and since:
             params["since"] = since
-        for items, _headers in self._http.iter_pages(
+        for items, _headers in self._iter_pages(
             f"/repos/{repo}/issues", params=params
         ):
             for payload in items:
                 if isinstance(payload, dict) and "pull_request" not in payload:
                     yield self._list_ref(source_id, "issue", payload)
         pull_params: dict[str, Any] = {"state": "all", "per_page": self._config.page_size}
-        for items, _headers in self._http.iter_pages(
+        for items, _headers in self._iter_pages(
             f"/repos/{repo}/pulls", params=pull_params
         ):
             for payload in items:
@@ -154,11 +188,11 @@ class GitVerseConnector:
         endpoint = f"/repos/{repo}/issues/{ref.number}/comments"
         try:
             pages = list(
-                self._http.iter_pages(endpoint, params={"per_page": self._config.page_size})
+                self._iter_pages(endpoint)
             )
         except ConnectorError as exc:
             if _unsupported(exc):
-                raw.add_unsupported("GET", endpoint, "404")
+                raw.add_unsupported("GET", endpoint, str(exc.status or "404"))
                 return items
             raise
         for page, _headers in pages:
@@ -177,14 +211,13 @@ class GitVerseConnector:
         items: list[RawItem] = []
         try:
             pages = list(
-                self._http.iter_pages(
-                    f"/repos/{repo}/pulls/{ref.number}/reviews",
-                    params={"per_page": self._config.page_size},
+                self._iter_pages(
+                    f"/repos/{repo}/pulls/{ref.number}/reviews"
                 )
             )
         except ConnectorError as exc:
             if _unsupported(exc):
-                raw.add_unsupported("GET", f"/repos/{repo}/pulls/{ref.number}/reviews", "404")
+                raw.add_unsupported("GET", f"/repos/{repo}/pulls/{ref.number}/reviews", str(exc.status or "404"))
                 return items
             raise
         for page, _headers in pages:
@@ -206,11 +239,11 @@ class GitVerseConnector:
         endpoint = f"/repos/{repo}/pulls/{ref.number}/comments"
         try:
             pages = list(
-                self._http.iter_pages(endpoint, params={"per_page": self._config.page_size})
+                self._iter_pages(endpoint)
             )
         except ConnectorError as exc:
             if _unsupported(exc):
-                raw.add_unsupported("GET", endpoint, "404")
+                raw.add_unsupported("GET", endpoint, str(exc.status or "404"))
                 return items
             raise
         for page, _headers in pages:
@@ -230,11 +263,11 @@ class GitVerseConnector:
         events: list[dict[str, Any]] = []
         try:
             pages = list(
-                self._http.iter_pages(endpoint, params={"per_page": self._config.page_size})
+                self._iter_pages(endpoint)
             )
         except ConnectorError as exc:
             if _unsupported(exc):
-                raw.add_unsupported("GET", endpoint, "404")
+                raw.add_unsupported("GET", endpoint, str(exc.status or "404"))
                 return []
             raise
         for page, _headers in pages:
