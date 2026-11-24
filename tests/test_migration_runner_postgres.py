@@ -66,6 +66,7 @@ def test_runner_dry_run_target_full_lock_and_atomic_rollback(tmp_path: Path) -> 
         assert dry["checksums_verified"]["0006_external_discussions"] == (
             "a6150d72bd154b95119ba2c4ab175bf0ab6a392a9898c8cbaf206b5ff616befa"
         )
+        assert "0008_external_check_constraints" in dry["pending"]
         with psycopg.connect(dsn) as conn:
             assert conn.execute(
                 "SELECT to_regclass('public.snapshots'), to_regclass('public.asr_runs')"
@@ -86,6 +87,7 @@ def test_runner_dry_run_target_full_lock_and_atomic_rollback(tmp_path: Path) -> 
         assert completed["newly_applied"] == [
             "0006_external_discussions",
             "0007_segments_tsv_generated",
+            "0008_external_check_constraints",
         ]
         with psycopg.connect(dsn) as conn:
             ledger = [
@@ -116,6 +118,16 @@ def test_runner_dry_run_target_full_lock_and_atomic_rollback(tmp_path: Path) -> 
                 .find("using gin (tsv)")
                 >= 0
             )
+            source_check = conn.execute(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                " WHERE conrelid='sources'::regclass AND conname='sources_kind_check'"
+            ).fetchone()[0].lower()
+            document_check = conn.execute(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                " WHERE conrelid='documents'::regclass AND conname='documents_doc_type_check'"
+            ).fetchone()[0].lower()
+            assert all(name in source_check for name in ("github", "gitlab", "gitverse"))
+            assert "thread" in document_check
 
         assert run_migrations(dsn)["status"] == "current"
 
@@ -135,21 +147,21 @@ def test_runner_dry_run_target_full_lock_and_atomic_rollback(tmp_path: Path) -> 
         rollback_sql = (
             "CREATE TABLE migration_rollback_probe (id integer);\n"
             "SELECT 1 / 0;\n"
-            "INSERT INTO schema_migrations(version) VALUES ('0008_rollback_probe');\n"
+            "INSERT INTO schema_migrations(version) VALUES ('0009_rollback_probe');\n"
         )
-        (rollback_catalog / "0008_rollback_probe.sql").write_text(rollback_sql, encoding="utf-8")
+        (rollback_catalog / "0009_rollback_probe.sql").write_text(rollback_sql, encoding="utf-8")
         manifest_path = rollback_catalog / "checksums.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["migrations"].append(
             {
-                "version": "0008_rollback_probe",
-                "file": "0008_rollback_probe.sql",
+                "version": "0009_rollback_probe",
+                "file": "0009_rollback_probe.sql",
                 "sha256": hashlib.sha256(rollback_sql.encode()).hexdigest(),
             }
         )
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         with pytest.raises(MigrationError, match="MIGRATION_FAILED") as error:
-            run_migrations(dsn, target="0008_rollback_probe", migrations_dir=rollback_catalog)
+            run_migrations(dsn, target="0009_rollback_probe", migrations_dir=rollback_catalog)
         assert error.value.sqlstate == "22012"
         with psycopg.connect(dsn) as conn:
             assert (
@@ -158,7 +170,7 @@ def test_runner_dry_run_target_full_lock_and_atomic_rollback(tmp_path: Path) -> 
             )
             assert (
                 conn.execute(
-                    "SELECT count(*) FROM schema_migrations WHERE version='0008_rollback_probe'"
+                    "SELECT count(*) FROM schema_migrations WHERE version='0009_rollback_probe'"
                 ).fetchone()[0]
                 == 0
             )
