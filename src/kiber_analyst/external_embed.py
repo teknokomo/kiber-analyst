@@ -33,6 +33,11 @@ from kiber_analyst.paths import write_json_atomic
 _MAX_SOURCE_SEGMENTS = 500_000
 
 
+def _external_embed_lock_key(source_id: str) -> str:
+    """Return a stable advisory-lock key scoped to one source and model."""
+    return f"external-embed:{source_id}:{MODEL_KEY}"
+
+
 def _checkpoint(
     *, source_id: str, last_segment_id: int | None, inserted: int,
     updated_vectors: int = 0, skipped_existing: int, skipped_empty: int,
@@ -158,7 +163,7 @@ def embed_external(
         "runs_id": None,
     }
     conn = None
-    lock_key = f"external-embed:{source_id}:{MODEL_KEY}"
+    lock_key = _external_embed_lock_key(source_id)
     lock_acquired = False
     try:
         conn = _connect(db_config)
@@ -202,7 +207,7 @@ def embed_external(
                      AND s.thread_ref IS NOT NULL
                      AND s.text ~ '[^[:space:]]'
                      AND (%s::bigint IS NULL OR s.id > %s::bigint)
-                   ORDER BY s.id
+                   ORDER BY has_embedding, s.id
                    LIMIT %s""",
                 (
                     MODEL_KEY,
