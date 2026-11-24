@@ -13,16 +13,81 @@ SELECT attgenerated::text
 FROM pg_attribute
 WHERE attrelid='segments'::regclass AND attname='tsv';
 
+SELECT attnotnull
+FROM pg_attribute
+WHERE attrelid='segments'::regclass AND attname='text';
+
+SELECT pg_get_expr(adbin, adrelid)
+FROM pg_attrdef
+WHERE adrelid='segments'::regclass
+  AND adnum=(SELECT attnum FROM pg_attribute
+             WHERE attrelid='segments'::regclass AND attname='tsv');
+
+SELECT indexdef
+FROM pg_indexes
+WHERE schemaname='public' AND tablename='segments'
+  AND indexname='idx_segments_tsv';
+
+SELECT count(*)
+FROM schema_migrations
+WHERE version='0007_segments_tsv_generated';
+
 SELECT tgname, pg_get_triggerdef(oid)
 FROM pg_trigger
 WHERE tgrelid='segments'::regclass AND NOT tgisinternal;
 ```
 
-- Ожидается `attgenerated = ''` и ноль не-внутренних триггеров.
-- `attgenerated = 's'` — миграция уже применена: ничего не делать, проверить
-  только индекс (`idx_segments_tsv`) и выполнить `ANALYZE segments;`.
+- Ожидаются `segments.text NOT NULL` и ноль не-внутренних триггеров.
 - Любой не-внутренний триггер — **остановиться и сообщить**: миграция 0007
   намеренно падает (`RAISE EXCEPTION`), обходить её нельзя.
+- Для `segments.tsv` ожидается `attgenerated = ''` (обычный столбец) либо
+  `attgenerated = 's'` (stored generated column). Любое другое значение —
+  остановиться и выяснить состояние схемы.
+- Для generated-столбца выражение должно соответствовать
+  `to_tsvector('russian'::regconfig, coalesce(text, ''))`, а индекс
+  `idx_segments_tsv` должен быть GIN по `tsv`.
+
+`pg_get_expr` может вывести `COALESCE(text, ''::text)` и отличаться
+пробелами или регистром. Считай выражение совпадающим, если после
+нормализации пробелов и регистра оно семантически содержит
+`to_tsvector('russian'::regconfig, coalesce(text, ''))`; cast пустой
+строки к `text` допустим. Не убирай проверку `coalesce`.
+
+### Если `attgenerated = 's'`
+
+Сравни выражение `pg_get_expr` и определение индекса с ожидаемыми выше.
+
+- Если выражение совпадает, а индекс отсутствует, после backup и проверки
+  восстановления повторно запусти миграцию из раздела 3: она создаст индекс,
+  выполнит `ANALYZE` и зарегистрирует недостающую версию.
+- Если выражение совпадает, индекс существует и его определение — GIN по
+  `tsv`, но строки версии нет, после backup повторно запусти миграцию из
+  раздела 3. Она выполнит `ANALYZE` и зарегистрирует версию. **Не добавляй
+  версию ручным `INSERT`.**
+- Если индекс уже существует, но его определение отличается, остановись и
+  отдельно исправь индекс после backup. `CREATE INDEX IF NOT EXISTS` не
+  перестраивает существующий индекс с неверным определением.
+- Если выражение отличается, сначала проверь `segments.text NOT NULL`.
+  Если `text` nullable — остановись: различие может менять семантику и
+  требует отдельного разбора. Перед исправлением сделай и проверь backup,
+  затем запланируй maintenance window: изменение generated-выражения
+  переписывает `segments` и требует `ACCESS EXCLUSIVE`.
+- На PostgreSQL 17 и новее исправь выражение штатной командой ниже; после
+  неё проверь `pg_get_expr` и только при точном совпадении повторно запусти
+  0007 из раздела 3:
+
+  ```bash
+  psql -1 -v ON_ERROR_STOP=1 -d knowledge \
+    -c "ALTER TABLE segments ALTER COLUMN tsv SET EXPRESSION AS (to_tsvector('russian'::regconfig, coalesce(text, ''))); ANALYZE segments;"
+  ```
+
+  `SET EXPRESSION` документирован в
+  [PostgreSQL 17 ALTER TABLE](https://www.postgresql.org/docs/17/sql-altertable.html).
+  На PostgreSQL 16 этой команды нет: **не запускай её и не добавляй её в
+  миграцию 0007**, которая должна работать на PostgreSQL 16. Подготовь
+  отдельную совместимую процедуру и остановись до её согласования.
+- Если `attgenerated = ''`, сделай backup и применяй 0007 обычным способом
+  из раздела 3.
 
 ## 2. Backup
 
@@ -65,6 +130,13 @@ psql -1 -v ON_ERROR_STOP=1 -d knowledge \
 SELECT attgenerated::text FROM pg_attribute
 WHERE attrelid='segments'::regclass AND attname='tsv';          -- ожидается 's'
 
+SELECT pg_get_expr(adbin, adrelid)
+FROM pg_attrdef
+WHERE adrelid='segments'::regclass
+  AND adnum=(SELECT attnum FROM pg_attribute
+             WHERE attrelid='segments'::regclass AND attname='tsv');
+-- ожидается выражение с to_tsvector('russian'::regconfig, coalesce(text, ''))
+
 SELECT count(*) FROM segments WHERE tsv IS NULL;                 -- ожидается 0
 
 SELECT count(*) FROM segments
@@ -79,14 +151,52 @@ SELECT count(*), coalesce(max(id),0) FROM segments;              -- как до 
 Плюс функциональная проверка: поиск Kiber-analyst через broker/CLI находит
 известный текст **без вектора** (`mode: fts`).
 
-## 5. Откат
+## 5. Проверка полноты истории перед следующей миграцией
+
+Перед применением любой следующей миграции сверь ledger БД с миграциями в
+том же checkout, из которого будет запускаться SQL. После 0007 ожидается
+полный набор `0001_init` и версий `0002`–`0007`, каждая ровно один раз:
+
+```bash
+find migrations -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | sort
+```
+
+```sql
+SELECT version FROM schema_migrations ORDER BY version;
+```
+
+Проверяй каждую версию отдельно: baseline `0001_init` и версии файлов
+`migrations/0002_*.sql` — `migrations/0007_*.sql`. В текущем репозитории нет
+файла `migrations/0001_*.sql`; `0001_init` — начальный baseline, который
+должен подтверждаться bootstrap-схемой установки. Не считай отсутствующую
+запись доказательством, что baseline или миграция применены. Перед каждым
+следующим DDL проверь также, что структура каждой уже записанной версии
+соответствует её контракту.
+
+- Если версия есть — проверь её соответствующую структуру и данные.
+- Если отсутствует только `0006_external_discussions`, сначала сравни
+  production-схему с её контрактом и выполни pre-checks/backup из
+  [`apply-0006.md`](apply-0006.md). Когда миграция ещё не применена, это
+  обычная forward-миграция; когда вся её структура уже совпадает, повторно
+  запусти тот же идемпотентный SQL. В обоих случаях миграция сама
+  зарегистрирует версию. **Не добавляй запись вручную.**
+- Для другой отсутствующей версии действуй только по её собственному
+  runbook. Не закрывай несколько пропусков массовым `INSERT`.
+- Если структура отличается, остановись и составь точный diff. Не запускай
+  миграцию в надежде, что она исправит неизвестный drift, и не записывай её
+  версию. Согласуй отдельную процедуру исправления.
+- Если отсутствует другая версия, разбирай её отдельно по её SQL и
+  структурным pre-checks; не делай вывод о её применении по соседним
+  версиям.
+
+## 6. Откат
 
 - Ошибка до COMMIT — откат автоматический (`-1`), версия не записана.
 - Проблема после COMMIT — восстановить backup
   (`pg_restore -d knowledge /var/backups/…dump` после подтверждения владельца),
   таблицу вручную не править.
 
-## 6. Шаблон отчёта
+## 7. Шаблон отчёта
 
 ```text
 PR #3: <url>            applied merge commit: <full merge commit SHA>

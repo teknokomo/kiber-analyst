@@ -1285,6 +1285,19 @@ def test_tsv_migration_converts_plain_column_and_is_idempotent(tmp_path: Path) -
         conn.execute(migration_sql)
         generated, plain = tsv_state(conn)
         assert (generated, plain) == (True, False)
+        generated_expression = conn.execute(
+            """SELECT pg_get_expr(adbin, adrelid)
+               FROM pg_attrdef
+               WHERE adrelid='segments'::regclass
+                 AND adnum=(SELECT attnum FROM pg_attribute
+                            WHERE attrelid='segments'::regclass
+                              AND attname='tsv' AND NOT attisdropped)"""
+        ).fetchone()[0]
+        normalized_expression = "".join(generated_expression.lower().split())
+        normalized_expression = normalized_expression.replace("''::text", "''")
+        assert normalized_expression == (
+            "to_tsvector('russian'::regconfig,coalesce(text,''))"
+        )
     with owner_connect() as conn:
         versions = conn.execute(
             "SELECT count(*) FROM schema_migrations WHERE version='0007_segments_tsv_generated'"
