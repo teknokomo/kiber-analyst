@@ -1,0 +1,37 @@
+# Connector configuration for kiber-analyst 0.2.0.
+#
+# Copy to the runtime config directory as connectors.yaml:
+#   ~/.config/kiber-analyst/connectors.yaml
+# (or the directory configured via KIBER_ANALYST_CONFIG_DIR).
+#
+# Tokens are read only from the environment and never from this file:
+#   KIBER_GITHUB_TOKEN   (read-only scope)
+#   KIBER_GITLAB_TOKEN   (read_only scope)
+#   KIBER_GITVERSE_TOKEN (read-only scope)
+# Never commit real tokens, and do not widen these examples with secrets.
+#
+# The token is sent only to the api_url host and to hosts listed in
+# allowed_hosts. Add self-hosted GitLab or GitHub Enterprise hosts explicitly;
+# an unconfigured host is rejected with SOURCE_NOT_ALLOWED before any request.
+
+github:
+  api_url: https://api.github.com
+  page_size: 100
+  timeout_seconds: 30
+  max_retries: 5
+  # allowed_hosts: [github.example.com]
+
+gitlab:
+  api_url: https://gitlab.com/api/v4
+  page_size: 100
+  timeout_seconds: 30
+  max_retries: 5
+  # Self-hosted example (a configured api_url keeps its base path):
+  # api_url: https://gitlab.example.com/gitlab/api/v4
+  # allowed_hosts: [gitlab.example.com]
+
+gitverse:
+  api_url: https://api.gitverse.ru
+  page_size: 100
+  timeout_seconds: 30
+  max_retries: 5

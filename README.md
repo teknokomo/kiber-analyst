@@ -1,16 +1,26 @@
 # Kiber-analyst
 
-Kiber-analyst is a Python toolkit for importing structured Telegram Desktop JSON exports into a PostgreSQL knowledge base. It normalizes messages and service events, tracks media references and missing files, creates embeddings, and supports hybrid full-text/vector search. A read-only MCP server, durable job worker, and restricted broker are included for controlled integrations.
+Kiber-analyst is a Python toolkit for importing structured source archives into a PostgreSQL knowledge base. It normalizes discussions and messages, tracks provenance, creates embeddings, and supports hybrid full-text/vector search. A read-only MCP server, durable job worker, and restricted broker are included for controlled integrations.
 
-## Version 0.1.0 scope
+## Version 0.2.0 scope
 
-This release covers Telegram JSON ingestion, message and service-event storage, media metadata and `media_missing` reports, embeddings, hybrid/FTS search, read-only MCP, durable jobs, and the allowlisted broker API. The release is limited to those documented workflows; other media processing and external connectors are out of scope.
+This release covers:
+
+- Telegram JSON ingestion (unchanged from 0.1.0): messages, service events, media metadata and `media_missing` reports.
+- Read-only discussion connectors for **GitHub** (issues, pull requests, reviews, review comments, Discussions when GraphQL is available), **GitLab** (issues, notes, merge requests, discussions), and **GitVerse** (issues, comments, pull requests, reviews).
+- A single normalized discussion model on top of `documents` + `segments`, with thread/item references, parent links, item kinds, revisions, and soft-deletion markers.
+- Incremental sync with checkpoints and a five-minute overlap window; repeated runs are idempotent.
+- Embeddings for non-empty discussion text, hybrid/FTS search, MCP search with provenance, and broker allowlisting for external sources.
+
+Everything stays **read-only** against the providers: Kiber-analyst never creates issues, comments, reviews, labels, or merges. Diff analysis, attachments, OCR, webhooks, cross-provider deduplication, and UI are out of scope for 0.2.0.
 
 ## Requirements
 
 - Python 3.12 or newer
 - PostgreSQL with the schema migrations in `migrations/` for database-backed operations
-- Optional provider credentials and network access only for embedding operations
+- Provider credentials and network access are required for enabled external
+  connector imports; they are optional for offline Telegram archive workflows.
+  Embedding operations also require the configured embedding provider.
 
 ## Install
 
@@ -28,6 +38,7 @@ Install only the extras needed for your workflow:
 ```bash
 pip install -e '.[db]'          # PostgreSQL load and search
 pip install -e '.[embedding]'   # embeddings and vector query support
+pip install -e '.[connectors]'  # GitHub/GitLab/GitVerse HTTP connectors
 pip install -e '.[mcp]'         # read-only MCP server
 pip install -e '.[test]'        # tests and Ruff
 ```
@@ -54,9 +65,36 @@ The prepared example records are in `examples/synthetic/telegram-topic/`. They d
 5. Optionally create embeddings and run hybrid search.
 6. Use the read-only MCP process or restricted broker when an agent needs bounded access.
 
+## External discussions (GitHub, GitLab, GitVerse)
+
+Set a read-only provider token in the environment (`KIBER_GITHUB_TOKEN`,
+`KIBER_GITLAB_TOKEN`, `KIBER_GITVERSE_TOKEN`) and optionally tune API settings in
+`~/.config/kiber-analyst/connectors.yaml` (see `config/connectors.example.yaml`).
+Tokens are never stored in the repository or written to logs.
+
+```bash
+kiber-analyst github ingest --repo owner/repo --project sample-project --since 2026-01-01
+kiber-analyst gitlab ingest --host gitlab.com --project group/project \
+  --project-slug sample-project --since 2026-01-01
+kiber-analyst gitverse ingest --repo owner/repo --project sample-project --since 2026-01-01
+
+kiber-analyst external status --source github:owner/repo --project sample-project
+kiber-analyst external embed  --source github:owner/repo --project sample-project
+kiber-analyst search "connector design" --project sample-project --source-kind github
+```
+
+Each ingest runs discover → fetch → normalize → load with per-stage checkpoints;
+`--limit` bounds a pilot run and `--dry-run` executes the full transaction and
+rolls it back. A run is `partial` when pagination or an optional endpoint
+(e.g. GitHub Discussions without GraphQL scope) was unavailable. Apply
+`migrations/0006_external_discussions.sql` before the first external ingest.
+
 ## Roadmap
 
-Possible future work includes additional input adapters, operational tooling, and usability improvements. This is exploratory only; there are no promised dates or committed scope beyond this release.
+Possible future work includes cross-provider deduplication (0.2.1), additional
+input adapters, operational tooling, and usability improvements. This is
+exploratory only; there are no promised dates or committed scope beyond this
+release.
 
 Typical commands are available with `kiber-analyst --help`. The input path, project slug, model, and provider settings must be supplied or configured for the local environment; no production account or source is built in.
 

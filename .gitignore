@@ -25,3 +25,5 @@ jobs/
 staging/
 backups/
 logs/
+memory-bank/
+.ontoindex

@@ -15,7 +15,15 @@ from kiber_analyst.jobqueue import DEFAULT_SOCKET, JobsError, canonical_json
 
 MAX_REQUEST_BYTES = 1_048_576
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
-ALLOWED_OPERATIONS = {"telegram_asr", "telegram_ingest", "embed", "asr_embed", "search"}
+ALLOWED_OPERATIONS = {
+    "telegram_asr",
+    "telegram_ingest",
+    "embed",
+    "asr_embed",
+    "search",
+    "external_ingest",
+    "external_embed",
+}
 DATA_PREFIX = data_dir().resolve()
 
 
@@ -155,6 +163,39 @@ def parse_job_command(argv: Sequence[str]) -> tuple[str, dict[str, Any], list[di
         ).hexdigest()
         return "embed", {"job_dir": str(job_dir), "project": args.project}, [{"key": "embedding-input", "fingerprint": fingerprint}]
 
+    if tokens[0] in {"github", "gitlab", "gitverse"} and len(tokens) > 1 and tokens[1] == "ingest":
+        return _parse_external_ingest(tokens)
+
+    if tokens[:2] == ["external", "embed"]:
+        parser = _RestrictedParser(add_help=False)
+        parser.add_argument("--source", required=True)
+        parser.add_argument("--project", required=True)
+        parser.add_argument("--limit", type=int)
+        try:
+            args = parser.parse_args(tokens[2:])
+        except SystemExit:
+            raise JobsError("Unsupported external embed arguments") from None
+        try:
+            from kiber_analyst.connectors.source_ids import parse_source_id
+
+            parsed = parse_source_id(args.source)
+        except Exception:  # noqa: BLE001 - keep source diagnostics generic
+            parsed = None
+        if parsed is None:
+            raise JobsError("External embed requires a valid provider source ID")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.project):
+            raise JobsError("Invalid project slug")
+        if args.limit is not None and args.limit < 1:
+            raise JobsError("--limit must be positive")
+        params = {
+            "source_id": args.source,
+            "provider": parsed.provider,
+            "project": args.project,
+            "limit": args.limit,
+        }
+        fingerprint = hashlib.sha256(canonical_json(params).encode()).hexdigest()
+        return "external_embed", params, [{"key": "external-embed", "fingerprint": fingerprint}]
+
     if tokens[:2] == ["asr", "embed"]:
         parser = _RestrictedParser(add_help=False)
         scope = parser.add_mutually_exclusive_group(required=True)
@@ -193,7 +234,10 @@ def parse_job_command(argv: Sequence[str]) -> tuple[str, dict[str, Any], list[di
         parser.add_argument("query")
         parser.add_argument("--project", required=True)
         parser.add_argument("--limit", type=int, default=10)
-        parser.add_argument("--source-kind", choices=("telegram", "document", "web", "video"))
+        parser.add_argument(
+            "--source-kind",
+            choices=("telegram", "document", "web", "video", "github", "gitlab", "gitverse"),
+        )
         parser.add_argument("--source", choices=("segment", "asr"), dest="source_filter")
         parser.add_argument("--date-from")
         parser.add_argument("--date-to")
@@ -227,7 +271,65 @@ def parse_job_command(argv: Sequence[str]) -> tuple[str, dict[str, Any], list[di
         }
         fingerprint = hashlib.sha256(canonical_json(params).encode()).hexdigest()
         return "search", params, [{"key": "search-query", "fingerprint": fingerprint}]
-    raise JobsError("Supported operations: telegram asr, telegram ingest, embed, asr embed, search")
+    raise JobsError(
+        "Supported operations: telegram asr, telegram ingest, embed, asr embed, search,"
+        " github/gitlab/gitverse ingest, external embed"
+    )
+
+
+def _parse_external_ingest(tokens: list[str]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+    provider = tokens[0]
+    parser = _RestrictedParser(add_help=False)
+    if provider == "gitlab":
+        parser.add_argument("--host", default="gitlab.com")
+        parser.add_argument("--project", required=True, dest="project_path")
+        parser.add_argument("--project-slug", required=True)
+    else:
+        parser.add_argument("--repo", required=True)
+        parser.add_argument("--project", required=True)
+    parser.add_argument("--since")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    try:
+        args = parser.parse_args(tokens[2:])
+    except SystemExit:
+        raise JobsError(f"Unsupported {provider} ingest arguments") from None
+    if provider == "gitlab":
+        source_id = f"gitlab:{args.host}/{args.project_path}"
+        project_slug = args.project_slug
+    else:
+        source_id = f"{provider}:{args.repo}"
+        project_slug = args.project
+    try:
+        from kiber_analyst.connectors.source_ids import parse_source_id
+
+        parsed = parse_source_id(source_id)
+    except Exception:  # noqa: BLE001 - keep source diagnostics generic
+        parsed = None
+    if parsed is None or parsed.provider != provider:
+        raise JobsError(f"Invalid {provider} repository identifier")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", project_slug):
+        raise JobsError("Invalid project slug")
+    if args.since is not None:
+        try:
+            datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+        except ValueError:
+            raise JobsError("--since must use ISO 8601 format") from None
+    if args.limit is not None and args.limit < 1:
+        raise JobsError("--limit must be positive")
+    params = {
+        "provider": provider,
+        "source_id": source_id,
+        "project": project_slug,
+        "since": args.since,
+        "limit": args.limit,
+        "dry_run": bool(args.dry_run),
+    }
+    # Idempotency key basis: source_id + since + mode (ТЗ §10.3); the job store
+    # derives the idempotency key from the operation fingerprint, which already
+    # covers all three plus limit/dry-run.
+    fingerprint = hashlib.sha256(canonical_json(params).encode()).hexdigest()
+    return "external_ingest", params, [{"key": "external-source", "fingerprint": fingerprint}]
 
 
 def request(socket_path: Path, payload: dict[str, Any], *, timeout: float = 65.0) -> dict[str, Any]:

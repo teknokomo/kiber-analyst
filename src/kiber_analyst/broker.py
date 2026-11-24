@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 
 from kiber_analyst import __version__ as KIBER_ANALYST_VERSION
 from kiber_analyst.config_paths import config_path, data_path, runtime_path
+from kiber_analyst.connectors.source_ids import parse_source_id
 from kiber_analyst.jobapi import api_call, submit_command
 from kiber_analyst.jobqueue import JobsError
 from kiber_analyst.media_resume import resumed_photos
@@ -47,7 +48,7 @@ PUBLIC_ERROR_CATEGORIES = RETRYABLE_ERRORS | {
 }
 MAX_ATTEMPTS = 3
 RESERVE = 5 * 1024**3
-SEARCH_MAX_LIMIT = 50
+SEARCH_MAX_LIMIT = 100
 SEARCH_MAX_QUERY_CHARS = 150
 SEARCH_WAIT_SECONDS = 55
 # Bump when search behavior or its public result shape changes. Old requests
@@ -131,10 +132,11 @@ def timestamp():
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 
-def search_fingerprint(source_id, query, limit):
+def search_fingerprint(source_id, project, query, limit):
     payload = {
         'cache_version': SEARCH_CACHE_VERSION,
         'source_id': source_id,
+        'project': project,
         'query': query,
         'limit': limit,
     }
@@ -200,6 +202,13 @@ def registry(path):
         raise Refused('UNSAFE_REGISTRY')
     values = json.loads(path.read_text())
     for source, entry in values.items():
+        if parse_source_id(source) is not None:
+            # External sources carry no staged files, so they register with a
+            # project only; no control hashes exist for them.
+            if set(entry) != {'project'} or not re.fullmatch(
+                    r'[a-z0-9][a-z0-9-]{0,62}', entry['project']):
+                raise Refused('INVALID_REGISTRY')
+            continue
         if not re.fullmatch(r'telegram:-[1-9][0-9]{0,18}:topic:[1-9][0-9]{0,9}', source):
             raise Refused('INVALID_REGISTRY')
         if (set(entry) not in ({'project', 'hashes'}, {'project', 'hashes', 'asr_enabled'})
@@ -377,6 +386,9 @@ class Broker:
             raise Refused('SOURCE_NOT_ALLOWED')
         entry = self.sources[source]
         fingerprint = hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
+        if parse_source_id(source) is not None:
+            # External sources have no staged import tree.
+            return entry, fingerprint, None, None
         _, chat, _, topic = source.split(':')
         return entry, fingerprint, chat, topic
 
@@ -847,6 +859,8 @@ class Broker:
 
     def start(self, owner, operation, source_id):
         entry, fingerprint, chat, topic = self.source(source_id)
+        if chat is None:
+            return self.start_external(owner, operation, source_id, entry, fingerprint)
         base_fingerprint = fingerprint
         revision = media_revision(self.root, chat, topic) if operation == 'ingest' else ''
         if revision:
@@ -886,6 +900,105 @@ class Broker:
                             (request_id, owner, source_id, fingerprint, operation, json.dumps(argv), now, now))
         return self.dispatch(self.row(owner, request_id))
 
+    @staticmethod
+    def _base_fingerprint(value):
+        # New runs use "<base>:<nonce>" so the requests uniqueness constraint
+        # still allows a fresh request while the source revision stays stable.
+        return str(value).split(':', 1)[0]
+
+    def start_external(self, owner, operation, source_id, entry, fingerprint):
+        # External sources: no staged files, the connector fetches from the API.
+        provider, external_id = source_id.split(':', 1)
+        relevant = self.db.execute(
+            """SELECT r.*, coalesce(e.base_fingerprint,r.fingerprint) AS source_fingerprint
+               FROM requests r LEFT JOIN embed_renewals e ON e.request_id=r.id
+               WHERE owner=? AND source=? AND operation=? ORDER BY r.created DESC""",
+            (owner, source_id, operation),
+        ).fetchall()
+        for row in relevant:
+            if self._base_fingerprint(row['source_fingerprint']) == fingerprint:
+                if self.status(row)['status'] not in TERMINAL:
+                    # An active identical request is never duplicated.
+                    return self.dispatch(row)
+                # A finished request must not suppress a new provider check;
+                # fall through and create a fresh run below.
+                break
+            if self.status(row)['status'] not in TERMINAL:
+                raise Refused('SOURCE_BUSY')
+        if operation == 'ingest':
+            if provider == 'gitlab':
+                host, project_path = external_id.split('/', 1)
+                argv = ['gitlab', 'ingest', '--host', host, '--project', project_path,
+                        '--project-slug', entry['project']]
+            else:
+                argv = [provider, 'ingest', '--repo', external_id, '--project', entry['project']]
+        elif operation == 'embed':
+            ingests = self.db.execute(
+                'SELECT * FROM requests WHERE owner=? AND source=? AND operation=?'
+                ' ORDER BY created DESC',
+                (owner, source_id, 'ingest'),
+            ).fetchall()
+            ingest = next(
+                (row for row in ingests
+                 if self._base_fingerprint(row['fingerprint']) == fingerprint),
+                None,
+            )
+            if ingest is None or self.status(ingest)['status'] != 'done':
+                raise Refused('INGEST_REQUIRED')
+            argv = ['external', 'embed', '--source', source_id, '--project', entry['project']]
+        else:
+            raise Refused('COMMAND_NOT_ALLOWED')
+        existing = self.db.execute(
+            'SELECT 1 FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
+            (owner, source_id, fingerprint, operation),
+        ).fetchone()
+        if existing is None:
+            request_fingerprint = fingerprint
+        else:
+            # Deterministic next generation: concurrent callers race on the
+            # requests uniqueness constraint instead of both creating a run.
+            generation = self.db.execute(
+                'SELECT count(*) FROM requests WHERE owner=? AND source=? AND operation=?',
+                (owner, source_id, operation),
+            ).fetchone()[0]
+            request_fingerprint = f"{fingerprint}:{generation}"
+        now = timestamp()
+        request_id = str(uuid.uuid4())
+        try:
+            with self.db:
+                self.db.execute(
+                    'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) VALUES(?,?,?,?,?,?,?,?)',
+                    (request_id, owner, source_id, request_fingerprint, operation,
+                     json.dumps(argv), now, now),
+                )
+        except sqlite3.IntegrityError:
+            row = self.db.execute(
+                'SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
+                (owner, source_id, request_fingerprint, operation),
+            ).fetchone()
+            if row is None:
+                raise Refused('SOURCE_BUSY') from None
+            return self.dispatch(row)
+        return self.dispatch(self.row(owner, request_id))
+
+    def external_source_status(self, owner, source_id, entry, command):
+        if command != 'source-status':
+            raise Refused('COMMAND_NOT_ALLOWED')
+        db = self.worker_api('source-overview', source_id=source_id, project=entry['project'])
+        rows = self.db.execute(
+            'SELECT * FROM requests WHERE owner=? AND source=? ORDER BY created DESC',
+            (owner, source_id),
+        ).fetchall()
+        by_operation = {}
+        for row in rows:
+            if row['operation'] not in by_operation:
+                by_operation[row['operation']] = {
+                    'request_id': row['id'], 'status': self.status(row)['status'],
+                }
+        return {'source_id': source_id, 'provider': source_id.split(':', 1)[0],
+                'counts': db, 'ingest': by_operation.get('ingest'),
+                'embed': by_operation.get('embed')}
+
     def source_search(self, owner, source_id, query, limit_text=None):
         entry, _source_fingerprint, _chat, _topic = self.source(source_id)
         if not isinstance(query, str) or not query.strip() or len(query) > SEARCH_MAX_QUERY_CHARS:
@@ -894,7 +1007,7 @@ class Broker:
             limit = 5
         elif (
             isinstance(limit_text, str)
-            and re.fullmatch(r'[1-9][0-9]?', limit_text)
+            and re.fullmatch(r'(?:[1-9][0-9]?|100)', limit_text)
         ):
             limit = int(limit_text)
         else:
@@ -905,17 +1018,22 @@ class Broker:
             overview = self.worker_api('source-overview', source_id=source_id, project=entry['project'])
         except JobsError:
             raise Refused('WORKER_UNAVAILABLE') from None
-        if overview.get('documents') != 1:
+        external = parse_source_id(source_id) is not None
+        if external:
+            if not overview.get('threads'):
+                raise Refused('SOURCE_NOT_FOUND')
+        elif overview.get('documents') != 1:
             raise Refused('SOURCE_NOT_FOUND')
         normalized = query.strip()
-        fingerprint = search_fingerprint(source_id, normalized, limit)
+        fingerprint = search_fingerprint(source_id, entry['project'], normalized, limit)
         row = self.db.execute(
             "SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation='search'",
             (owner, source_id, fingerprint),
         ).fetchone()
         if row is None:
             argv = ['search', normalized, '--project', entry['project'], '--limit', str(limit),
-                    '--source-kind', 'telegram', '--source-id', source_id, '--json']
+                    '--source-kind', source_id.split(':', 1)[0] if external else 'telegram',
+                    '--source-id', source_id, '--json']
             now = timestamp()
             request_id = str(uuid.uuid4())
             with self.db:
@@ -951,6 +1069,10 @@ class Broker:
                             'message_id', 'author', 'score',
                         )
                     }
+                    if external:
+                        for key in ('thread_ref', 'item_ref', 'item_kind', 'url',
+                                    'state', 'labels'):
+                            row_data[key] = item.get(key)
                     row_data['date'] = item.get('posted_at')
                     row_data['text'] = text[:1200]
                     row_data['text_truncated'] = len(text) > 1200
@@ -998,7 +1120,13 @@ class Broker:
         old_base = self.db.execute(
             'SELECT base_fingerprint FROM embed_renewals WHERE request_id=?', (request_id,),
         ).fetchone()
-        if fingerprint != (old_base[0] if old_base else previous['fingerprint']):
+        expected_fingerprint = (
+            old_base[0] if old_base else self._base_fingerprint(previous['fingerprint'])
+        )
+        if (
+            self._base_fingerprint(fingerprint)
+            != self._base_fingerprint(expected_fingerprint)
+        ):
             raise Refused('SOURCE_REVISION_CHANGED')
         for row in self.db.execute(
             "SELECT * FROM requests WHERE owner=? AND source=? AND operation='embed' AND id<>?",
@@ -1083,6 +1211,8 @@ class Broker:
 
     def inspect_source(self, owner, source_id, command):
         entry, _, chat, topic = self.source(source_id)
+        if chat is None:
+            return self.external_source_status(owner, source_id, entry, command)
         with contextlib.ExitStack() as stack:
             fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             stack.callback(os.close, fd)
@@ -1261,7 +1391,15 @@ class Broker:
             'SELECT base_fingerprint FROM embed_renewals WHERE request_id=?', (row['id'],),
         ).fetchone()
         expected_fingerprint = renewal[0] if renewal else row['fingerprint']
-        if operation == 'ingest':
+        if operation == 'ingest' and chat is None:
+            # External reruns add a uniqueness suffix to the request fingerprint;
+            # validate the source revision against its unsuffixed base.
+            if (
+                self._base_fingerprint(fingerprint)
+                != self._base_fingerprint(expected_fingerprint)
+            ):
+                raise Refused('SOURCE_REVISION_CHANGED')
+        elif operation == 'ingest':
             revision = media_revision(self.root, chat, topic)
             current = hashlib.sha256((fingerprint + revision).encode()).hexdigest() if revision else fingerprint
             if current != expected_fingerprint:
@@ -1301,11 +1439,16 @@ class Broker:
                 limit = int(argv[5])
             except (TypeError, ValueError):
                 raise Refused('SOURCE_REVISION_CHANGED') from None
-            current = search_fingerprint(row['source'], argv[1].strip(), limit)
+            current = search_fingerprint(
+                row['source'], entry['project'], argv[1].strip(), limit
+            )
             if current != expected_fingerprint:
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'embed':
-            if fingerprint != expected_fingerprint:
+            if (
+                self._base_fingerprint(fingerprint)
+                != self._base_fingerprint(expected_fingerprint)
+            ):
                 raise Refused('SOURCE_REVISION_CHANGED')
         else:
             raise Refused('RETRY_NOT_ALLOWED')

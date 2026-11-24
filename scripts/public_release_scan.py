@@ -50,12 +50,33 @@ FORBIDDEN_FILES = (
 )
 
 
+SKIP_PARTS = {
+    ".git",
+    "__pycache__",
+    ".ruff_cache",
+    ".pytest_cache",
+    "build",
+    "dist",
+    # Local, gitignored working directories (private notes, tool indexes)
+    # are never part of a public release.
+    "memory-bank",
+    ".ontoindex",
+    ".venv",
+}
+
+
 def scan() -> list[str]:
     issues: list[str] = []
     for path in sorted(ROOT.rglob("*")):
-        if any(part in {".git", "__pycache__", ".ruff_cache", ".pytest_cache", "build", "dist"} or part.endswith(".egg-info") for part in path.parts) or not path.is_file():
+        relative = path.relative_to(ROOT)
+        # Exclusions apply to repository-relative components only: a checkout
+        # under a directory named e.g. ".claude" must still be scanned fully.
+        if any(
+            part in SKIP_PARTS or part.endswith(".egg-info")
+            for part in relative.parts
+        ) or not path.is_file():
             continue
-        relative = path.relative_to(ROOT).as_posix()
+        relative = relative.as_posix()
         lower_name = path.name.lower()
         if path.is_symlink():
             issues.append(f"symlink: {relative}")

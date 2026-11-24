@@ -35,3 +35,29 @@ def test_release_scanner_accepts_placeholders_and_loopback(tmp_path: Path, monke
     )
 
     assert scanner.scan() == []
+
+
+def test_release_scanner_does_not_skip_a_checkout_under_a_skipped_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A checkout may live under e.g. ~/.claude/worktrees/repo; exclusions must
+    # apply to repository-relative components, not to absolute path parts.
+    root = tmp_path / ".claude" / "worktrees" / "repo"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(scanner, "ROOT", root)
+    (root / "config.txt").write_text(
+        "API_KEY=not-a-real-but-secret-shaped-value-123\n", encoding="utf-8"
+    )
+    issues = scanner.scan()
+    assert any("credential-like assignment" in issue for issue in issues)
+
+
+def test_release_scanner_still_skips_relative_skipped_directories(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(scanner, "ROOT", tmp_path)
+    (tmp_path / "memory-bank").mkdir()
+    (tmp_path / "memory-bank" / "notes.txt").write_text(
+        "API_KEY=not-a-real-but-secret-shaped-value-123\n", encoding="utf-8"
+    )
+    assert scanner.scan() == []

@@ -155,7 +155,8 @@ def test_search_uses_read_only_hybrid_reciprocal_rank_fusion_sql() -> None:
 def test_search_sql_uses_group_title_and_preserves_sender_identity() -> None:
     normalized = " ".join(SEARCH_SQL.lower().split())
     assert normalized.count(
-        "case when so.kind = 'telegram' then p.title else so.title end as chat_title"
+        "case when so.kind = 'telegram' then p.title "
+        "else coalesce(so.title, so.external_id) end as chat_title"
     ) == 2
     assert normalized.count(
         "coalesce(nullif(s.speaker, ''), nullif(s.meta->>'author_id', ''), "
@@ -182,3 +183,14 @@ def test_search_cli_accepts_an_exact_source_id_filter() -> None:
         "--source-id", "telegram:-10012345:topic:1",
     ])
     assert args.source_id == "telegram:-10012345:topic:1"
+
+
+def test_search_sql_excludes_stale_external_vectors_only() -> None:
+    normalized = " ".join(SEARCH_SQL.lower().split())
+    assert (
+        "and (b.item_kind is null or e.content_hash = b.segment_content_hash)"
+        in normalized
+    )
+    # Telegram/ASR rows have no item_kind, so their semantic ranking is
+    # unchanged; external rows must carry the hash of the embedded text.
+    assert normalized.count("s.content_hash as segment_content_hash") == 2
