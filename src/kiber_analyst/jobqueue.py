@@ -32,6 +32,7 @@ JOB_STATES = {
     "timed_out",
     "cancelled",
 }
+TERMINAL_STATES = frozenset({"done", "failed", "timed_out", "cancelled"})
 
 
 class JobsError(IngestError):
@@ -384,6 +385,7 @@ class JobStore:
         priority: int = 0,
         items: list[dict[str, Any]] | None = None,
         idempotency_key: str | None = None,
+        rerun_when_terminal: bool = False,
     ) -> tuple[JobRecord, bool]:
         if not 0 < deadline_hours <= 72:
             raise JobsError("Deadline must be greater than 0 and at most 72 hours")
@@ -391,53 +393,78 @@ class JobStore:
         key = idempotency_key or hashlib.sha256(
             canonical_json({"operation": operation, "fingerprint": fingerprint}).encode()
         ).hexdigest()
-        new_id = str(uuid.uuid4())
         with self.transaction() as db:
-            db.execute(
-                """INSERT INTO jobs
-                   (id,operation,command_json,fingerprint,idempotency_key,state,priority,
-                    created_at,updated_at,deadline_at)
-                   VALUES(?,?,?,?,?,'queued',?,?,?,?)
-                   ON CONFLICT(idempotency_key) DO NOTHING""",
-                (
-                    new_id,
-                    operation,
-                    canonical_json(command),
-                    fingerprint,
-                    key,
-                    priority,
-                    iso_utc(now),
-                    iso_utc(now),
-                    iso_utc(now + timedelta(hours=deadline_hours)),
-                ),
-            )
-            row = db.execute(
-                "SELECT * FROM jobs WHERE idempotency_key=?", (key,)
-            ).fetchone()
-            if row is None:
-                raise JobsError("Could not persist queued job")
-            if row["operation"] != operation or row["fingerprint"] != fingerprint:
-                raise JobsError("Idempotency key was already used for a different job")
-            created = row["id"] == new_id
-            if created:
-                self.event(db, new_id, "submitted", {"operation": operation})
-                job_dir = self.jobs_dir / new_id
-                job_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-                os.chmod(job_dir,0o700)
-                directory_fd=os.open(self.jobs_dir,os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-                for item in items or []:
-                    item_id = str(uuid.uuid4())
-                    db.execute(
-                        """INSERT INTO job_items
-                           (id,job_id,item_key,fingerprint,state,updated_at)
-                           VALUES(?,?,?,?,'queued',?)""",
-                        (item_id, new_id, item["key"], item["fingerprint"], iso_utc(now)),
-                    )
-                    self.event(db, new_id, "item_created", {"item_key": item["key"]})
+            def insert_job(job_key: str) -> tuple[sqlite3.Row, bool]:
+                job_id = str(uuid.uuid4())
+                db.execute(
+                    """INSERT INTO jobs
+                       (id,operation,command_json,fingerprint,idempotency_key,state,priority,
+                        created_at,updated_at,deadline_at)
+                       VALUES(?,?,?,?,?,'queued',?,?,?,?)
+                       ON CONFLICT(idempotency_key) DO NOTHING""",
+                    (
+                        job_id,
+                        operation,
+                        canonical_json(command),
+                        fingerprint,
+                        job_key,
+                        priority,
+                        iso_utc(now),
+                        iso_utc(now),
+                        iso_utc(now + timedelta(hours=deadline_hours)),
+                    ),
+                )
+                inserted_row = db.execute(
+                    "SELECT * FROM jobs WHERE idempotency_key=?", (job_key,)
+                ).fetchone()
+                if inserted_row is None:
+                    raise JobsError("Could not persist queued job")
+                if (
+                    inserted_row["operation"] != operation
+                    or inserted_row["fingerprint"] != fingerprint
+                ):
+                    raise JobsError("Idempotency key was already used for a different job")
+                was_created = inserted_row["id"] == job_id
+                if was_created:
+                    self.event(db, job_id, "submitted", {"operation": operation})
+                    job_dir = self.jobs_dir / job_id
+                    job_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+                    os.chmod(job_dir,0o700)
+                    directory_fd=os.open(self.jobs_dir,os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                    for item in items or []:
+                        item_id = str(uuid.uuid4())
+                        db.execute(
+                            """INSERT INTO job_items
+                               (id,job_id,item_key,fingerprint,state,updated_at)
+                               VALUES(?,?,?,?,'queued',?)""",
+                            (item_id, job_id, item["key"], item["fingerprint"], iso_utc(now)),
+                        )
+                        self.event(db, job_id, "item_created", {"item_key": item["key"]})
+                return inserted_row, was_created
+
+            row, created = insert_job(key)
+            if not created and rerun_when_terminal and row["state"] in TERMINAL_STATES:
+                # An explicit new run after a finished job: return an already
+                # active rerun if one exists (no duplicate), otherwise create a
+                # deterministic next generation. BEGIN IMMEDIATE serializes
+                # concurrent submissions, so two callers cannot both create it.
+                active = db.execute(
+                    """SELECT * FROM jobs WHERE operation=? AND fingerprint=?
+                         AND state NOT IN ('done','failed','timed_out','cancelled')
+                       ORDER BY created_at DESC, id DESC LIMIT 1""",
+                    (operation, fingerprint),
+                ).fetchone()
+                if active is not None:
+                    return self._record(active), False
+                generation = db.execute(
+                    "SELECT count(*) FROM jobs WHERE operation=? AND fingerprint=?",
+                    (operation, fingerprint),
+                ).fetchone()[0]
+                row, created = insert_job(f"{key}:{generation}")
             return self._record(row), created
 
     def _record(self, row: sqlite3.Row) -> JobRecord:

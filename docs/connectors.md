@@ -49,7 +49,9 @@ duplicated. The same rule applies to GitVerse.
 ## Incremental sync and checkpoints
 
 - `--since` accepts an ISO date or datetime; a date without an offset is a UTC
-  cutoff. Without it the first run covers the last 90 days.
+  cutoff. Without `--since`, the cutoff of the last completed import for the
+  same project and source is reused; only a source with no history falls back
+  to the last 90 days. An explicit `--since` always overrides the saved value.
 - Subsequent runs use the stored watermark minus a five-minute overlap window,
   so changes on the boundary are not lost. The watermark is not advanced when a
   run is `partial` or when `--limit` was applied, so unprocessed threads are
@@ -92,9 +94,10 @@ unavailable.
   vector stores the text hash it was computed from: edited text is re-embedded,
   while metadata-only changes keep the vector, so re-embedding is idempotent.
 - An explicit new `ingest`/`embed` after a finished run creates a new run and
-  queries the provider again; an identical request that is still active is
-  deduplicated. Re-importing a previously seen snapshot restores its text when
-  it is no longer the latest run (A → B → A).
+  queries the provider again; repeating the command while that run is queued
+  returns the active job instead of creating a second one. Re-importing a
+  previously seen snapshot restores its text when it is no longer the latest
+  run (A → B → A).
 
 ## Configuration and errors
 

@@ -84,6 +84,13 @@ def _make_worker(store: JobStore, monkeypatch: pytest.MonkeyPatch) -> JobWorker:
             "deleted": 0,
         },
     )
+    # Jobs without --since resolve the checkpoint through the database; the
+    # database itself is covered by the gated PostgreSQL suite.
+    import kiber_analyst.external_load as load_module
+
+    monkeypatch.setattr(
+        load_module, "latest_checkpoint_since", lambda *args, **kwargs: None
+    )
     return JobWorker(store=store, pools={})
 
 
@@ -177,3 +184,62 @@ def test_submit_reruns_external_ingest_only_after_the_previous_job_finished(
     assert rerun["job_id"] != first["job_id"]
     assert rerun["created"] is True
     assert store.status(rerun["job_id"])["state"] == "queued"
+
+    # Repeating the same command while the rerun is queued must return that
+    # active job instead of creating a second one.
+    repeated = worker.submit(argv, uid=0)
+    assert repeated["job_id"] == rerun["job_id"]
+    assert repeated["created"] is False
+    with store.connect() as db:
+        active = db.execute(
+            """SELECT id FROM jobs WHERE operation='external_ingest'
+               AND state NOT IN ('done','failed','timed_out','cancelled')"""
+        ).fetchall()
+    assert [row[0] for row in active] == [rerun["job_id"]]
+
+
+def test_ingest_without_since_uses_the_saved_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kiber_analyst.external_ingest as ingest_module
+    import kiber_analyst.external_load as load_module
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = _make_worker(store, monkeypatch)
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        load_module,
+        "latest_checkpoint_since",
+        lambda *args, **kwargs: "2026-09-01T00:00:00Z",
+    )
+    monkeypatch.setattr(
+        ingest_module,
+        "run_external_ingest",
+        lambda **kwargs: captured.append(kwargs) or {
+            "status": "done", "threads": 0, "items": 0, "load": {},
+        },
+    )
+
+    worker.submit(
+        {"argv": ["github", "ingest", "--repo", "owner/repo", "--project", "demo"]},
+        uid=0,
+    )
+    job = store.claim()
+    assert job is not None
+    worker.process(job)
+    assert captured[0]["since"] == "2026-09-01T00:00:00Z"
+
+    worker.submit(
+        {
+            "argv": [
+                "github", "ingest", "--repo", "owner/repo", "--project", "demo",
+                "--since", "2026-10-01",
+            ]
+        },
+        uid=0,
+    )
+    second = store.claim()
+    assert second is not None
+    worker.process(second)
+    assert captured[1]["since"] == "2026-10-01"

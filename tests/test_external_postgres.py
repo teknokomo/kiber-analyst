@@ -699,6 +699,12 @@ def test_partial_ingest_loads_good_threads_with_the_real_loader(tmp_path: Path) 
         ).fetchone()
         assert run[0] == "done"
         assert run[1] == "2026-11-01T00:00:00Z"
+    from kiber_analyst.external_load import latest_checkpoint_since
+
+    # A partial run must not move the checkpoint read by the next import.
+    assert latest_checkpoint_since(
+        project_slug, source_id, env_path=Path(TEST_ENV)
+    ) == "2026-11-01T00:00:00Z"
 
 
 def test_embedding_refreshes_only_when_the_text_changes(tmp_path: Path) -> None:
@@ -843,3 +849,158 @@ def test_reimporting_an_older_snapshot_restores_its_text(tmp_path: Path) -> None
         ).fetchone()
         assert row[0] == "Version A"
         assert row[1] == hashlib.sha256(b"Version A").hexdigest()
+
+
+def test_saved_checkpoint_is_read_for_the_next_import(tmp_path: Path) -> None:
+    from kiber_analyst.external_load import latest_checkpoint_since, load_external
+
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/cp-{token}"
+    project_slug = f"kiber-cp-{uuid.uuid4().hex[:10]}"
+    threads, items = _sample_bundle(source_id, "github")
+    job_dir = tmp_path / "cp"
+    _bundle(job_dir, source_id, "github", threads, items)
+    assert latest_checkpoint_since(project_slug, source_id, env_path=Path(TEST_ENV)) is None
+
+    load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_slug)
+    saved = latest_checkpoint_since(project_slug, source_id, env_path=Path(TEST_ENV))
+    # _bundle stores this checkpoint in the manifest and the loader persists it.
+    assert saved == "2026-11-22T23:55:00Z"
+
+    # Another source in the same project must not borrow this checkpoint.
+    other = f"github:owner/cp-other-{token}"
+    assert latest_checkpoint_since(project_slug, other, env_path=Path(TEST_ENV)) is None
+
+
+def test_stale_vectors_are_excluded_from_semantic_ranking(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.external_embed import embed_external
+    from kiber_analyst.external_load import load_external
+    from kiber_analyst.search_core import execute_search
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/stale-{token}"
+    project_slug = f"kiber-stale-{uuid.uuid4().hex[:10]}"
+    thread_ref = f"{source_id}:issue:1"
+
+    def bundle(job_dir: Path, edited_text: str) -> None:
+        threads = [{
+            "thread_ref": thread_ref, "provider": "github", "kind": "issue", "number": 1,
+            "title": "Stale", "state": "open", "author": "alice",
+            "created_at": "2026-11-01T10:00:00Z", "updated_at": "2026-11-02T10:00:00Z",
+            "url": "https://github.com/owner/repo/issues/1", "labels": [], "meta": {},
+        }]
+        items = [
+            {
+                "external_ref": f"{thread_ref}:comment:1", "thread_ref": thread_ref,
+                "item_kind": "comment", "parent_external_ref": None, "author": "bob",
+                "text": edited_text, "posted_at": "2026-11-02T11:00:00Z",
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-1",
+                "content_hash": hashlib.sha256(edited_text.encode()).hexdigest(),
+                "meta": {},
+            },
+            {
+                "external_ref": f"{thread_ref}:comment:2", "thread_ref": thread_ref,
+                "item_kind": "comment", "parent_external_ref": None, "author": "carol",
+                "text": "Unchanged comment", "posted_at": "2026-11-02T12:00:00Z",
+                "url": "https://github.com/owner/repo/issues/1#issuecomment-2",
+                "content_hash": hashlib.sha256(b"Unchanged comment").hexdigest(),
+                "meta": {},
+            },
+        ]
+        _bundle(job_dir, source_id, "github", threads, items)
+
+    def fake_embedding(texts: list[str]) -> tuple[list[list[float]], int | None]:
+        vectors = []
+        for text in texts:
+            digest = hashlib.sha256(text.encode()).digest() * 48
+            vectors.append([float(byte % 7) for byte in digest[:1536]])
+        return vectors, None
+
+    bundle(tmp_path / "old", "Version A")
+    load_external(tmp_path / "old", env_path=Path(TEST_ENV), project_slug=project_slug)
+    embed_external(
+        source_id, project=project_slug, env_path=Path(TEST_ENV),
+        embedding_call=fake_embedding,
+    )
+    # Edit the text and do NOT re-embed: the stored vector is now stale.
+    bundle(tmp_path / "new", "Version B")
+    load_external(tmp_path / "new", env_path=Path(TEST_ENV), project_slug=project_slug)
+
+    query_vector, _ = fake_embedding(["Version B"])
+    with _connect(credentials) as conn:
+        semantic_only = execute_search(
+            conn, "zzzznomatch", project=project_slug, vector=query_vector[0],
+            source_id=source_id, limit=10,
+        )
+        refs = {row["item_ref"] for row in semantic_only["results"]}
+        assert f"{thread_ref}:comment:1" not in refs, "stale vector must not rank"
+        assert f"{thread_ref}:comment:2" in refs
+
+        # Full-text search still finds the new text without any re-embed.
+        conn.execute(
+            "UPDATE segments SET tsv=to_tsvector('russian', text)"
+            " WHERE external_ref LIKE %s",
+            (f"{source_id}:%",),
+        )
+        fts = execute_search(
+            conn, "Version", project=project_slug, vector=None,
+            source_id=source_id, limit=10,
+        )
+        assert any(
+            row["item_ref"] == f"{thread_ref}:comment:1" for row in fts["results"]
+        )
+
+
+def test_telegram_semantic_ranking_is_unchanged(tmp_path: Path) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.search_core import execute_search
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    project_slug = f"kiber-tgsem-{uuid.uuid4().hex[:10]}"
+    with _connect(credentials) as conn:
+        project_id = conn.execute(
+            "INSERT INTO projects (slug,title) VALUES (%s,'TgSem') RETURNING id",
+            (project_slug,),
+        ).fetchone()[0]
+        source_id = conn.execute(
+            "INSERT INTO sources (project_id,kind,external_id,meta)"
+            " VALUES (%s,'telegram','-100555','{}') RETURNING id",
+            (project_id,),
+        ).fetchone()[0]
+        document_id = conn.execute(
+            "INSERT INTO documents (source_id,doc_type,meta)"
+            " VALUES (%s,'export','{\"topic_id\":\"7\",\"topic_title\":\"Topic\"}')"
+            " RETURNING id",
+            (source_id,),
+        ).fetchone()[0]
+        # A per-run message id keeps the test repeatable: Telegram external
+        # refs stay globally unique.
+        message_ref = f"tg:-100555:{uuid.uuid4().hex[:10]}"
+        segment_id = conn.execute(
+            """INSERT INTO segments (document_id,seq,text,external_ref,content_hash,
+                                     meta,posted_at)
+               VALUES (%s,1,'telegram semantic text',%s,%s,'{}',
+                       '2026-11-01T10:00:00Z') RETURNING id""",
+            (document_id, message_ref,
+             hashlib.sha256(b"telegram semantic text").hexdigest()),
+        ).fetchone()[0]
+        # Telegram embeddings carry no content_hash; semantic ranking must keep
+        # working exactly as before the external-item freshness check.
+        conn.execute(
+            """INSERT INTO embeddings
+                 (project_id,owner_table,owner_id,model,embedding,content_hash)
+               VALUES (%s,'segments',%s,'gemini-embedding-2:1536',%s::vector,NULL)""",
+            (project_id, str(segment_id), json.dumps([0.05] * 1536)),
+        )
+        result = execute_search(
+            conn, "zzzznomatch", project=project_slug, vector=[0.05] * 1536,
+            limit=10,
+        )
+    assert result["results"], "Telegram semantic ranking must still work"
+    row = result["results"][0]
+    assert row["source_kind"] == "telegram"
+    assert row["message_id"] == message_ref.split(":")[2]

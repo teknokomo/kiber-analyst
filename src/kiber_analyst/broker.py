@@ -952,17 +952,33 @@ class Broker:
             'SELECT 1 FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
             (owner, source_id, fingerprint, operation),
         ).fetchone()
-        request_fingerprint = fingerprint if existing is None else (
-            f"{fingerprint}:{uuid.uuid4().hex}"
-        )
+        if existing is None:
+            request_fingerprint = fingerprint
+        else:
+            # Deterministic next generation: concurrent callers race on the
+            # requests uniqueness constraint instead of both creating a run.
+            generation = self.db.execute(
+                'SELECT count(*) FROM requests WHERE owner=? AND source=? AND operation=?',
+                (owner, source_id, operation),
+            ).fetchone()[0]
+            request_fingerprint = f"{fingerprint}:{generation}"
         now = timestamp()
         request_id = str(uuid.uuid4())
-        with self.db:
-            self.db.execute(
-                'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) VALUES(?,?,?,?,?,?,?,?)',
-                (request_id, owner, source_id, request_fingerprint, operation,
-                 json.dumps(argv), now, now),
-            )
+        try:
+            with self.db:
+                self.db.execute(
+                    'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) VALUES(?,?,?,?,?,?,?,?)',
+                    (request_id, owner, source_id, request_fingerprint, operation,
+                     json.dumps(argv), now, now),
+                )
+        except sqlite3.IntegrityError:
+            row = self.db.execute(
+                'SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
+                (owner, source_id, request_fingerprint, operation),
+            ).fetchone()
+            if row is None:
+                raise Refused('SOURCE_BUSY') from None
+            return self.dispatch(row)
         return self.dispatch(self.row(owner, request_id))
 
     def external_source_status(self, owner, source_id, entry, command):

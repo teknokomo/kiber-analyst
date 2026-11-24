@@ -23,6 +23,7 @@ search_units AS (
     NULL::bigint AS asr_segment_id,
     s.document_id,
     s.text,
+    s.content_hash AS segment_content_hash,
     s.tsv,
     s.posted_at,
     COALESCE(NULLIF(s.speaker, ''), NULLIF(s.meta->>'author_id', ''),
@@ -64,6 +65,7 @@ search_units AS (
     a.id AS asr_segment_id,
     s.document_id,
     a.text,
+    s.content_hash AS segment_content_hash,
     a.tsv,
     s.posted_at,
     COALESCE(NULLIF(s.speaker, ''), NULLIF(s.meta->>'author_id', ''),
@@ -143,6 +145,10 @@ semantic_rank AS (
          WHEN b.source = 'asr' THEN b.asr_segment_id::text
          ELSE b.segment_id::text
        END
+   -- External items are ranked only by a vector built from their current
+   -- text; a stale vector must not compete until the segment is re-embedded.
+   -- Telegram and ASR rows (item_kind IS NULL) keep their previous behavior.
+   AND (b.item_kind IS NULL OR e.content_hash = b.segment_content_hash)
   CROSS JOIN query_args q
   WHERE q.query_vector IS NOT NULL
 ),

@@ -49,6 +49,10 @@ Review hardening included in this release:
 - Re-importing a previously seen snapshot restores its text (A → B → A), and
   malformed or non-advancing pagination fails the chain instead of reporting a
   truncated result as complete.
+- Repeated external commands return the active rerun instead of creating a
+  second job; imports without `--since` continue from the saved checkpoint of
+  the last completed import; stale vectors are excluded from semantic ranking
+  until the edited text is re-embedded, with full-text search unaffected.
 
 Still out of scope: write operations, webhooks, diff/file analysis, attachments,
 OCR, ASR changes, cross-provider deduplication, and UI.

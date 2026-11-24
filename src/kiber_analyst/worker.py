@@ -58,7 +58,6 @@ ROUTING_PATH = Path(
 SOCKET_PATH = Path(os.environ.get("KIBER_ANALYST_SOCKET", str(DEFAULT_SOCKET)))
 DATA_ROOT = Path(os.environ.get("KIBER_ANALYST_DATA_ROOT", str(DEFAULT_DATA_ROOT)))
 DATA_UUID = os.environ.get("KIBER_ANALYST_DATA_UUID", DEFAULT_UUID)
-TERMINAL_JOB_STATES = {"done", "failed", "timed_out", "cancelled"}
 RERUNNABLE_OPERATIONS = {"external_ingest", "external_embed"}
 
 DEFAULT_POOLS = {
@@ -232,33 +231,19 @@ class JobWorker:
             "profile":profile,
         }
         fingerprint=_digest(canonical_json({"operation":operation,"command":command,"items":items}).encode())
-        default_key = idempotency_key or _digest(
-            canonical_json({"operation": operation, "fingerprint": fingerprint}).encode()
-        )
         job,created=self.store.create_job(
             operation=operation,
             command=command,
             fingerprint=fingerprint,
             priority=100 if operation=="search" else 0,
             items=items,
-            idempotency_key=default_key,
-        )
-        if (
-            not created
-            and idempotency_key is None
-            and operation in RERUNNABLE_OPERATIONS
-            and job.state in TERMINAL_JOB_STATES
-        ):
+            idempotency_key=idempotency_key,
             # An explicit new run of a finished external operation must query
-            # the provider again; only an active identical job is deduplicated.
-            job,created=self.store.create_job(
-                operation=operation,
-                command=command,
-                fingerprint=fingerprint,
-                priority=100 if operation=="search" else 0,
-                items=items,
-                idempotency_key=f"{default_key}:rerun:{uuid.uuid4().hex}",
-            )
+            # the provider again; an active identical job stays deduplicated.
+            rerun_when_terminal=(
+                idempotency_key is None and operation in RERUNNABLE_OPERATIONS
+            ),
+        )
         return {"job_id":job.id,"state":job.state,"created":created,"deadline_at":job.deadline_at,"operation":job.operation}
 
     def handle(self,uid:int,request:dict[str,Any]) -> dict[str,Any]:
@@ -896,13 +881,22 @@ class JobWorker:
             "limit":params.get("limit"),
         })
         artifact_dir=self.store.jobs_dir/job.id/"external-ingest"
+        since=params.get("since")
+        if since is None:
+            # Continue from the last completed import of this source instead of
+            # restarting with the 90-day default window.
+            from kiber_analyst.external_load import latest_checkpoint_since
+
+            since=latest_checkpoint_since(
+                params["project"],params["source_id"],env_path=ENV_PATH,
+            )
         last_code="UNKNOWN"
         for attempt in range(1,MAX_TELEGRAM_INGEST_ATTEMPTS+1):
             self._check_cancel_deadline(job)
             try:
                 result=run_external_ingest(
                     provider=params["provider"],source_id=params["source_id"],
-                    project_slug=params["project"],since=params.get("since"),
+                    project_slug=params["project"],since=since,
                     limit=params.get("limit"),dry_run=params.get("dry_run",False),
                     artifact_dir=artifact_dir,env_path=ENV_PATH,
                     check_stop=lambda: self._check_cancel_deadline(job),

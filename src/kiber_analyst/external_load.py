@@ -459,6 +459,37 @@ def _write_failed_run(
         conn.close()
 
 
+def latest_checkpoint_since(
+    project_slug: str,
+    source_id: str,
+    *,
+    env_path: Path = ENV_PATH,
+) -> str | None:
+    """Return the incremental cutoff of the last completed import for a source."""
+    parsed = parse_source_id(source_id)
+    if parsed is None or _SLUG.fullmatch(project_slug or "") is None:
+        raise LoadError("External source scope is invalid")
+    config = _required_env(env_path)
+    conn = _connect(config)
+    try:
+        with conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT r.checkpoint->>'since' FROM runs r
+                   JOIN projects p ON p.id = r.project_id
+                   WHERE p.slug = %s AND r.kind = 'external_ingest'
+                     AND r.status = 'done'
+                     AND r.checkpoint->>'source_id' = %s
+                   ORDER BY r.started_at DESC, r.id DESC LIMIT 1""",
+                (project_slug, source_id),
+            )
+            row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    return str(row[0])
+
+
 def load_external(
     job_dir: Path,
     *,
@@ -610,6 +641,7 @@ def load_external(
                             )
                     checkpoint_data = {
                         "job_dir": str(job_dir.resolve()),
+                        "source_id": identity["source_id"],
                         "snapshot_sha256": identity["sha256"],
                         "import_key": identity["import_key"],
                         "since": manifest.get("checkpoint_after", {}).get("since"),

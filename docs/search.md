@@ -41,5 +41,11 @@ is always equal to `source_kind`, so Telegram rows report
 The `topic` filter keeps Telegram topic semantics; external threads are
 filtered through `--source-id`/`--source-kind` and the query text.
 
+External items are ranked semantically only by a vector built from their
+current text: after an edit and before the next `external embed`, the stale
+vector is excluded from semantic ranking, while full-text search still finds
+the new text. Telegram and ASR ranking are unchanged (their rows have no
+`item_kind` and keep the previous behavior).
+
 Broker `search <source_id> <query> [limit]` accepts limits from 1 to 100 for
 both Telegram and external sources.
