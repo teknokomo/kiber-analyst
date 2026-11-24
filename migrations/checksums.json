@@ -35,6 +35,11 @@
       "version": "0007_segments_tsv_generated",
       "file": "0007_segments_tsv_generated.sql",
       "sha256": "b87f14ce84f8a3dfa76f910de5a33c712917afccfc01258abff3c6541f58ec9c"
+    },
+    {
+      "version": "0008_external_check_constraints",
+      "file": "0008_external_check_constraints.sql",
+      "sha256": "b25faf448ebd2554ca84ba84ee08cda01913d26ac6e246be67ed23c9ff15653e"
     }
   ]
 }

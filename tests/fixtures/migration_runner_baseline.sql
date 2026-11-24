@@ -22,7 +22,7 @@ CREATE TABLE projects (
 CREATE TABLE sources (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  kind text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('video', 'telegram', 'document', 'web')),
   external_id text NOT NULL,
   url text,
   title text,
@@ -36,7 +36,7 @@ CREATE TABLE sources (
 CREATE TABLE documents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   source_id uuid NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-  doc_type text NOT NULL,
+  doc_type text NOT NULL CHECK (doc_type IN ('transcript', 'ocr', 'report', 'export')),
   language text,
   raw_path text,
   text_sha256 text,
@@ -67,7 +67,7 @@ CREATE TABLE runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   kind text NOT NULL,
-  status text NOT NULL,
+  status text NOT NULL CHECK (status IN ('queued', 'running', 'done', 'failed', 'partial')),
   checkpoint jsonb NOT NULL DEFAULT '{}'::jsonb,
   started_at timestamptz NOT NULL DEFAULT now(),
   finished_at timestamptz,
@@ -79,3 +79,5 @@ GRANT SELECT, INSERT ON schema_migrations TO knowledge_owner;
 GRANT REFERENCES ON projects TO knowledge_owner;
 GRANT SELECT ON projects, sources, documents, segments, embeddings, runs TO knowledge_owner;
 GRANT USAGE ON SCHEMA public TO knowledge_app;
+GRANT SELECT, INSERT, UPDATE ON projects, sources, runs TO knowledge_app;
+GRANT USAGE, SELECT ON SEQUENCE segments_id_seq TO knowledge_app;

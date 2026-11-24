@@ -46,6 +46,28 @@ def test_external_discussions_migration_grants_are_read_write_scoped() -> None:
     assert "GRANT SELECT ON documents, segments TO knowledge_reader;" in sql
 
 
+def test_external_check_migration_adds_only_supported_provider_and_thread_values() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "0008_external_check_constraints.sql"
+    )
+    sql = migration.read_text(encoding="utf-8").lower()
+    assert "drop constraint if exists sources_kind_check" in sql
+    assert "drop constraint if exists documents_doc_type_check" in sql
+    for provider in ("github", "gitlab", "gitverse"):
+        assert f"'{provider}'::text" in sql
+    assert "'thread'::text" in sql
+    assert "'external'::text" not in sql
+    assert "external_ingest" not in sql
+    assert "runs_status_check" not in sql
+    assert (
+        "insert into schema_migrations(version) values ('0008_external_check_constraints')"
+        in sql
+    )
+    assert "on conflict do nothing;" in sql
+
+
 def test_base_schema_fixture_includes_external_columns() -> None:
     fixture = Path(__file__).parents[1] / "tests" / "fixtures" / "knowledge_base_test_schema.sql"
     sql = fixture.read_text(encoding="utf-8")

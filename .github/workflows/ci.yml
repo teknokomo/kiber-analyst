@@ -18,7 +18,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
-          - 5432:5432
+          - 5433:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
@@ -31,11 +31,11 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install migration runner test dependencies
-        run: python -m pip install -e '.[test,db]'
-      - name: Exercise migrations against disposable PostgreSQL
+        run: python -m pip install -e '.[test,db,connectors]'
+      - name: Exercise migrations and external GitLab load against disposable PostgreSQL
         env:
-          KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
-        run: pytest -v tests/test_migration_runner_postgres.py
+          KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN: postgresql://postgres:postgres@127.0.0.1:5433/postgres
+        run: pytest -v tests/test_migration_runner_postgres.py tests/test_external_check_constraints_postgres.py
 
   test:
     runs-on: ubuntu-latest

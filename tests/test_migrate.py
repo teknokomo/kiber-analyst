@@ -28,6 +28,7 @@ def test_catalog_checksums_and_self_registration() -> None:
         "0005_telegram_services",
         "0006_external_discussions",
         "0007_segments_tsv_generated",
+        "0008_external_check_constraints",
     )
     assert all(migration.sql for migration in catalog.migrations)
 
