@@ -41,6 +41,9 @@ is always equal to `source_kind`, so Telegram rows report
 The `topic` filter keeps Telegram topic semantics; external threads are
 filtered through `--source-id`/`--source-kind` and the query text.
 
+`segments.tsv` is a stored generated column (`to_tsvector('russian', text)`),
+so full-text search covers every loader without manual filling.
+
 External items are ranked semantically only by a vector built from their
 current text: after an edit and before the next `external embed`, the stale
 vector is excluded from semantic ranking, while full-text search still finds

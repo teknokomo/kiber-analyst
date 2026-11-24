@@ -54,7 +54,9 @@ CREATE TABLE segments (
   end_ms integer,
   speaker text,
   text text NOT NULL,
-  tsv tsvector,
+  tsv tsvector GENERATED ALWAYS AS (
+    to_tsvector('russian'::regconfig, coalesce(text, ''))
+  ) STORED,
   external_ref text,
   content_hash text,
   meta jsonb NOT NULL DEFAULT '{}'::jsonb,

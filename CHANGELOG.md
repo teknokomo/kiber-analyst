@@ -53,6 +53,9 @@ Review hardening included in this release:
   second job; imports without `--since` continue from the saved checkpoint of
   the last completed import; stale vectors are excluded from semantic ranking
   until the edited text is re-embedded, with full-text search unaffected.
+- `segments.tsv` becomes a stored generated column (`0007`), so full-text
+  search works for every loader without manual filling; the migration checks
+  for existing triggers or generated definitions before rewriting the table.
 
 Still out of scope: write operations, webhooks, diff/file analysis, attachments,
 OCR, ASR changes, cross-provider deduplication, and UI.

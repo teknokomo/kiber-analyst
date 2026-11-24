@@ -307,10 +307,14 @@ def test_same_repository_in_two_projects_stays_isolated(tmp_path: Path) -> None:
         assert cross == 0
 
         # Search isolation: both projects must answer their own rows only.
-        conn.execute(
-            "UPDATE segments SET tsv=to_tsvector('russian', text) WHERE external_ref LIKE %s",
+        # tsv is a stored generated column, so plain load_external already
+        # fills it: no manual updates here.
+        null_tsv = conn.execute(
+            """SELECT count(*) FROM segments s
+               WHERE s.external_ref LIKE %s AND s.tsv IS NULL""",
             (f"{source_id}:%",),
-        )
+        ).fetchone()[0]
+        assert null_tsv == 0
         for slug in (project_a, project_b):
             result = execute_search(
                 conn, "connector", project=slug, vector=None,
@@ -793,6 +797,7 @@ def test_reimporting_an_older_snapshot_restores_its_text(tmp_path: Path) -> None
 
     from kiber_analyst.external_embed import embed_external
     from kiber_analyst.external_load import load_external
+    from kiber_analyst.search_core import execute_search
 
     credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
     token = uuid.uuid4().hex[:10]
@@ -849,6 +854,16 @@ def test_reimporting_an_older_snapshot_restores_its_text(tmp_path: Path) -> None
         ).fetchone()
         assert row[0] == "Version A"
         assert row[1] == hashlib.sha256(b"Version A").hexdigest()
+        # The refreshed vector must now rank the restored text semantically.
+        vector_a, _ = fake_embedding(["Version A"])
+        semantic = execute_search(
+            conn, "zzzznomatch", project=project_slug, vector=vector_a[0],
+            source_id=source_id, limit=10,
+        )
+        assert any(
+            item["item_ref"] == f"{thread_ref}:comment:1"
+            for item in semantic["results"]
+        )
 
 
 def test_saved_checkpoint_is_read_for_the_next_import(tmp_path: Path) -> None:
@@ -929,6 +944,19 @@ def test_stale_vectors_are_excluded_from_semantic_ranking(tmp_path: Path) -> Non
     bundle(tmp_path / "new", "Version B")
     load_external(tmp_path / "new", env_path=Path(TEST_ENV), project_slug=project_slug)
 
+    with _connect(credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+        ).fetchone()[0]
+        null_tsv = conn.execute(
+            """SELECT count(*) FROM segments s
+               JOIN documents d ON d.id=s.document_id
+               JOIN sources so ON so.id=d.source_id
+               WHERE so.project_id=%s AND s.tsv IS NULL""",
+            (project_id,),
+        ).fetchone()[0]
+        assert null_tsv == 0
+
     query_vector, _ = fake_embedding(["Version B"])
     with _connect(credentials) as conn:
         semantic_only = execute_search(
@@ -939,12 +967,8 @@ def test_stale_vectors_are_excluded_from_semantic_ranking(tmp_path: Path) -> Non
         assert f"{thread_ref}:comment:1" not in refs, "stale vector must not rank"
         assert f"{thread_ref}:comment:2" in refs
 
-        # Full-text search still finds the new text without any re-embed.
-        conn.execute(
-            "UPDATE segments SET tsv=to_tsvector('russian', text)"
-            " WHERE external_ref LIKE %s",
-            (f"{source_id}:%",),
-        )
+        # Full-text search still finds the new text without any re-embed:
+        # tsv is generated from the stored text by the database itself.
         fts = execute_search(
             conn, "Version", project=project_slug, vector=None,
             source_id=source_id, limit=10,
