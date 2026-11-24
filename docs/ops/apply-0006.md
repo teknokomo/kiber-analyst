@@ -1,6 +1,6 @@
 # Применение 0006 External discussions
 
-`0006_external_discussions.sql` — обычная forward-миграция для базы Kiber-analyst `knowledge`. Она добавляет метаданные внешних обсуждений и `embeddings.content_hash`; Telegram- и ASR-строки не преобразует. Запускай её из checkout, содержащего проверенный файл миграции, от владельца базы `knowledge_owner`. Не выполняй SQL на контейнере платформы Multica.
+`0006_external_discussions.sql` — обычная forward-миграция для базы Kiber-analyst `knowledge`. Она добавляет метаданные внешних обсуждений и `embeddings.content_hash`; Telegram- и ASR-строки не преобразует. Запускай её только после проверки целевой базы, из checkout с проверенным файлом миграции, от владельца базы `knowledge_owner`.
 
 Миграция сама записывает `0006_external_discussions` в `schema_migrations`. Не добавляй эту запись вручную. `0007_segments_tsv_generated.sql` отдельно и этим runbook не изменяется.
 
