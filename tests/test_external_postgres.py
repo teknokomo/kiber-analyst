@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -534,6 +535,92 @@ def test_embed_limit_applies_after_the_resume_cursor(tmp_path: Path) -> None:
         ).fetchone()[0] == 2
 
 
+def test_external_embedding_lock_covers_provider_call_and_prevents_duplicate_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dotenv import dotenv_values
+
+    import kiber_analyst.external_embed as embed_module
+    from kiber_analyst.external_embed import embed_external
+    from kiber_analyst.external_load import load_external
+
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/lock-{token}"
+    project_slug = f"kiber-lock-{uuid.uuid4().hex[:10]}"
+    threads, items = _sample_bundle(source_id, "github")
+    job_dir = tmp_path / "locked-embed"
+    _bundle(job_dir, source_id, "github", threads, items)
+    load_external(job_dir, env_path=Path(TEST_ENV), project_slug=project_slug)
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_passed_lock = threading.Event()
+    second_provider_calls = []
+    errors: list[BaseException] = []
+
+    original_get_or_create_run = embed_module._get_or_create_run
+
+    def observe_lock(cursor, project_id, source_id):
+        if threading.current_thread().name == "second-embedding":
+            second_passed_lock.set()
+        return original_get_or_create_run(cursor, project_id, source_id)
+
+    monkeypatch.setattr(embed_module, "_get_or_create_run", observe_lock)
+
+    def vectors(texts: list[str]) -> tuple[list[list[float]], int | None]:
+        return [[0.04] * 1536 for _ in texts], None
+
+    def first_embedding(texts: list[str]):
+        first_entered.set()
+        if not release_first.wait(10):
+            raise TimeoutError("test did not release first embedding")
+        return vectors(texts)
+
+    def second_embedding(texts: list[str]):
+        second_provider_calls.append(len(texts))
+        return vectors(texts)
+
+    def run_embedding(callback) -> None:
+        if threading.current_thread().name == "second-embedding":
+            second_started.set()
+        try:
+            embed_external(
+                source_id, project=project_slug, env_path=Path(TEST_ENV),
+                embedding_call=callback,
+            )
+        except BaseException as exc:  # captured for assertion in the test thread
+            errors.append(exc)
+
+    first = threading.Thread(target=run_embedding, args=(first_embedding,))
+    second = threading.Thread(
+        target=run_embedding, args=(second_embedding,), name="second-embedding"
+    )
+    first.start()
+    try:
+        assert first_entered.wait(10)
+        second.start()
+        assert second_started.wait(10)
+        assert not second_passed_lock.wait(0.3)
+    finally:
+        release_first.set()
+    first.join(10)
+    second.join(10)
+    assert not first.is_alive() and not second.is_alive()
+    assert second_passed_lock.is_set()
+    assert second_provider_calls == []
+    assert errors == []
+
+    with _connect(credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+        ).fetchone()[0]
+        assert conn.execute(
+            "SELECT count(*) FROM embeddings WHERE project_id=%s", (project_id,)
+        ).fetchone()[0] == len(items)
+
+
 def test_embed_skips_tab_only_text_and_changed_segments(tmp_path: Path) -> None:
     from dotenv import dotenv_values
 
@@ -864,6 +951,93 @@ def test_reimporting_an_older_snapshot_restores_its_text(tmp_path: Path) -> None
             item["item_ref"] == f"{thread_ref}:comment:1"
             for item in semantic["results"]
         )
+
+
+def test_external_import_order_uses_timestamp_assigned_after_source_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dotenv import dotenv_values
+
+    import kiber_analyst.external_load as load_module
+    from kiber_analyst.external_load import load_external
+
+    _credentials = {
+        key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value
+    }
+    token = uuid.uuid4().hex[:10]
+    source_id = f"github:owner/order-{token}"
+    project_slug = f"kiber-order-{uuid.uuid4().hex[:10]}"
+
+    def make_bundle(path: Path, text: str) -> int:
+        threads, items = _sample_bundle(source_id, "github")
+        items[0]["text"] = text
+        items[0]["content_hash"] = hashlib.sha256(text.encode()).hexdigest()
+        _bundle(path, source_id, "github", threads, items)
+        return len(items)
+
+    bundle_a = tmp_path / "order-a"
+    bundle_b = tmp_path / "order-b"
+    item_count = make_bundle(bundle_a, "Snapshot A")
+    make_bundle(bundle_b, "Snapshot B")
+    load_external(bundle_a, env_path=Path(TEST_ENV), project_slug=project_slug)
+
+    original_project_id = load_module._project_id
+    transaction_started = threading.Event()
+    allow_source_lock = threading.Event()
+    thread_errors: list[BaseException] = []
+
+    def controlled_project_id(cursor, slug):
+        project_id = original_project_id(cursor, slug)
+        if threading.current_thread().name == "older-transaction":
+            transaction_started.set()
+            if not allow_source_lock.wait(10):
+                raise TimeoutError("test did not release older transaction")
+        return project_id
+
+    monkeypatch.setattr(load_module, "_project_id", controlled_project_id)
+
+    def load_older_snapshot() -> None:
+        try:
+            load_external(bundle_a, env_path=Path(TEST_ENV), project_slug=project_slug)
+        except BaseException as exc:  # captured for assertion in the test thread
+            thread_errors.append(exc)
+
+    first = threading.Thread(target=load_older_snapshot, name="older-transaction")
+    first.start()
+    try:
+        assert transaction_started.wait(10)
+        load_external(bundle_b, env_path=Path(TEST_ENV), project_slug=project_slug)
+    finally:
+        allow_source_lock.set()
+    first.join(10)
+    assert not first.is_alive()
+    assert thread_errors == []
+
+    runs_before_repeat = None
+    repeated = load_external(bundle_a, env_path=Path(TEST_ENV), project_slug=project_slug)
+    with _connect(_credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,)
+        ).fetchone()[0]
+        runs_before_repeat = conn.execute(
+            "SELECT count(*) FROM runs WHERE project_id=%s AND kind='external_ingest'",
+            (project_id,),
+        ).fetchone()[0]
+        latest_key = conn.execute(
+            """SELECT checkpoint->>'import_key' FROM runs
+               WHERE project_id=%s AND kind='external_ingest' AND status='done'
+               ORDER BY started_at DESC, id DESC LIMIT 1""",
+            (project_id,),
+        ).fetchone()[0]
+        assert conn.execute(
+            """SELECT text FROM segments WHERE external_ref LIKE %s ORDER BY id LIMIT 1""",
+            (f"{source_id}:%",),
+        ).fetchone()[0] == "Snapshot A"
+        assert latest_key == json.loads(
+            (bundle_a / "normalized" / "manifest.json").read_text()
+        )["external_import_key"]
+    assert repeated["skipped"] == item_count
+    assert runs_before_repeat == 3
 
 
 def test_saved_checkpoint_is_read_for_the_next_import(tmp_path: Path) -> None:

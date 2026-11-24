@@ -158,6 +158,8 @@ def embed_external(
         "runs_id": None,
     }
     conn = None
+    lock_key = f"external-embed:{source_id}:{MODEL_KEY}"
+    lock_acquired = False
     try:
         conn = _connect(db_config)
         with conn.transaction(), conn.cursor() as cursor:
@@ -167,11 +169,13 @@ def embed_external(
                 raise EmbedError(f"Project {project!r} does not exist")
             project_id = str(project_row[0])
             # Serialize invocations that share a resumable run so a second
-            # worker cannot move the cursor backwards.
+            # worker cannot move the cursor backwards. This is a session lock:
+            # it remains held while provider calls run outside DB transactions.
             cursor.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (f"external-embed:{source_id}:{MODEL_KEY}",),
+                "SELECT pg_advisory_lock(hashtext(%s))",
+                (lock_key,),
             )
+            lock_acquired = True
             run_id, resume, _ = _get_or_create_run(cursor, project_id, source_id)
             last_value = resume.get("last_segment_id")
             last_segment_id = int(last_value) if last_value is not None else None
@@ -198,7 +202,7 @@ def embed_external(
                      AND s.thread_ref IS NOT NULL
                      AND s.text ~ '[^[:space:]]'
                      AND (%s::bigint IS NULL OR s.id > %s::bigint)
-                   ORDER BY has_embedding, s.id
+                   ORDER BY s.id
                    LIMIT %s""",
                 (
                     MODEL_KEY,
@@ -357,11 +361,11 @@ def embed_external(
         _write_report(report_path, report)
         raise EmbedError(f"External embedding failed ({exc.code})") from exc
     except Exception as exc:
-        from kiber_analyst.routing import WaitForQuota
+        from kiber_analyst.routing import PermanentProviderError, WaitForQuota
         from kiber_analyst.worker import JobCancelled
 
-        if isinstance(exc, (WaitForQuota, JobCancelled)):
-            # The worker must postpone/cancel the job, not see a failed embed.
+        if isinstance(exc, (WaitForQuota, JobCancelled, PermanentProviderError)):
+            # The worker owns quota, cancellation, and deadline state changes.
             raise
         counters["errors"] += 1
         safe_message = (
@@ -406,6 +410,15 @@ def embed_external(
         raise EmbedError(_safe_db_message(exc)) from exc
     finally:
         if conn is not None:
+            if lock_acquired:
+                try:
+                    with conn.transaction(), conn.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT pg_advisory_unlock(hashtext(%s))",
+                            (lock_key,),
+                        )
+                except Exception:  # noqa: BLE001 - close releases a session lock even on unlock failure.
+                    pass
             conn.close()
         if client is not None:
             client.close()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
+from urllib.parse import urlsplit
 
 from kiber_analyst.connectors.base import (
     ConnectorHttpClient,
@@ -90,8 +91,13 @@ class GitHubConnector:
                     ConnectorCodes.SOURCE_NOT_ALLOWED,
                     "GitHub host is not configured for this provider",
                 )
-            api_base = f"https://{host}/api/v3"
-            graphql_base = f"https://{host}/api/graphql"
+            configured_host = (urlsplit(self._config.api_url).hostname or "").lower()
+            if host.lower() == configured_host:
+                api_base = self._config.api_url
+                graphql_base = _graphql_url(self._config.api_url)
+            else:
+                api_base = f"https://{host}/api/v3"
+                graphql_base = f"https://{host}/api/graphql"
         else:
             api_base = self._config.api_url
             graphql_base = _graphql_url(self._config.api_url)
@@ -169,6 +175,9 @@ class GitHubConnector:
         assert parsed is not None
         owner, name = parsed.path.split("/", 1)
         cursor = (checkpoint or {}).get("discussions_cursor")
+        seen_cursors: set[str] = set()
+        if isinstance(cursor, str) and cursor:
+            seen_cursors.add(cursor)
         while True:
             try:
                 payload = self._graphql(
@@ -219,11 +228,10 @@ class GitHubConnector:
                     title=node.get("title") if isinstance(node.get("title"), str) else None,
                 )
             page_info = discussions.get("pageInfo") or {}
-            if not page_info.get("hasNextPage"):
+            next_cursor = _next_graphql_cursor(page_info, seen_cursors)
+            if next_cursor is None:
                 return
-            cursor = page_info.get("endCursor")
-            if not cursor:
-                return
+            cursor = next_cursor
 
     def _graphql(
         self, url: str, query: str, variables: dict[str, Any]
@@ -422,6 +430,7 @@ class GitHubConnector:
     ) -> list[dict[str, Any]]:
         comments: list[dict[str, Any]] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         while True:
             payload = self._graphql(
                 graphql_base,
@@ -434,11 +443,10 @@ class GitHubConnector:
                 node for node in (connection.get("nodes") or []) if isinstance(node, dict)
             )
             page_info = connection.get("pageInfo") or {}
-            if not page_info.get("hasNextPage"):
+            next_cursor = _next_graphql_cursor(page_info, seen_cursors)
+            if next_cursor is None:
                 return comments
-            cursor = page_info.get("endCursor")
-            if not cursor:
-                return comments
+            cursor = next_cursor
 
     def _fetch_discussion_replies(
         self, graphql_base: str, comment: dict[str, Any]
@@ -449,11 +457,18 @@ class GitHubConnector:
         ]
         page_info = connection.get("pageInfo") or {}
         comment_id = comment.get("id")
-        while page_info.get("hasNextPage") and isinstance(comment_id, str):
+        seen_cursors: set[str] = set()
+        cursor = _next_graphql_cursor(page_info, seen_cursors)
+        if cursor is not None and not isinstance(comment_id, str):
+            raise ConnectorError(
+                ConnectorCodes.MALFORMED_RESPONSE,
+                "GitHub discussion reply page is missing its comment ID",
+            )
+        while cursor is not None:
             payload = self._graphql(
                 graphql_base,
                 _DISCUSSION_REPLIES_QUERY,
-                {"id": comment_id, "cursor": page_info.get("endCursor")},
+                {"id": comment_id, "cursor": cursor},
             )
             if payload is None:
                 raise ConnectorError(
@@ -466,6 +481,7 @@ class GitHubConnector:
                 item for item in (connection.get("nodes") or []) if isinstance(item, dict)
             )
             page_info = connection.get("pageInfo") or {}
+            cursor = _next_graphql_cursor(page_info, seen_cursors)
         return replies
 
     def _discussion_reply_items(self, discussion: dict[str, Any]) -> list[RawItem]:
@@ -691,6 +707,19 @@ def _graphql_url(api_url: str) -> str:
     if api_url.rstrip("/").endswith("/api/v3"):
         return api_url.rstrip("/")[: -len("/api/v3")] + "/api/graphql"
     return "https://api.github.com/graphql"
+
+
+def _next_graphql_cursor(page_info: Any, seen: set[str]) -> str | None:
+    if not isinstance(page_info, dict) or page_info.get("hasNextPage") is not True:
+        return None
+    cursor = page_info.get("endCursor")
+    if not isinstance(cursor, str) or not cursor or cursor in seen:
+        raise ConnectorError(
+            ConnectorCodes.MALFORMED_RESPONSE,
+            "GitHub pagination is missing an advancing cursor",
+        )
+    seen.add(cursor)
+    return cursor
 
 
 def _discussions_blocked(errors: list[Any]) -> bool:

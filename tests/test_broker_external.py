@@ -61,7 +61,12 @@ def setup(tmp_path):
     def api(action, *, job_id):
         return jobs[job_id]
 
-    instance = broker.Broker(tmp_path, dict(EXTERNAL_SOURCES), api, submit)
+    instance = broker.Broker(
+        tmp_path,
+        {source: dict(entry) for source, entry in EXTERNAL_SOURCES.items()},
+        api,
+        submit,
+    )
     yield instance, jobs, argv_log
     instance.db.close()
 
@@ -233,3 +238,93 @@ def test_embed_after_completed_ingest_creates_a_new_run(setup) -> None:
     assert argv_log[-1] == [
         "external", "embed", "--source", GITHUB_SOURCE, "--project", "demo-github",
     ]
+
+
+@pytest.mark.parametrize("operation", ["ingest", "embed"])
+def test_retry_accepts_unchanged_source_for_nonce_suffixed_external_request(
+    setup, operation: str
+) -> None:
+    app, jobs, _argv_log = setup
+    if operation == "embed":
+        ingest = app.handle("client", "ingest", GITHUB_SOURCE)
+        jobs[ingest["job_id"]]["state"] = "done"
+    first = app.handle("client", operation, GITHUB_SOURCE)
+    jobs[first["job_id"]]["state"] = "done"
+
+    rerun = app.handle("client", operation, GITHUB_SOURCE)
+    row = app.row("client", rerun["request_id"])
+    assert ":" in row["fingerprint"]
+    jobs[rerun["job_id"]].update(
+        state="failed",
+        error={"category": "rate_limited"},
+        last_provider_error={"http_code": 429},
+    )
+
+    retried = app.handle("client", "retry", rerun["request_id"])
+
+    assert retried["request_id"] == rerun["request_id"]
+    assert retried["attempt"] == 2
+
+
+@pytest.mark.parametrize("operation", ["ingest", "embed"])
+def test_nonce_suffixed_external_retry_still_rejects_changed_source(
+    setup, operation: str
+) -> None:
+    app, jobs, _argv_log = setup
+    if operation == "embed":
+        ingest = app.handle("client", "ingest", GITHUB_SOURCE)
+        jobs[ingest["job_id"]]["state"] = "done"
+    first = app.handle("client", operation, GITHUB_SOURCE)
+    jobs[first["job_id"]]["state"] = "done"
+    rerun = app.handle("client", operation, GITHUB_SOURCE)
+    jobs[rerun["job_id"]].update(
+        state="failed",
+        error={"category": "rate_limited"},
+        last_provider_error={"http_code": 429},
+    )
+    app.sources[GITHUB_SOURCE]["project"] = "changed-project"
+
+    with pytest.raises(broker.Refused, match="SOURCE_REVISION_CHANGED"):
+        app.handle("client", "retry", rerun["request_id"])
+
+
+@pytest.mark.parametrize("source_changed", [False, True])
+def test_renew_embed_normalizes_generation_suffix_but_checks_source_revision(
+    setup, source_changed: bool
+) -> None:
+    app, jobs, _argv_log = setup
+    ingest = app.handle("client", "ingest", GITHUB_SOURCE)
+    jobs[ingest["job_id"]]["state"] = "done"
+    first = app.handle("client", "embed", GITHUB_SOURCE)
+    jobs[first["job_id"]]["state"] = "done"
+    request = app.handle("client", "embed", GITHUB_SOURCE)
+    row = app.row("client", request["request_id"])
+    assert ":" in row["fingerprint"]
+
+    terminal_job = "terminal-embed-attempt"
+    jobs[terminal_job] = {
+        "state": "failed",
+        "error": {"category": "retry_exhausted"},
+        "attempts": {"items": [{"status": "failed", "category": "rate_limited"}]},
+        "last_provider_error": {"http_code": 429},
+        "progress": {"completed_batches": 4},
+    }
+    with app.db:
+        app.db.execute(
+            "UPDATE requests SET attempt=3 WHERE id=?", (request["request_id"],)
+        )
+        app.db.execute(
+            "INSERT INTO attempts(request_id,attempt,job_id,bound,state)"
+            " VALUES(?,3,?,?,?)",
+            (request["request_id"], terminal_job, broker.timestamp(), "failed"),
+        )
+    if source_changed:
+        app.sources[GITHUB_SOURCE]["project"] = "changed-project"
+
+    if source_changed:
+        with pytest.raises(broker.Refused, match="SOURCE_REVISION_CHANGED"):
+            app.handle("client", "renew-embed", request["request_id"])
+    else:
+        renewed = app.handle("client", "renew-embed", request["request_id"])
+        assert renewed["previous_request_id"] == request["request_id"]
+        assert renewed["previous_job_id"] == terminal_job

@@ -162,6 +162,110 @@ def test_retryable_connector_exhaustion_is_reported_retryable(
     assert result["error"]["code"] == ConnectorCodes.RATE_LIMITED
 
 
+def test_nonretryable_connector_error_keeps_its_stable_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kiber_analyst.external_ingest as ingest_module
+    from kiber_analyst.connectors.errors import ConnectorCodes, ConnectorError
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = _make_worker(store, monkeypatch)
+
+    def failing_run(**_kwargs):
+        raise ConnectorError(
+            ConnectorCodes.SOURCE_NOT_FOUND, "thread disappeared", status=404
+        )
+
+    monkeypatch.setattr(ingest_module, "run_external_ingest", failing_run)
+    worker.submit(
+        {"argv": ["github", "ingest", "--repo", "owner/repo", "--project", "demo",
+                  "--since", "2026-11-01"]},
+        uid=0,
+    )
+    job = store.claim()
+    assert job is not None
+    worker.process(job)
+    result = store.result(job.id)
+    assert result["error"]["category"] == "connector_error"
+    assert result["error"]["code"] == ConnectorCodes.SOURCE_NOT_FOUND
+
+
+def test_external_ingest_retries_transient_checkpoint_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kiber_analyst.external_ingest as ingest_module
+    import kiber_analyst.external_load as load_module
+    import kiber_analyst.worker as worker_module
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = _make_worker(store, monkeypatch)
+    monkeypatch.setattr(worker_module.time, "sleep", lambda _seconds: None)
+    lookup_calls = []
+
+    class TransientDatabaseError(Exception):
+        sqlstate = "08006"
+
+    def lookup(*_args, **_kwargs):
+        lookup_calls.append(True)
+        if len(lookup_calls) == 1:
+            raise TransientDatabaseError("temporary connection failure")
+        return "2026-10-01T00:00:00Z"
+
+    monkeypatch.setattr(load_module, "latest_checkpoint_since", lookup)
+    resolved_since = []
+    monkeypatch.setattr(
+        ingest_module, "run_external_ingest",
+        lambda **kwargs: resolved_since.append(kwargs["since"]) or {
+            "status": "done", "threads": 0, "items": 0, "load": {},
+        },
+    )
+    submitted = worker.submit(
+        {"argv": ["github", "ingest", "--repo", "owner/repo", "--project", "demo"]},
+        uid=0,
+    )
+    job = store.claim()
+    assert job is not None and job.id == submitted["job_id"]
+    worker.process(job)
+    assert len(lookup_calls) == 2
+    assert resolved_since == ["2026-10-01T00:00:00Z"]
+    assert store.status(job.id)["state"] == "done"
+
+
+def test_external_ingest_persistent_transient_db_failure_is_reported_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kiber_analyst.external_load as load_module
+    import kiber_analyst.worker as worker_module
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = _make_worker(store, monkeypatch)
+    monkeypatch.setattr(worker_module.time, "sleep", lambda _seconds: None)
+
+    class TransientDatabaseError(Exception):
+        sqlstate = "08006"
+
+    lookup_calls = []
+
+    def lookup(*_args, **_kwargs):
+        lookup_calls.append(True)
+        raise TransientDatabaseError("temporary connection failure")
+
+    monkeypatch.setattr(load_module, "latest_checkpoint_since", lookup)
+    submitted = worker.submit(
+        {"argv": ["github", "ingest", "--repo", "owner/repo", "--project", "demo"]},
+        uid=0,
+    )
+    job = store.claim()
+    assert job is not None and job.id == submitted["job_id"]
+    worker.process(job)
+    result = store.result(job.id)
+    assert len(lookup_calls) == 3
+    assert result["error"]["category"] == "transient_database_error"
+
+
 def test_submit_reruns_external_ingest_only_after_the_previous_job_finished(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

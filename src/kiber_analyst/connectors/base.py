@@ -11,15 +11,18 @@ Rules enforced here:
 
 from __future__ import annotations
 
+import email.utils
 import json
+import math
 import random
 import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 
 from kiber_analyst.connectors.config import ProviderConfig
 from kiber_analyst.connectors.errors import ConnectorCodes, ConnectorError
@@ -106,7 +109,13 @@ class ConnectorHttpClient:
         self._transport = transport
         self._default_headers = default_headers or {}
         self._last_response: Any = None
-        config_host = urlsplit(config.api_url).hostname or ""
+        config_parts = urlsplit(config.api_url)
+        config_host = (config_parts.hostname or "").lower()
+        try:
+            config_port = config_parts.port or 443
+        except ValueError:
+            config_port = -1
+        self._configured_origin = (config_parts.scheme.lower(), config_host, config_port)
         self._allowed_hosts = {config_host.lower()} | {
             host.lower() for host in config.allowed_hosts
         }
@@ -125,7 +134,17 @@ class ConnectorHttpClient:
         target = urljoin(self._config.api_url.rstrip("/") + "/", url)
         parts = urlsplit(target)
         host = (parts.hostname or "").lower()
-        if parts.scheme != "https" or not host or host not in self._allowed_hosts:
+        try:
+            port = parts.port or 443
+        except ValueError:
+            port = -1
+        same_configured_host = host == self._configured_origin[1]
+        allowed_origin = (
+            (parts.scheme.lower(), host, port) == self._configured_origin
+            if same_configured_host
+            else host in self._allowed_hosts and port == 443
+        )
+        if parts.scheme.lower() != "https" or not host or not allowed_origin:
             raise ConnectorError(
                 ConnectorCodes.MALFORMED_RESPONSE,
                 f"{self._config.provider} request target is not an allowed HTTPS endpoint",
@@ -237,14 +256,11 @@ class ConnectorHttpClient:
                     )
                 delay = _backoff_seconds(attempt)
                 retry_after = response.headers.get("Retry-After")
-                if status == 429 and retry_after is not None:
-                    # A server-provided interval is a lower bound: never jitter
-                    # or cap it below what the provider asked for.
-                    try:
-                        delay = max(float(retry_after), delay)
-                    except ValueError:
-                        pass
-                    self._sleep(min(delay, 3600.0))
+                server_delay = _retry_after_seconds(retry_after)
+                if status == 429 and server_delay is not None:
+                    # Retry-After is a server-specified lower bound; never cap
+                    # it below what the provider asked for.
+                    self._sleep(max(server_delay, delay))
                 else:
                     self._sleep(min(self._jitter(delay), 60.0))
                 continue
@@ -323,8 +339,8 @@ class ConnectorHttpClient:
         silently reporting a truncated result as complete.
         """
         next_url: str | None = url
-        next_params = dict(params or {})
-        seen_targets: set[tuple[str | None, str | None]] = set()
+        next_params = dict(params) if params else None
+        seen_targets = {_page_marker(next_url, next_params, self._config.api_url)}
         while next_url is not None:
             payload, _not_modified = self.request_json(
                 "GET", next_url, params=next_params, headers=headers
@@ -348,16 +364,12 @@ class ConnectorHttpClient:
                 response,
                 paging=paging,
                 page_param=page_param,
-                current_params=next_params,
+                current_params=next_params or {},
                 current_url=next_url,
                 provider=self._config.provider,
             )
-            marker = (
-                (next_url, None)
-                if next_url is not None
-                else (None, next_params.get(page_param))
-            )
-            if next_url is not None or next_params.get(page_param) is not None:
+            if next_url is not None:
+                marker = _page_marker(next_url, next_params, self._config.api_url)
                 if marker in seen_targets:
                     raise ConnectorError(
                         ConnectorCodes.MALFORMED_RESPONSE,
@@ -380,6 +392,32 @@ def _backoff_seconds(attempt: int) -> float:
     return min(2.0 ** (attempt - 1), 60.0)
 
 
+def _retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = (retry_at - datetime.now(UTC)).total_seconds()
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _page_marker(
+    url: str, params: dict[str, Any] | None, base_url: str
+) -> tuple[str, str]:
+    resolved = urljoin(base_url.rstrip("/") + "/", url)
+    encoded_params = urlencode(sorted((params or {}).items()), doseq=True)
+    return resolved, encoded_params
+
+
 def _next_page(
     response: Any,
     *,
@@ -388,7 +426,7 @@ def _next_page(
     current_params: dict[str, Any],
     current_url: str | None,
     provider: str,
-) -> tuple[str | None, dict[str, Any]]:
+) -> tuple[str | None, dict[str, Any] | None]:
     if response is None:
         return None, {}
     if paging == "link":
@@ -405,7 +443,7 @@ def _next_page(
                 ConnectorCodes.MALFORMED_RESPONSE,
                 f"{provider} returned an unusable next-page link",
             )
-        return target, {}
+        return target, None
     header = (response.headers.get("X-Next-Page") or "").strip()
     if not header:
         return None, {}

@@ -586,9 +586,11 @@ def load_external(
                         )
                 else:
                     cursor.execute(
-                        """INSERT INTO runs (project_id, kind, status, checkpoint)
-                           VALUES (%s::uuid, 'external_ingest', 'running', %s::jsonb)
-                           RETURNING id""",
+                        """INSERT INTO runs
+                             (project_id, kind, status, checkpoint, started_at)
+                           VALUES (%s::uuid, 'external_ingest', 'running', %s::jsonb,
+                                   clock_timestamp())
+                           RETURNING id, started_at""",
                         (
                             project_id,
                             json.dumps({
@@ -604,6 +606,8 @@ def load_external(
                     run_id = str(run_row[0]) if run_row else None
                     if run_id is None:
                         raise LoadError("Could not create the external ingestion run row")
+                    if run_row[1] is not None:
+                        started_at = run_row[1]
                     doc_by_ref: dict[str, str] = {}
                     for thread in threads:
                         thread_items = items_by_thread.get(thread["thread_ref"], [])

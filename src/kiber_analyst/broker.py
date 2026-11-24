@@ -1120,7 +1120,13 @@ class Broker:
         old_base = self.db.execute(
             'SELECT base_fingerprint FROM embed_renewals WHERE request_id=?', (request_id,),
         ).fetchone()
-        if fingerprint != (old_base[0] if old_base else previous['fingerprint']):
+        expected_fingerprint = (
+            old_base[0] if old_base else self._base_fingerprint(previous['fingerprint'])
+        )
+        if (
+            self._base_fingerprint(fingerprint)
+            != self._base_fingerprint(expected_fingerprint)
+        ):
             raise Refused('SOURCE_REVISION_CHANGED')
         for row in self.db.execute(
             "SELECT * FROM requests WHERE owner=? AND source=? AND operation='embed' AND id<>?",
@@ -1386,8 +1392,12 @@ class Broker:
         ).fetchone()
         expected_fingerprint = renewal[0] if renewal else row['fingerprint']
         if operation == 'ingest' and chat is None:
-            # External ingest: no staged import tree, the fingerprint is stable.
-            if fingerprint != expected_fingerprint:
+            # External reruns add a uniqueness suffix to the request fingerprint;
+            # validate the source revision against its unsuffixed base.
+            if (
+                self._base_fingerprint(fingerprint)
+                != self._base_fingerprint(expected_fingerprint)
+            ):
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'ingest':
             revision = media_revision(self.root, chat, topic)
@@ -1429,11 +1439,16 @@ class Broker:
                 limit = int(argv[5])
             except (TypeError, ValueError):
                 raise Refused('SOURCE_REVISION_CHANGED') from None
-            current = search_fingerprint(row['source'], argv[1].strip(), limit)
+            current = search_fingerprint(
+                row['source'], entry['project'], argv[1].strip(), limit
+            )
             if current != expected_fingerprint:
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'embed':
-            if fingerprint != expected_fingerprint:
+            if (
+                self._base_fingerprint(fingerprint)
+                != self._base_fingerprint(expected_fingerprint)
+            ):
                 raise Refused('SOURCE_REVISION_CHANGED')
         else:
             raise Refused('RETRY_NOT_ALLOWED')

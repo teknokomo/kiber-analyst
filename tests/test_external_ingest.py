@@ -303,6 +303,115 @@ def test_retryable_failure_keeps_fetched_threads_and_resumes(
     assert second.fetched == [f"{SOURCE}:pull:2"], "only the missing thread is refetched"
 
 
+def test_torn_fetched_journal_tail_is_removed_without_refetch(
+    artifact, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "kiber_analyst.external_ingest.load_external",
+        lambda *args, **kwargs: {"status": "dry_run", "inserted": 0},
+    )
+    run_external_ingest(
+        provider="github", source_id=SOURCE, project_slug="demo",
+        since="2026-11-01", artifact_dir=artifact, env_path=tmp_path / "env",
+        connector=FakeConnector(),
+    )
+    fetched_file = artifact / "fetched.jsonl"
+    with fetched_file.open("ab") as stream:
+        stream.write(b'{"ref":{"thread_ref":')
+
+    retry = FakeConnector()
+    result = run_external_ingest(
+        provider="github", source_id=SOURCE, project_slug="demo",
+        since="2026-11-01", artifact_dir=artifact, env_path=tmp_path / "env",
+        connector=retry,
+    )
+
+    assert result["threads"] == 2
+    assert retry.fetched == []
+    lines = fetched_file.read_bytes().splitlines()
+    assert len(lines) == 2
+    assert all(json.loads(line)["ref"]["thread_ref"] for line in lines)
+
+
+def test_retry_refetches_and_replaces_cached_thread_when_discovery_is_newer(
+    artifact, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "kiber_analyst.external_ingest.load_external",
+        lambda *args, **kwargs: {"status": "dry_run", "inserted": 0},
+    )
+    run_external_ingest(
+        provider="github", source_id=SOURCE, project_slug="demo",
+        since="2026-11-01", artifact_dir=artifact, env_path=tmp_path / "env",
+        connector=FakeConnector(),
+    )
+
+    class UpdatedDiscoveryConnector(FakeConnector):
+        def discover(self, source_id, checkpoint):
+            for ref in super().discover(source_id, checkpoint):
+                if ref.thread_ref == f"{SOURCE}:issue:1":
+                    yield ThreadRef(
+                        provider=ref.provider, source_id=ref.source_id,
+                        thread_ref=ref.thread_ref, kind=ref.kind, number=ref.number,
+                        updated_at="2026-11-13T10:00:00Z",
+                        state=ref.state, title=ref.title,
+                    )
+                else:
+                    yield ref
+
+    updated = UpdatedDiscoveryConnector()
+    result = run_external_ingest(
+        provider="github", source_id=SOURCE, project_slug="demo",
+        since="2026-11-01", artifact_dir=artifact, env_path=tmp_path / "env",
+        connector=updated,
+    )
+    assert result["status"] == "done"
+    assert updated.fetched == [f"{SOURCE}:issue:1"]
+    records = [
+        json.loads(line)
+        for line in (artifact / "fetched.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    refs = [record["ref"]["thread_ref"] for record in records]
+    assert len(refs) == len(set(refs)) == 2
+    refreshed = next(
+        record for record in records
+        if record["ref"]["thread_ref"] == f"{SOURCE}:issue:1"
+    )
+    assert refreshed["ref"]["updated_at"] == "2026-11-13T10:00:00Z"
+    assert refreshed["body"]["updated_at"] == "2026-11-13T10:00:00Z"
+
+
+def test_incomplete_raw_thread_marks_run_partial_and_suppresses_watermark(
+    artifact, monkeypatch, tmp_path
+) -> None:
+    class IncompleteConnector(FakeConnector):
+        def fetch_thread(self, ref):
+            raw = super().fetch_thread(ref)
+            if ref.thread_ref == f"{SOURCE}:issue:1":
+                raw.complete = False
+                raw.errors.append({"code": "partial_comments"})
+            return raw
+
+    monkeypatch.setattr(
+        "kiber_analyst.external_ingest.load_external",
+        lambda *args, **kwargs: {"status": "dry_run", "inserted": 0},
+    )
+    result = run_external_ingest(
+        provider="github", source_id=SOURCE, project_slug="demo",
+        since="2026-11-01", artifact_dir=artifact, env_path=tmp_path / "env",
+        connector=IncompleteConnector(),
+    )
+    manifest = json.loads(
+        (artifact / "normalized" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert result["status"] == "partial"
+    assert "incomplete_thread" in result["partial_reasons"]
+    assert manifest["threads_complete"][f"{SOURCE}:issue:1"] is False
+    assert manifest["checkpoint_after"]["since"] == "2026-11-01T00:00:00Z"
+    assert manifest["checkpoint_after"]["watermark_suppressed"] == "partial"
+
+
 def test_stop_hook_interrupts_the_pipeline(artifact, monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         "kiber_analyst.external_ingest.load_external",

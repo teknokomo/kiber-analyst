@@ -323,6 +323,62 @@ def test_discussion_fetch_uses_real_schema_and_paginates_comments(monkeypatch) -
     connector.close()
 
 
+def test_graphql_comment_pagination_rejects_repeated_cursor(monkeypatch) -> None:
+    connector = make_connector(monkeypatch)
+    calls = []
+
+    def graphql(_url, _query, variables):
+        calls.append(variables.get("cursor"))
+        return {"data": {"repository": {"discussion": {"comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "same-cursor"},
+            "nodes": [],
+        }}}}}
+
+    connector._graphql = graphql
+    with pytest.raises(ConnectorError) as exc:
+        connector._fetch_discussion_comments(
+            "https://api.github.com/graphql", "owner", "repo", 1
+        )
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    assert calls == [None, "same-cursor"]
+    connector.close()
+
+
+def test_graphql_reply_pagination_rejects_missing_cursor(monkeypatch) -> None:
+    connector = make_connector(monkeypatch)
+    calls = []
+
+    def graphql(*_args, **_kwargs):
+        calls.append(True)
+        return {"data": {"node": {"replies": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [],
+        }}}}
+
+    connector._graphql = graphql
+    with pytest.raises(ConnectorError) as exc:
+        connector._fetch_discussion_replies(
+            "https://api.github.com/graphql",
+            {"id": "comment-id", "replies": {
+                "pageInfo": {"hasNextPage": True, "endCursor": None}, "nodes": [],
+            }},
+        )
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    assert calls == []
+    connector.close()
+
+
+def test_discussion_discovery_rejects_missing_cursor(monkeypatch) -> None:
+    connector = make_connector(monkeypatch, lambda _request: httpx.Response(
+        200, json={"data": {"repository": {"discussions": {
+            "pageInfo": {"hasNextPage": True, "endCursor": None}, "nodes": [],
+        }}}},
+    ))
+    with pytest.raises(ConnectorError) as exc:
+        list(connector._discover_discussions(SOURCE, None))
+    assert exc.value.code == ConnectorCodes.MALFORMED_RESPONSE
+    connector.close()
+
+
 def test_graphql_scope_failure_marks_discussions_unsupported(monkeypatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/graphql":
@@ -372,6 +428,39 @@ def test_enterprise_host_uses_its_own_api_base(monkeypatch) -> None:
     assert [ref.number for ref in refs] == [1]
     assert all(ref.kind != "discussion" for ref in refs)
     assert connector.discovery_errors
+    connector.close()
+
+
+def test_explicit_configured_enterprise_host_preserves_port_and_api_path(monkeypatch) -> None:
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.port, request.url.path))
+        if request.url.path == "/api/graphql":
+            return httpx.Response(200, json={"errors": [
+                {"type": "INSUFFICIENT_SCOPES", "message": "no scope"}]})
+        if request.url.path == "/api/v3/repos/team/repo/issues":
+            return httpx.Response(200, json=[{**ISSUE, "number": 1}])
+        if request.url.path == "/api/v3/repos/team/repo/pulls":
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    monkeypatch.setenv("KIBER_GITHUB_TOKEN", "test-token")
+    config = ProviderConfig(
+        provider="github", api_url="https://github.example.com:8443/api/v3",
+        page_size=100, timeout_seconds=30, max_retries=2,
+    )
+    connector = GitHubConnector(
+        config=config, transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None, jitter=lambda seconds: seconds,
+    )
+    refs = list(connector.discover("github:github.example.com/team/repo", None))
+    assert [ref.number for ref in refs] == [1]
+    assert seen == [
+        (8443, "/api/v3/repos/team/repo/issues"),
+        (8443, "/api/v3/repos/team/repo/pulls"),
+        (8443, "/api/graphql"),
+    ]
     connector.close()
 
 

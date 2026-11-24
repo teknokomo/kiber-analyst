@@ -44,23 +44,22 @@ def test_missing_token_is_auth_required(monkeypatch) -> None:
 
 
 def test_link_pagination_follows_rel_next_until_the_end(monkeypatch) -> None:
-    pages = {"page": 1}
-
     def handler(request: httpx.Request) -> httpx.Response:
-        current = pages["page"]
-        if current == 1:
-            pages["page"] = 2
+        current = request.url.params.get("page", "1")
+        if current == "1":
             return httpx.Response(
                 200, json=[{"n": 1}],
                 headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
             )
-        return httpx.Response(200, json=[{"n": 2}, {"n": 3}])
+        return httpx.Response(200, json=[{"n": 2}])
 
     client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
     collected = []
-    for items, _headers in client.iter_pages("/repos/o/r/issues"):
+    for items, _headers in client.iter_pages(
+        "/repos/o/r/issues", params={"page": "1"}
+    ):
         collected.extend(items)
-    assert [item["n"] for item in collected] == [1, 2, 3]
+    assert [item["n"] for item in collected] == [1, 2]
     client.close()
 
 
@@ -82,6 +81,31 @@ def test_header_pagination_follows_x_next_page(monkeypatch) -> None:
         collected.extend(items)
     assert seen_pages == ["1", "2"]
     assert [item["n"] for item in collected] == [1, 2]
+    client.close()
+
+
+def test_header_pagination_allows_multiple_advancing_cursors(monkeypatch) -> None:
+    seen_pages = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params.get("page", "1")
+        seen_pages.append(page)
+        if page == "1":
+            return httpx.Response(200, json=[{"n": 1}], headers={"X-Next-Page": "2"})
+        if page == "2":
+            return httpx.Response(200, json=[{"n": 2}], headers={"X-Next-Page": "3"})
+        return httpx.Response(200, json=[{"n": 3}], headers={"X-Next-Page": ""})
+
+    client, _sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    collected = [
+        item
+        for items, _headers in client.iter_pages(
+            "/projects/p/issues", params={"per_page": 1}, paging="header"
+        )
+        for item in items
+    ]
+    assert seen_pages == ["1", "2", "3"]
+    assert [item["n"] for item in collected] == [1, 2, 3]
     client.close()
 
 
@@ -312,6 +336,26 @@ def test_allowed_extra_host_is_accepted_for_absolute_urls(monkeypatch) -> None:
     client.close()
 
 
+def test_configured_host_different_port_is_rejected_before_token_send(monkeypatch) -> None:
+    calls = {"n": 0}
+    config = ProviderConfig(
+        provider="github", api_url="https://github.example.com:8443/api/v3",
+        page_size=100, timeout_seconds=30, max_retries=1,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=[])
+
+    client, _sleeps, _calls = make_client(
+        monkeypatch, httpx.MockTransport(handler), config=config
+    )
+    with pytest.raises(ConnectorError, match="allowed HTTPS endpoint"):
+        client.request_json("GET", "https://github.example.com:9443/api/v3/private")
+    assert calls["n"] == 0
+    client.close()
+
+
 def test_501_is_preserved_for_conditional_endpoint_handling(monkeypatch) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(501)
@@ -345,6 +389,41 @@ def test_retry_after_is_never_reduced_by_jitter_or_cap(monkeypatch) -> None:
     )
     client.request_json("GET", "/x")
     assert sleeps and sleeps[0] >= 600
+    client.close()
+
+
+def test_retry_after_above_one_hour_is_not_capped(monkeypatch) -> None:
+    attempts = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "7200"})
+        return httpx.Response(200, json=[])
+
+    client, sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    client.request_json("GET", "/x")
+    assert sleeps == [7200.0]
+    client.close()
+
+
+def test_retry_after_http_date_is_respected(monkeypatch) -> None:
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    retry_at = datetime.now(UTC) + timedelta(hours=2)
+    value = format_datetime(retry_at, usegmt=True)
+    attempts = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": value})
+        return httpx.Response(200, json=[])
+
+    client, sleeps, _calls = make_client(monkeypatch, httpx.MockTransport(handler))
+    client.request_json("GET", "/x")
+    assert sleeps and sleeps[0] >= 7190
     client.close()
 
 

@@ -39,7 +39,7 @@ sha256sum /var/backups/knowledge/pre-0007-*.dump
 ```bash
 createdb -h 127.0.0.1 -U <owner> knowledge_restore_check
 pg_restore -h 127.0.0.1 -U <owner> -d knowledge_restore_check \
-  /var/backups/knowledge/pre-0007-< stamp >.dump
+  /var/backups/knowledge/pre-0007-<stamp>.dump
 psql -d knowledge_restore_check -t -c \
   "SELECT count(*), coalesce(max(id),0) FROM segments;"
 # должно совпасть с counts до миграции; после проверки базу удалить:
@@ -89,7 +89,7 @@ SELECT count(*), coalesce(max(id),0) FROM segments;              -- как до 
 ## 6. Шаблон отчёта
 
 ```text
-PR #3: <url>            applied commit: 8d221ed+
+PR #3: <url>            applied merge commit: <full merge commit SHA>
 Backup: <path> (<size>, sha256 <hash>, restore-verified: yes|no)
 Before: segments count=<n> max(id)=<n>
 Duration: <s> s

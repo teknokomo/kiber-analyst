@@ -225,6 +225,33 @@ def test_search_fingerprint_scopes_source_project_query_limit_and_version(monkey
     assert broker.search_fingerprint(SOURCE, 'fixture', 'Example Station', 5) != baseline
 
 
+def test_retrying_search_revalidates_fingerprint_with_source_project(setup):
+    app, _src, _jobs, argv_log = setup
+    query = 'Example Station'
+    fingerprint = broker.search_fingerprint(SOURCE, 'fixture', query, 5)
+    request_id = str(uuid.uuid4())
+    now = broker.timestamp()
+    argv = ['search', query, '--project', 'fixture', '--limit', '5',
+            '--source-kind', 'telegram', '--source-id', SOURCE, '--json']
+    with app.db:
+        app.db.execute(
+            """INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (request_id, 'client', SOURCE, fingerprint, 'search', json.dumps(argv),
+             now, now, 'failed'),
+        )
+        app.db.execute(
+            "INSERT INTO attempts(request_id,attempt,job_id,bound,state)"
+            " VALUES(?,1,?,?,?)",
+            (request_id, 'previous-search-job', now, 'failed'),
+        )
+    app.status = lambda _row: {'status': 'failed', 'retryable': True}
+    retried = app.handle('client', 'retry', request_id)
+    assert retried['request_id'] == request_id
+    assert retried['attempt'] == 2
+    assert argv_log[-1][0] == 'search'
+
+
 def test_source_search_refuses_missing_topic_explicitly(setup):
     app, _src, _jobs, argv_log = setup
     app.worker_api = lambda action, **_kwargs: {'documents': 0} if action == 'source-overview' else {}

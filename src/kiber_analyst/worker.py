@@ -882,18 +882,21 @@ class JobWorker:
         })
         artifact_dir=self.store.jobs_dir/job.id/"external-ingest"
         since=params.get("since")
-        if since is None:
-            # Continue from the last completed import of this source instead of
-            # restarting with the 90-day default window.
-            from kiber_analyst.external_load import latest_checkpoint_since
-
-            since=latest_checkpoint_since(
-                params["project"],params["source_id"],env_path=ENV_PATH,
-            )
+        checkpoint_resolved = since is not None
         last_code="UNKNOWN"
         for attempt in range(1,MAX_TELEGRAM_INGEST_ATTEMPTS+1):
             self._check_cancel_deadline(job)
             try:
+                if not checkpoint_resolved:
+                    # Resolve once, inside the same bounded retry loop as ingest.
+                    # Keep this cutoff across ingest retries so a later run does
+                    # not silently change the source window.
+                    from kiber_analyst.external_load import latest_checkpoint_since
+
+                    since=latest_checkpoint_since(
+                        params["project"],params["source_id"],env_path=ENV_PATH,
+                    )
+                    checkpoint_resolved = True
                 result=run_external_ingest(
                     provider=params["provider"],source_id=params["source_id"],
                     project_slug=params["project"],since=since,
@@ -901,12 +904,13 @@ class JobWorker:
                     artifact_dir=artifact_dir,env_path=ENV_PATH,
                     check_stop=lambda: self._check_cancel_deadline(job),
                 )
-            except IngestError as exc:
+            except Exception as exc:  # noqa: BLE001 - connector and database errors have different retry rules.
                 code=getattr(exc,"code","")
                 retryable_connector=getattr(exc,"retryable",False)
+                retryable_database=self._retryable_ingest_error(exc)
                 last_code=code or type(exc).__name__
                 if attempt < MAX_TELEGRAM_INGEST_ATTEMPTS and (
-                    retryable_connector or self._retryable_ingest_error(exc)
+                    retryable_connector or retryable_database
                 ):
                     self.store.update_item(item["id"],"waiting",checkpoint={
                         "attempt":attempt,"retry":code or "transient_error",
@@ -917,11 +921,15 @@ class JobWorker:
                 self.store.update_item(item["id"],"failed",checkpoint={
                     "attempt":attempt,"error_code":last_code,
                 })
-                if retryable_connector:
-                    # Preserve the retryable connector code so process() can
-                    # report a retryable failure to the broker.
+                if retryable_connector or retryable_database or (
+                    isinstance(code, str) and code
+                ):
+                    # Preserve stable connector codes and transient database
+                    # SQLSTATEs for process() and the broker retry policy.
                     raise
-                raise JobsError(f"External ingestion failed ({last_code})") from exc
+                if isinstance(exc, IngestError):
+                    raise JobsError(f"External ingestion failed ({last_code})") from exc
+                raise
             self.store.update_item(item["id"],"done",checkpoint={
                 "attempts":attempt,
                 "threads":result.get("threads",0),
@@ -1116,7 +1124,8 @@ class JobWorker:
             self.store.complete(job.id,{"job_id":job.id,"status":state,"error":{"category":exc.category,"http_code":exc.status_code,"message":str(exc)},"attempts":self.store.attempts_summary(job.id)},state=state)
         except Exception as exc:  # noqa: BLE001 - keep private data and request payloads out of diagnostics.
             temporary_database_error = (
-                job.operation == "telegram_ingest" and self._retryable_ingest_error(exc)
+                job.operation in {"telegram_ingest", "external_ingest"}
+                and self._retryable_ingest_error(exc)
             )
             category = "transient_database_error" if temporary_database_error else "worker_error"
             error_detail = {"category": category, "type": type(exc).__name__}

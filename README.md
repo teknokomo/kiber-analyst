@@ -18,7 +18,9 @@ Everything stays **read-only** against the providers: Kiber-analyst never create
 
 - Python 3.12 or newer
 - PostgreSQL with the schema migrations in `migrations/` for database-backed operations
-- Optional provider credentials and network access only for embedding operations
+- Provider credentials and network access are required for enabled external
+  connector imports; they are optional for offline Telegram archive workflows.
+  Embedding operations also require the configured embedding provider.
 
 ## Install
 

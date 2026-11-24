@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,33 @@ def _raw_thread_line(ref: ThreadRef, raw: RawThread) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _compact_jsonl_atomic(path: Path, lines: list[str]) -> None:
+    """Replace a completed append journal without risking its last good copy."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            for line in lines:
+                stream.write(line.encode("utf-8"))
+                stream.write(b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def run_external_ingest(
     *,
     provider: str,
@@ -193,46 +221,85 @@ def run_external_ingest(
 
     # Stage 2: fetch (raw answers are dumped to the job directory by the
     # connector itself); per-thread non-retryable failures are recorded, and
-    # retryable ones propagate to the worker. Already fetched threads survive a
-    # job retry: the file is rewritten with valid lines and extended in place.
+    # retryable ones propagate to the worker. Successful threads are appended
+    # durably before another request starts, then compacted atomically on success.
     fetched_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     max_updated: datetime | None = None
+
+    def _parse_timestamp(candidate: Any) -> datetime | None:
+        if not isinstance(candidate, str) or not candidate:
+            return None
+        try:
+            parsed_date = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed_date.tzinfo is None:
+            parsed_date = parsed_date.replace(tzinfo=UTC)
+        return parsed_date.astimezone(UTC)
 
     def _track_watermark(*candidates: Any) -> None:
         nonlocal max_updated
         for candidate in candidates:
-            if not isinstance(candidate, str) or not candidate:
-                continue
-            try:
-                parsed_date = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
-            except ValueError:
+            parsed_date = _parse_timestamp(candidate)
+            if parsed_date is None:
                 continue
             if max_updated is None or parsed_date > max_updated:
                 max_updated = parsed_date
 
-    existing_lines: list[str] = []
-    fetched_refs: set[str] = set()
+    existing_lines: dict[str, str] = {}
+    existing_payloads: dict[str, dict[str, Any]] = {}
+    valid_cache_bytes = 0
     if paths["fetched"].is_file():
-        with paths["fetched"].open("r", encoding="utf-8") as stream:
-            for line in stream:
-                if not line.strip():
+        with paths["fetched"].open("rb") as stream:
+            while line_bytes := stream.readline():
+                if not line_bytes.endswith(b"\n"):
                     continue
                 try:
+                    line = line_bytes.decode("utf-8").rstrip("\n")
+                    if not line.strip():
+                        valid_cache_bytes = stream.tell()
+                        continue
                     payload = json.loads(line)
                     thread_ref_value = payload["ref"]["thread_ref"]
                 except (json.JSONDecodeError, KeyError, TypeError):
                     break
-                existing_lines.append(line.rstrip("\n"))
-                fetched_refs.add(thread_ref_value)
+                except UnicodeDecodeError:
+                    break
+                existing_lines[thread_ref_value] = line
+                existing_payloads[thread_ref_value] = payload
                 _track_watermark(payload["ref"].get("updated_at"),
                                  (payload.get("body") or {}).get("updated_at"))
-    with paths["fetched"].open("w", encoding="utf-8", newline="\n") as stream:
-        for line in existing_lines:
-            stream.write(line + "\n")
-        stream.flush()
+                valid_cache_bytes = stream.tell()
+        if paths["fetched"].stat().st_size > valid_cache_bytes:
+            # Discard a torn or malformed tail left by an interrupted append,
+            # preserving every complete JSONL record before it.
+            with paths["fetched"].open("r+b") as stream:
+                stream.truncate(valid_cache_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+    journal_created = not paths["fetched"].exists()
+    with paths["fetched"].open("ab") as stream:
         for ref in refs:
             _check_stop()
-            if ref.thread_ref in fetched_refs:
+            cached = existing_payloads.get(ref.thread_ref)
+            discovered_updated = _parse_timestamp(ref.updated_at)
+            cached_dates = (
+                _parse_timestamp((cached.get("ref") or {}).get("updated_at")),
+                _parse_timestamp((cached.get("body") or {}).get("updated_at")),
+            ) if cached is not None else ()
+            cached_updated = max(
+                (value for value in cached_dates if value is not None),
+                default=None,
+            )
+            cached_complete = bool(
+                cached is not None
+                and cached.get("complete", True)
+                and not cached.get("errors")
+            )
+            if cached_complete and not (
+                discovered_updated is not None
+                and (cached_updated is None or discovered_updated > cached_updated)
+            ):
                 continue
             try:
                 raw = connector.fetch_thread(ref)
@@ -249,9 +316,23 @@ def run_external_ingest(
                 partial_reasons.append("thread_fetch_failed")
                 continue
             _track_watermark(ref.updated_at, (raw.body or {}).get("updated_at"))
-            stream.write(_raw_thread_line(ref, raw) + "\n")
+            line = _raw_thread_line(ref, raw)
+            existing_lines[ref.thread_ref] = line
+            existing_payloads[ref.thread_ref] = json.loads(line)
+            stream.write(line.encode("utf-8") + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
+            if journal_created:
+                directory_fd = os.open(paths["fetched"].parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                journal_created = False
+    # A successful pass compacts any replaced cached records. If a retryable
+    # fetch fails above, the append-only journal still preserves each completed
+    # fetch and the next pass deduplicates by thread_ref, keeping the last line.
+    _compact_jsonl_atomic(paths["fetched"], list(existing_lines.values()))
 
     # Stage 3: normalize (offline, deterministic). Every discovered thread
     # starts as incomplete; only successfully normalized ones flip to True.
@@ -283,9 +364,10 @@ def run_external_ingest(
             )
             normalized = connector.normalize(raw)
             threads_out.append(normalized.thread)
-            threads_complete[ref.thread_ref] = bool(
-                raw.complete and not raw.errors
-            )
+            is_complete = bool(raw.complete and not raw.errors)
+            threads_complete[ref.thread_ref] = is_complete
+            if not is_complete:
+                partial_reasons.append("incomplete_thread")
             for item in normalized.items:
                 items_out.append(item)
                 if item["item_kind"] == "event":
