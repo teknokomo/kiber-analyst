@@ -26,8 +26,19 @@ def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def _connect(credentials: dict[str, str], *, autocommit: bool = True):
+    return psycopg.connect(
+        host=credentials["KNOWLEDGE_HOST"],
+        port=int(credentials["KNOWLEDGE_PORT"]),
+        dbname=credentials["KNOWLEDGE_DB"],
+        user=credentials["KNOWLEDGE_USER"],
+        password=credentials["KNOWLEDGE_PASSWORD"],
+        autocommit=autocommit,
+    )
+
+
 def _fixture(root: Path) -> Path:
-    chat_id = "-10012345"
+    chat_id = f"-100{uuid.uuid4().int % 10**15 + 1}"
     topic_id = 1
     source_id = f"telegram:{chat_id}:topic:{topic_id}"
     topic = root / chat_id / str(topic_id)
@@ -118,6 +129,7 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_pat
 
     export_root = tmp_path / "telegram"
     source = _fixture(export_root)
+    chat_id = json.loads((source / "manifest.json").read_text(encoding="utf-8"))["chat_id"]
     before = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in source.iterdir()
@@ -156,7 +168,7 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_pat
         project_id = conn.execute("SELECT id FROM projects WHERE slug=%s", (project_slug,)).fetchone()[0]
         source_id = conn.execute(
             "SELECT id FROM sources WHERE project_id=%s AND external_id=%s",
-            (project_id, "-10012345"),
+            (project_id, chat_id),
         ).fetchone()[0]
         assert conn.execute(
             """SELECT count(*) FROM segments seg JOIN documents doc ON doc.id=seg.document_id
@@ -171,3 +183,115 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_pat
             "SELECT count(*) FROM runs WHERE project_id=%s AND kind='telegram_ingest' AND status='done'",
             (project_id,),
         ).fetchone()[0] == 1
+
+
+def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
+    tmp_path: Path,
+) -> None:
+    from dotenv import dotenv_values
+
+    from kiber_analyst.errors import LoadError, SearchError
+    from kiber_analyst.search_core import execute_search
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    project_a = f"kiber-iso-a-{uuid.uuid4().hex[:10]}"
+    project_b = f"kiber-iso-b-{uuid.uuid4().hex[:10]}"
+    with _connect(credentials) as conn:
+        conn.execute(
+            "INSERT INTO projects (slug, title) VALUES (%s, %s), (%s, %s)",
+            (project_a, "Isolation A", project_b, "Isolation B"),
+        )
+
+    export_root = tmp_path / "telegram"
+    source = _fixture(export_root)
+    chat_id = json.loads((source / "manifest.json").read_text(encoding="utf-8"))["chat_id"]
+    artifacts = tmp_path / "artifacts" / "shared-job"
+    first = load_telegram_export(
+        source, artifacts, env_path=Path(TEST_ENV), project_slug=project_a, root=export_root,
+    )
+    repeated = load_telegram_export(
+        source, artifacts, env_path=Path(TEST_ENV), project_slug=project_a, root=export_root,
+    )
+    assert (first["inserted"], first["service_events_inserted"]) == (1, 1)
+    assert (repeated["inserted"], repeated["skipped"], repeated["service_events_skipped"]) == (0, 1, 1)
+
+    def project_counts(conn, slug: str) -> tuple[int, ...]:
+        return conn.execute(
+            """SELECT
+                 (SELECT count(*) FROM sources so JOIN projects p ON p.id=so.project_id WHERE p.slug=%s),
+                 (SELECT count(*) FROM documents d JOIN sources so ON so.id=d.source_id
+                    JOIN projects p ON p.id=so.project_id WHERE p.slug=%s),
+                 (SELECT count(*) FROM segments s JOIN documents d ON d.id=s.document_id
+                    JOIN sources so ON so.id=d.source_id JOIN projects p ON p.id=so.project_id
+                    WHERE p.slug=%s),
+                 (SELECT count(*) FROM snapshots sn JOIN sources so ON so.id=sn.source_id
+                    JOIN projects p ON p.id=so.project_id WHERE p.slug=%s),
+                 (SELECT count(*) FROM runs r JOIN projects p ON p.id=r.project_id WHERE p.slug=%s),
+                 (SELECT count(*) FROM telegram_service_events ev JOIN sources so ON so.id=ev.source_id
+                    JOIN projects p ON p.id=so.project_id WHERE p.slug=%s)""",
+            (slug, slug, slug, slug, slug, slug),
+        ).fetchone()
+
+    with _connect(credentials) as conn:
+        project_a_before_dry = project_counts(conn, project_a)
+    dry = load_telegram_export(
+        source, artifacts, env_path=Path(TEST_ENV), project_slug=project_a,
+        dry_run=True, root=export_root,
+    )
+    assert dry["status"] == "dry_run" and dry["rollback_confirmed"] is True
+    with _connect(credentials) as conn:
+        assert project_counts(conn, project_a) == project_a_before_dry
+        project_a_before_cross_project = project_counts(conn, project_a)
+        project_b_before = project_counts(conn, project_b)
+
+    with pytest.raises(LoadError, match="TELEGRAM_PROJECT_CONFLICT"):
+        load_telegram_export(
+            source, artifacts, env_path=Path(TEST_ENV), project_slug=project_b, root=export_root,
+        )
+    with pytest.raises(LoadError, match="TELEGRAM_PROJECT_CONFLICT"):
+        load_telegram_export(
+            source, artifacts, env_path=Path(TEST_ENV), project_slug=project_b,
+            dry_run=True, root=export_root,
+        )
+
+    with _connect(credentials) as conn:
+        assert project_counts(conn, project_b) == project_b_before == (0, 0, 0, 0, 0, 0)
+        assert project_counts(conn, project_a) == project_a_before_cross_project
+        project_id = conn.execute("SELECT id FROM projects WHERE slug=%s", (project_a,)).fetchone()[0]
+        message = conn.execute(
+            """SELECT seg.id, seg.document_id, seg.text, seg.content_hash, seg.meta
+               FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+               JOIN sources so ON so.id=doc.source_id
+               WHERE so.project_id=%s AND seg.external_ref=%s""",
+            (project_id, f"tg:{chat_id}:101"),
+        ).fetchone()
+        assert message is not None
+        assert message[2] == "Изолированная проверка импорта"
+        assert conn.execute(
+            """SELECT seg.id, seg.document_id, seg.text, seg.content_hash, seg.meta
+               FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+               JOIN sources so ON so.id=doc.source_id
+               WHERE so.project_id=%s AND seg.external_ref=%s""",
+            (project_id, f"tg:{chat_id}:101"),
+        ).fetchone() == message
+        assert conn.execute(
+            "SELECT count(*) FROM segments WHERE external_ref=%s",
+            (f"tg:{chat_id}:101",),
+        ).fetchone()[0] == 1
+        a_search = execute_search(
+            conn, "изолированная проверка", project=project_a, vector=None,
+            limit=5, source_id=f"telegram:{chat_id}:topic:1",
+        )
+        b_search = execute_search(
+            conn, "изолированная проверка", project=project_b, vector=None, limit=5,
+        )
+        assert len(a_search["results"]) == 1
+        assert a_search["results"][0]["text"] == message[2]
+        assert b_search["results"] == []
+        with pytest.raises(SearchError, match="Telegram source or topic does not exist"):
+            execute_search(
+                conn, "изолированная проверка", project=project_b, vector=None,
+                limit=5, source_id=f"telegram:{chat_id}:topic:1",
+            )

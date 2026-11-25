@@ -2157,21 +2157,20 @@ class Broker:
         saved_argv = json.loads(row['argv'])
         project = self._argv_project(saved_argv)
         static_entry = self.sources.get(row['source'])
-        if isinstance(static_entry, dict) and static_entry.get('project') == project:
-            entry, fingerprint, chat, topic = self.source(row['source'])
-        else:
-            if isinstance(static_entry, dict):
-                registered = self.db.execute(
-                    'SELECT 1 FROM managed_sources WHERE owner=? AND source=? AND project=?',
-                    (owner, row['source'], project),
-                ).fetchone()
-                if registered is None:
-                    raise Refused('SOURCE_REVISION_CHANGED')
+        registered = self.db.execute(
+            'SELECT 1 FROM managed_sources WHERE owner=? AND source=? AND project=?',
+            (owner, row['source'], project),
+        ).fetchone()
+        if registered is not None:
             entry, fingerprint, parsed = self._managed_source_entry(owner, row['source'], project)
             if isinstance(parsed, tuple):
                 chat, topic = parsed
             else:
                 chat = topic = None
+        elif isinstance(static_entry, dict) and static_entry.get('project') == project:
+            entry, fingerprint, chat, topic = self.source(row['source'])
+        else:
+            raise Refused('SOURCE_REVISION_CHANGED')
         operation = row['operation']
         if operation in {'asr_pilot', 'asr_full', 'asr_embed'} and entry.get('asr_enabled') is not True:
             raise Refused('ASR_NOT_ENABLED')
@@ -2219,19 +2218,35 @@ class Broker:
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'search':
             argv = json.loads(row['argv'])
+            parsed_source = parse_source_id(row['source'])
+            source_kind = (
+                parsed_source.provider if parsed_source is not None
+                else 'telegram' if telegram_topic_source(row['source']) is not None
+                else None
+            )
             if (not isinstance(argv, list) or len(argv) != 11 or argv[0] != 'search'
-                    or argv[2:4] != ['--project', entry['project']]
-                    or argv[4] != '--limit' or argv[6:8] != ['--source-kind', 'telegram']
+                    or source_kind is None
+                    or not isinstance(project, str) or entry.get('project') != project
+                    or argv[2:4] != ['--project', project]
+                    or argv[4] != '--limit' or argv[6:8] != ['--source-kind', source_kind]
                     or argv[8:10] != ['--source-id', row['source']] or argv[10] != '--json'):
+                raise Refused('SOURCE_REVISION_CHANGED')
+            query = argv[1]
+            if (not isinstance(query, str) or not query or query != query.strip()
+                    or len(query) > SEARCH_MAX_QUERY_CHARS
+                    or any(ord(char) < 32 or ord(char) == 127 for char in query)
+                    or query.lstrip().startswith('-')):
                 raise Refused('SOURCE_REVISION_CHANGED')
             try:
                 limit = int(argv[5])
             except (TypeError, ValueError):
                 raise Refused('SOURCE_REVISION_CHANGED') from None
+            if not 1 <= limit <= SEARCH_MAX_LIMIT or str(limit) != argv[5]:
+                raise Refused('SOURCE_REVISION_CHANGED')
             current = search_fingerprint(
-                row['source'], entry['project'], argv[1].strip(), limit
+                row['source'], project, query, limit
             )
-            if current != expected_fingerprint:
+            if self._base_fingerprint(expected_fingerprint) != current:
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'embed':
             if (

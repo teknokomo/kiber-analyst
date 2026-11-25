@@ -358,6 +358,44 @@ def test_v2_upgrade_recovers_schedule_owner_by_event_sequence_and_restores_backu
     assert store.get(job.id).next_run_at == target
 
 
+def test_v3_to_v4_upgrade_and_rollback_snapshot_preserve_only_prebackup_jobs(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    before_upgrade, _ = create_job(store, key="v3-before-upgrade")
+    with store.transaction() as db:
+        db.execute("DROP TABLE cancelled_idempotency_keys")
+        db.execute("PRAGMA user_version=3")
+
+    backup = store.backups_dir / "pre-v4-test.sqlite3"
+    with sqlite3.connect(store.db_path) as source, sqlite3.connect(backup) as target:
+        source.backup(target)
+    backup.chmod(0o600)
+    with sqlite3.connect(backup) as snapshot:
+        assert snapshot.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert snapshot.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert snapshot.execute("SELECT id FROM jobs").fetchone()[0] == before_upgrade.id
+
+    store.initialize()
+    with store.connect() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.execute("SELECT id FROM jobs").fetchone()[0] == before_upgrade.id
+
+    after_backup, _ = create_job(store, key="created-after-v4-backup")
+    store.restore_from_backup(backup)
+    with store.connect() as db:
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        job_ids = {row[0] for row in db.execute("SELECT id FROM jobs")}
+        assert before_upgrade.id in job_ids
+        assert after_backup.id not in job_ids
+
+    store.initialize()
+    with store.connect() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert {row[0] for row in db.execute("SELECT id FROM jobs")} == {before_upgrade.id}
+
+
 def test_cancel_by_idempotency_key_tombstones_unsubmitted_broker_job(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     request_id = str(uuid.uuid4())

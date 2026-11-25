@@ -23,6 +23,9 @@ versions did not record a reschedule equal to a provider wait, so that historica
 operator intent cannot be recovered: such a wait is treated as provider-owned.
 Operators should review and reapply those schedules before a profile reset.
 Older workers reject newer queue schemas; take a pre-upgrade backup before upgrading.
+For a coordinated worker/broker upgrade and rollback, including the v4 queue,
+backup validation, job reconciliation, and mixed-runtime prohibition, see
+[`docs/ops/queue-v4-upgrade-rollback.md`](ops/queue-v4-upgrade-rollback.md).
 
 Scheduled submission and schedule changes require the worker's operator
 identity. Ordinary callers cannot set a deadline or start time and cannot use

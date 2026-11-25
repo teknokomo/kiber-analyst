@@ -526,6 +526,116 @@ def test_telegram_dry_run_retry_keeps_the_dry_run_fingerprint_and_flag(
     assert "--dry-run" in submitted[-1][1]
 
 
+def test_managed_telegram_retry_prefers_registration_over_static_source(
+    control, tmp_path,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    _telegram_export(tmp_path)
+    app.sources[TELEGRAM_SOURCE] = {
+        "project": PROJECT,
+        "hashes": {name: "0" * 64 for name in broker.CONTROLS},
+    }
+    app.handle("client", "source-add", TELEGRAM_SOURCE, PROJECT)
+    first = app.handle("client", "ingest-dry-run", TELEGRAM_SOURCE, PROJECT)
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    retried = app.handle("client", "retry", first["request_id"])
+
+    assert retried["attempt"] == 2
+    assert submitted[-1][1] == submitted[-2][1]
+    assert "--dry-run" in submitted[-1][1]
+
+
+def test_managed_telegram_retry_rejects_changed_export_with_static_source(
+    control, tmp_path,
+):
+    app, _projects, jobs, _submitted, _api_calls = control
+    export = _telegram_export(tmp_path)
+    app.sources[TELEGRAM_SOURCE] = {"project": PROJECT}
+    app.handle("client", "source-add", TELEGRAM_SOURCE, PROJECT)
+    first = app.handle("client", "ingest", TELEGRAM_SOURCE, PROJECT)
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+    messages = export / "messages.jsonl"
+    messages.write_bytes(messages.read_bytes().replace(b"prepared message", b"changed message"))
+
+    with pytest.raises(broker.Refused, match="HASH_MISMATCH"):
+        app.handle("client", "retry", first["request_id"])
+
+
+@pytest.mark.parametrize(
+    ("source_id", "provider"),
+    [
+        ("github:example-org/example-repo", "github"),
+        ("gitlab:gitlab.com/example-group/example-project", "gitlab"),
+        ("gitverse:example-org/example-repo", "gitverse"),
+        (TELEGRAM_SOURCE, "telegram"),
+    ],
+)
+def test_managed_search_retry_preserves_source_provider_project_query_and_limit(
+    control, tmp_path, monkeypatch, source_id, provider,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    if provider == "telegram":
+        _telegram_export(tmp_path)
+    app.handle("client", "source-add", source_id, PROJECT)
+    first = app.handle("client", "search-source", source_id, PROJECT, "two word query", "7")
+    assert first["error_code"] == "SEARCH_PENDING"
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    retried = app.handle("client", "retry", first["request_id"])
+
+    assert retried["attempt"] == 2
+    assert submitted[-1][1] == submitted[-2][1]
+    assert submitted[-1][1][1] == "two word query"
+    assert submitted[-1][1][3] == PROJECT
+    assert submitted[-1][1][5] == "7"
+    assert submitted[-1][1][7] == provider
+    assert submitted[-1][1][9] == source_id
+
+
+@pytest.mark.parametrize(
+    ("index", "replacement"),
+    [
+        (1, "changed query"),
+        (3, "foreign-project"),
+        (5, "8"),
+        (7, "gitlab"),
+        (9, "github:other/repository"),
+    ],
+)
+def test_managed_search_retry_rejects_tampered_saved_parameters(
+    control, monkeypatch, index, replacement,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    source_id = "github:example-org/example-repo"
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    app.handle("client", "source-add", source_id, PROJECT)
+    first = app.handle("client", "search-source", source_id, PROJECT, "two word query", "7")
+    row = app.row("client", first["request_id"])
+    argv = json.loads(row["argv"])
+    argv[index] = replacement
+    with app.db:
+        app.db.execute("UPDATE requests SET argv=? WHERE id=?", (json.dumps(argv), row["id"]))
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    with pytest.raises(broker.Refused):
+        app.handle("client", "retry", first["request_id"])
+    assert len(submitted) == 1
+
+
 def test_search_result_retrieves_completed_project_and_source_searches(
     control, monkeypatch,
 ):
