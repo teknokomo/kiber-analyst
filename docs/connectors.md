@@ -9,8 +9,9 @@ reviews, labels, or merges, and they never scrape HTML.
 Each ingest is one worker operation (`external_ingest`) with four stages:
 
 1. **discover** — list discussions (no comment text is downloaded yet).
-2. **fetch** — download thread bodies, comments, reviews, review comments, and
-   timeline events. Raw upstream responses are written to the job directory.
+2. **fetch** — download thread bodies, comments, reviews, review comments
+   (where the provider exposes them), and timeline events. Raw upstream
+   responses are written to the job directory.
 3. **normalize** — offline, deterministic conversion to `threads.jsonl`,
    `items.jsonl`, and `manifest.json`.
 4. **load** — one PostgreSQL transaction upserting sources, documents, and
@@ -40,11 +41,29 @@ The manifest records `source_id`, `provider`, `snapshot_sha256`, counts
 |---|---|---|
 | GitHub | issues, pull requests, discussions (GraphQL) | body, comment, review, review comment, reply, timeline events (last 200 in `documents.meta.events`) |
 | GitLab | issues, merge requests | body, note, discussion note, diff note (position), system note as event |
-| GitVerse | issues, pull requests | body, comment, review, review comment, timeline events |
+| GitVerse | issues, pull requests | body, comment, review, timeline events; inline review comments are **not readable** through the Public API (see below) |
 
 GitHub REST `/issues` also returns pull requests; PR entries are excluded from
 the issue list by the `pull_request` marker, so an issue and a PR are never
 duplicated. The same rule applies to GitVerse.
+
+### GitVerse inline review comments
+
+The GitVerse Public API exposes a `review_comments` count on a pull request and
+`GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews`, but it has **no
+readable inline review-comment collection**. In OpenAPI 1.12.0 the
+`/repos/{owner}/{repo}/pulls/{pull_number}/comments` path only has `POST`;
+there is no `GET`. The API answers a read attempt with `400 VALIDATION_ERROR`,
+not `403`, so a read-only token is not the cause. Discussion comments remain
+available through `GET /repos/{owner}/{repo}/issues/{issue_number}/comments`.
+
+When a pull request has `review_comments` greater than zero and the inline text
+cannot be fetched, the connector keeps the rest of the thread, records the
+unsupported endpoint without exposing tokens, and marks the thread incomplete.
+The run is `partial` with `incomplete_thread`; it is not reported as `done`.
+Historical inline review comments can only be obtained through a future
+GitVerse API change or captured going forward through webhooks; do not scrape
+HTML and do not weaken the completeness rule.
 
 ## Incremental sync and checkpoints
 
@@ -69,8 +88,9 @@ duplicated. The same rule applies to GitVerse.
 
 ## Conditional endpoint support
 
-When a specific endpoint answers `404` or `501` (for example GitHub Discussions
-without a GraphQL-capable token, or a GitVerse review-comment endpoint), the
+When a specific endpoint answers `404` or `501`, or is unavailable by contract
+(for example GitHub Discussions without a GraphQL-capable token, or GitVerse
+returning `400` because inline review comments have no `GET` method), the
 connector records `unsupported` with the exact method and status, keeps the
 rest of the thread, and never substitutes HTML scraping or reports a partial
 result as complete. GitHub Issues/PRs continue to work when Discussions are

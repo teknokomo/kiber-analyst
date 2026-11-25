@@ -29,8 +29,15 @@ kiber-analyst gitverse ingest --repo owner/repo --project <project> --since 2026
 
 Expected: exit code 0 and `status` = `done`, or `partial` with an explicit
 `partial_reasons` entry (for example `partial_discovery` when the token lacks
-GraphQL Discussions). `failed` with `AUTH_REQUIRED` means the token is missing;
-`AUTH_FORBIDDEN` means the token has no access to the repository.
+GraphQL Discussions, or `incomplete_thread` when a GitVerse pull request has
+inline review comments that the Public API cannot return). `failed` with
+`AUTH_REQUIRED` means the token is missing; `AUTH_FORBIDDEN` means the token has
+no access to the repository.
+
+GitVerse is expected to be `partial` when `review_comments > 0`: the current
+Public API has no `GET` for inline review comments, and this is not an
+authentication failure. Discussion comments, review summaries, and timeline
+events are still ingested.
 
 ## 2. Source status per provider
 
@@ -40,7 +47,10 @@ kiber-analyst external status --source github:owner/repo --project <project>
 
 Expected counts: `threads`, `items`, `comments`, `reviews`, `review_comments`,
 `replies`, `events`, `threads_open`, `threads_closed_or_merged`,
-`nonempty_items`, `embeddings` (embeddings only after step 3).
+`nonempty_items`, `embeddings` (embeddings only after step 3). On GitVerse,
+`review_comments` is `0` even when the upstream pull-request object reports a
+non-zero counter, because inline review comments are not readable through the
+current Public API.
 
 ## 3. Embeddings and search
 
