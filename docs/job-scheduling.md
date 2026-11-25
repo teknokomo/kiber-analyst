@@ -11,7 +11,16 @@ The `set-deadline` action accepts an absolute deadline and cannot shorten the
 current deadline or exceed the 72-hour per-job limit. The `reschedule` action
 can move only queued or waiting jobs. It changes only the job's next start time;
 provider cooldown and quota state are left intact. Repeating either action with
-the same absolute value is idempotent.
+the same absolute value is idempotent. A reschedule also makes that time
+operator-owned when it equals an existing provider wait; resetting a profile
+preserves operator-owned times but releases provider-owned waits.
+
+Queue schema v3 persists schedule ownership. During upgrade, existing ownership
+is reconstructed from the latest relevant event by sequence number. Earlier
+versions did not record a reschedule equal to a provider wait, so that historical
+operator intent cannot be recovered: such a wait is treated as provider-owned.
+Operators should review and reapply those schedules before a profile reset.
+Older workers reject v3 queues; take a pre-upgrade backup before upgrading.
 
 Scheduled submission and schedule changes require the worker's operator
 identity. Ordinary callers cannot set a deadline or start time and cannot use

@@ -156,6 +156,25 @@ def test_profile_reset_clears_provider_wait_but_preserves_later_operator_schedul
     assert store.claim() is None
 
 
+@pytest.mark.parametrize("same_time", [True, False])
+def test_reset_preserves_explicit_reschedule_even_when_events_are_ambiguous(tmp_path: Path, same_time: bool) -> None:
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    job = make_job(store)
+    assert store.claim().id == job.id
+    wait = iso_utc(utc_now() + timedelta(hours=1))
+    from kiber_analyst.jobqueue import parse_utc
+    store.postpone(job.id, "waiting_quota", parse_utc(wait), {"reason": "all_profiles_disabled"})
+    target = wait if same_time else iso_utc(utc_now() + timedelta(hours=2))
+    store.reschedule(job.id, target)
+    with store.transaction() as db:
+        db.execute("UPDATE job_events SET at='2026-01-01T00:00:00Z' WHERE job_id=?", (job.id,))
+    worker.reset_profile("profile_a")
+    assert store.get(job.id).next_run_at == target
+    assert store.claim() is None
+
+
 def test_asr_worker_continues_after_one_permanent_file_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

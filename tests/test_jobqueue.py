@@ -288,6 +288,7 @@ def test_queue_initialization_rejects_symlinked_database(tmp_path: Path) -> None
 
 def _downgrade_test_queue_to_v1(store: JobStore) -> None:
     with store.transaction() as db:
+        db.execute("ALTER TABLE jobs DROP COLUMN schedule_owner")
         db.execute("DROP VIEW quota_ledger")
         db.execute("DROP TABLE quota_events")
         db.execute("DROP TABLE interactive_attempts")
@@ -304,7 +305,7 @@ def test_sqlite_v1_migration_is_repeatable_and_preserves_jobs(tmp_path: Path) ->
     store.initialize()
 
     with store.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert db.execute("SELECT id FROM jobs").fetchone()[0] == job.id
         assert db.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN "
@@ -315,7 +316,7 @@ def test_sqlite_v1_migration_is_repeatable_and_preserves_jobs(tmp_path: Path) ->
         ).fetchone()[0] == 1
 
 
-def test_v1_backup_restore_can_be_upgraded_to_v2(tmp_path: Path) -> None:
+def test_v1_backup_restore_can_be_upgraded_to_v3(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     job, _ = create_job(store, key="restore-v1")
     _downgrade_test_queue_to_v1(store)
@@ -331,8 +332,29 @@ def test_v1_backup_restore_can_be_upgraded_to_v2(tmp_path: Path) -> None:
 
     store.initialize()
     with store.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert db.execute("SELECT id FROM jobs").fetchone()[0] == job.id
+
+
+def test_v2_upgrade_recovers_schedule_owner_by_event_sequence_and_restores_backup(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    job, _ = create_job(store, key="legacy")
+    assert store.claim() is not None
+    store.postpone(job.id, "waiting_quota", utc_now() + timedelta(hours=1), {"reason": "all_profiles_disabled"})
+    target = iso_utc(utc_now() + timedelta(hours=2))
+    store.reschedule(job.id, target)
+    with store.transaction() as db:
+        db.execute("UPDATE job_events SET at='2026-01-01T00:00:00Z' WHERE job_id=?", (job.id,))
+        db.execute("ALTER TABLE jobs DROP COLUMN schedule_owner")
+        db.execute("PRAGMA user_version=2")
+    store.initialize()
+    store.initialize()
+    with store.connect() as db:
+        assert db.execute("SELECT schedule_owner FROM jobs WHERE id=?", (job.id,)).fetchone()[0] == "operator"
+    backup = store.backup(pre_upgrade=True)
+    store.restore_from_backup(backup)
+    store.initialize()
+    assert store.get(job.id).next_run_at == target
 
 
 def test_interactive_restart_audits_uncertain_quota_and_abandons_request(

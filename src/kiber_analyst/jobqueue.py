@@ -333,7 +333,7 @@ class JobStore:
         with self._write_lock, self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             current_version = int(db.execute("PRAGMA user_version").fetchone()[0])
-            if current_version > 2:
+            if current_version > 3:
                 raise JobsError("Queue schema is newer than this worker supports")
             from kiber_analyst.gemini_quota import SCHEMA as GEMINI_QUOTA_SCHEMA
 
@@ -348,6 +348,24 @@ class JobStore:
                         + QUEUE_SCHEMA_V2
                         + "\nPRAGMA user_version=2;\nCOMMIT;"
                     )
+                except sqlite3.Error:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise
+            if current_version <= 2:
+                try:
+                    db.executescript("""BEGIN IMMEDIATE;
+                        ALTER TABLE jobs ADD COLUMN schedule_owner TEXT NOT NULL DEFAULT 'provider'
+                          CHECK(schedule_owner IN ('operator','provider'));
+                        UPDATE jobs SET schedule_owner='operator'
+                        WHERE next_run_at IS NOT NULL AND (
+                          SELECT kind FROM job_events
+                          WHERE job_id=jobs.id AND kind IN
+                            ('scheduled','rescheduled','waiting_quota','waiting_retry')
+                          ORDER BY seq DESC LIMIT 1
+                        ) IN ('scheduled','rescheduled');
+                        PRAGMA user_version=3;
+                        COMMIT;""")
                 except sqlite3.Error:
                     if db.in_transaction:
                         db.rollback()
@@ -451,8 +469,8 @@ class JobStore:
                 db.execute(
                     """INSERT INTO jobs
                        (id,operation,command_json,fingerprint,idempotency_key,state,priority,
-                        created_at,updated_at,deadline_at,next_run_at)
-                       VALUES(?,?,?,?,?,'queued',?,?,?,?,?)
+                        created_at,updated_at,deadline_at,next_run_at,schedule_owner)
+                       VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)
                        ON CONFLICT(idempotency_key) DO NOTHING""",
                     (
                         job_id,
@@ -465,6 +483,7 @@ class JobStore:
                         iso_utc(now),
                         iso_utc(deadline),
                         iso_utc(scheduled) if scheduled else None,
+                        "operator" if scheduled else "provider",
                     ),
                 )
                 inserted_row = db.execute(
@@ -719,7 +738,7 @@ class JobStore:
                 result = None
             else:
                 updated = db.execute(
-                    "UPDATE jobs SET state='running',updated_at=?,next_run_at=NULL WHERE id=? AND state=?",
+                    "UPDATE jobs SET state='running',updated_at=?,next_run_at=NULL,schedule_owner='provider' WHERE id=? AND state=?",
                     (now, row["id"], row["state"]),
                 )
                 if updated.rowcount != 1:
@@ -897,7 +916,7 @@ class JobStore:
             raise JobsError("Invalid wait state")
         with self.transaction() as db:
             db.execute(
-                """UPDATE jobs SET state=?,next_run_at=?,diagnostic_json=?,updated_at=?
+                """UPDATE jobs SET state=?,next_run_at=?,schedule_owner='provider',diagnostic_json=?,updated_at=?
                    WHERE id=? AND state='running'""",
                 (state, iso_utc(next_run_at), canonical_json(diagnostic), iso_utc(), job_id),
             )
@@ -1043,7 +1062,7 @@ class JobStore:
             try:
                 integrity=source.execute("PRAGMA integrity_check").fetchone()
                 version=int(source.execute("PRAGMA user_version").fetchone()[0])
-                if not integrity or integrity[0]!="ok" or version not in {1,2}:
+                if not integrity or integrity[0]!="ok" or version not in {1,2,3}:
                     raise JobsError("Queue backup failed integrity or schema-version validation")
                 temporary=self.db_path.with_name("queue.db.restore.tmp")
                 target=sqlite3.connect(temporary)
@@ -1145,12 +1164,14 @@ class JobStore:
                 raise JobsError("Only queued or waiting jobs can be rescheduled")
             current = parse_utc(row["next_run_at"]) if row["next_run_at"] else None
             if scheduled == current:
+                if row["schedule_owner"] != "operator":
+                    db.execute("UPDATE jobs SET schedule_owner='operator' WHERE id=?", (job_id,))
                 return self._record(row)
             deadline = parse_utc(row["deadline_at"])
             if not now <= scheduled < deadline:
                 raise JobsError("Next run time must be before the deadline")
             db.execute(
-                "UPDATE jobs SET next_run_at=?,updated_at=? WHERE id=?",
+                "UPDATE jobs SET next_run_at=?,schedule_owner='operator',updated_at=? WHERE id=?",
                 (iso_utc(scheduled), iso_utc(now), job_id),
             )
             self.event(db, job_id, "rescheduled", {"next_run_at": iso_utc(scheduled)})

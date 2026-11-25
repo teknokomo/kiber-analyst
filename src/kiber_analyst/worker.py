@@ -430,37 +430,11 @@ class JobWorker:
                 found=True
             if not found:
                 raise JobsError("Profile is not referenced by a routing pool")
-            # Release provider-disabled waits, but keep a later operator
-            # schedule. A reschedule after the last provider wait owns
-            # next_run_at; otherwise it is only the provider cooldown.
+            # Only provider-owned waits are released by a profile reset.
             db.execute(
-                """UPDATE jobs AS j SET state='queued',updated_at=?
-                   WHERE j.state='waiting_quota' AND j.diagnostic_json LIKE ?
-                     AND EXISTS (
-                       SELECT 1 FROM job_events scheduled
-                       WHERE scheduled.job_id=j.id
-                         AND scheduled.kind IN ('scheduled','rescheduled')
-                         AND scheduled.at > COALESCE((
-                           SELECT max(waited.at) FROM job_events waited
-                           WHERE waited.job_id=j.id
-                             AND waited.kind IN ('waiting_quota','waiting_retry')
-                         ), '')
-                     )""",
-                (iso_utc(now),'%"reason":"all_profiles_disabled"%'),
-            )
-            db.execute(
-                """UPDATE jobs AS j SET state='queued',next_run_at=NULL,updated_at=?
-                   WHERE j.state='waiting_quota' AND j.diagnostic_json LIKE ?
-                     AND NOT EXISTS (
-                       SELECT 1 FROM job_events scheduled
-                       WHERE scheduled.job_id=j.id
-                         AND scheduled.kind IN ('scheduled','rescheduled')
-                         AND scheduled.at > COALESCE((
-                           SELECT max(waited.at) FROM job_events waited
-                           WHERE waited.job_id=j.id
-                             AND waited.kind IN ('waiting_quota','waiting_retry')
-                         ), '')
-                     )""",
+                """UPDATE jobs SET state='queued',
+                   next_run_at=CASE WHEN schedule_owner='operator' THEN next_run_at ELSE NULL END,
+                   updated_at=? WHERE state='waiting_quota' AND diagnostic_json LIKE ?""",
                 (iso_utc(now),'%"reason":"all_profiles_disabled"%'),
             )
         return {"profile":profile,"reset":True}
