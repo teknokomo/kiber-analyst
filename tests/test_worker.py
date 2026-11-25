@@ -112,6 +112,49 @@ def test_project_catalog_is_fixed_and_worker_only(tmp_path: Path, monkeypatch) -
         worker.handle(0, {"action": "project-catalog", "mode": "list", "path": "/tmp"})
 
 
+def test_root_control_does_not_require_media_account_lookup(tmp_path: Path, monkeypatch) -> None:
+    from kiber_analyst import project_catalog
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    monkeypatch.setattr(project_catalog, "list_projects", lambda: [])
+
+    def missing_account(_name):
+        raise KeyError("media")
+
+    monkeypatch.setattr("kiber_analyst.worker.pwd.getpwnam", missing_account)
+    assert worker.handle(0, {"action": "project-catalog", "mode": "list"}) == {
+        "projects": [],
+    }
+    with pytest.raises(JobsError, match="requires the media worker identity"):
+        worker.handle(1001, {"action": "project-catalog", "mode": "list"})
+
+
+def test_worker_cancels_broker_submission_by_idempotency_key(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    request_id = str(uuid.uuid4())
+    key = f"broker:{request_id}:1"
+
+    cancelled = worker.handle(0, {
+        "action": "cancel-idempotency", "idempotency_key": key,
+    })
+    assert cancelled == {
+        "found": False, "job_id": None, "state": "cancelled",
+        "cancel_requested": False,
+    }
+    with pytest.raises(JobsError, match="Invalid submission cancellation request"):
+        worker.handle(0, {
+            "action": "cancel-idempotency", "idempotency_key": key, "path": "/tmp",
+        })
+    with pytest.raises(JobsError, match="requires the media worker identity"):
+        worker.handle(1001, {
+            "action": "cancel-idempotency", "idempotency_key": f"broker:{uuid.uuid4()}:1",
+        })
+
+
 def test_scheduled_submit_and_schedule_control_require_operator_identity(
     tmp_path: Path,
 ) -> None:

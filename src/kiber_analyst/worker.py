@@ -89,6 +89,15 @@ def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _is_media_or_root(uid: int) -> bool:
+    if uid == 0:
+        return True
+    try:
+        return uid == pwd.getpwnam("media").pw_uid
+    except KeyError:
+        return False
+
+
 def _private_json(path: Path, value: Any) -> str:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent,0o700)
@@ -263,13 +272,13 @@ class JobWorker:
     def handle(self,uid:int,request:dict[str,Any]) -> dict[str,Any]:
         action=request.get("action")
         if action=="query-embedding":
-            if uid not in {0,pwd.getpwnam("media").pw_uid}:
+            if not _is_media_or_root(uid):
                 raise JobsError("Interactive embeddings require the media worker identity")
             return self.query_embedding(request)
         if action=="submit":
             return self.submit(request,uid=uid)
         if action=="project-catalog":
-            if uid not in {0,pwd.getpwnam("media").pw_uid}:
+            if not _is_media_or_root(uid):
                 raise JobsError("Project catalog requires the media worker identity")
             mode=request.get("mode")
             if mode=="list" and set(request)=={"action","mode"}:
@@ -286,6 +295,12 @@ class JobWorker:
                     request.get("owner"),request.get("request_key"),
                 )
             raise JobsError("Invalid project catalog request")
+        if action=="cancel-idempotency":
+            if not _is_media_or_root(uid):
+                raise JobsError("Submission cancellation requires the media worker identity")
+            if set(request)!={"action","idempotency_key"}:
+                raise JobsError("Invalid submission cancellation request")
+            return self.store.cancel_by_idempotency_key(request.get("idempotency_key"))
         if action in {"set-deadline","reschedule"}:
             self._require_root(uid)
             job_id=str(request.get("job_id",""))
@@ -344,7 +359,7 @@ class JobWorker:
             pre_upgrade=bool(request.get("pre_upgrade",False))
             if pre_upgrade:
                 self._require_root(uid)
-            elif uid not in {0,pwd.getpwnam("media").pw_uid}:
+            elif not _is_media_or_root(uid):
                 raise JobsError("This control operation requires media or root")
             path=self.store.backup(pre_upgrade=pre_upgrade)
             return {"backup_path":str(path)}
@@ -362,7 +377,7 @@ class JobWorker:
                 raise JobsError("profile is required")
             return self.reset_profile(profile)
         if action in {"queue-overview", "provider-overview", "provider-probe", "job-log"}:
-            if uid not in {0, pwd.getpwnam("media").pw_uid}:
+            if not _is_media_or_root(uid):
                 raise JobsError("Queue overview requires media or root")
             from kiber_analyst.queue_overview import health, job_log
 
@@ -385,7 +400,7 @@ class JobWorker:
                 return job_log(self.store, request.get("job_id"), request.get("limit"))
             return health(self.store, providers_only=action == "provider-overview")
         if action in {"source-overview", "asr-source-overview"}:
-            if uid not in {0, pwd.getpwnam("media").pw_uid}:
+            if not _is_media_or_root(uid):
                 raise JobsError("Source overview requires media or root")
 
             try:

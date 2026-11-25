@@ -34,6 +34,9 @@ JOB_STATES = {
     "cancelled",
 }
 TERMINAL_STATES = frozenset({"done", "failed", "timed_out", "cancelled"})
+_BROKER_IDEMPOTENCY_KEY = re.compile(
+    r"\Abroker:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[1-3]\Z"
+)
 
 
 class JobsError(IngestError):
@@ -257,6 +260,13 @@ CREATE VIEW IF NOT EXISTS quota_ledger AS
     FROM quota_events;
 """
 
+QUEUE_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS cancelled_idempotency_keys (
+  idempotency_key TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL
+);
+"""
+
 
 @dataclass(frozen=True)
 class JobRecord:
@@ -333,7 +343,7 @@ class JobStore:
         with self._write_lock, self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             current_version = int(db.execute("PRAGMA user_version").fetchone()[0])
-            if current_version > 3:
+            if current_version > 4:
                 raise JobsError("Queue schema is newer than this worker supports")
             from kiber_analyst.gemini_quota import SCHEMA as GEMINI_QUOTA_SCHEMA
 
@@ -366,6 +376,17 @@ class JobStore:
                         ) IN ('scheduled','rescheduled');
                         PRAGMA user_version=3;
                         COMMIT;""")
+                except sqlite3.Error:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise
+            if current_version <= 3:
+                try:
+                    db.executescript(
+                        "BEGIN IMMEDIATE;\n"
+                        + QUEUE_SCHEMA_V4
+                        + "\nPRAGMA user_version=4;\nCOMMIT;"
+                    )
                 except sqlite3.Error:
                     if db.in_transaction:
                         db.rollback()
@@ -432,6 +453,12 @@ class JobStore:
         ).hexdigest()
         with self.transaction() as db:
             def insert_job(job_key: str) -> tuple[sqlite3.Row, bool]:
+                cancelled = db.execute(
+                    "SELECT 1 FROM cancelled_idempotency_keys WHERE idempotency_key=?",
+                    (job_key,),
+                ).fetchone()
+                if cancelled is not None:
+                    raise JobsError("Job submission was cancelled")
                 existing = db.execute(
                     "SELECT * FROM jobs WHERE idempotency_key=?", (job_key,)
                 ).fetchone()
@@ -959,6 +986,34 @@ class JobStore:
             return self.get(job_id)
         return self.get(job_id)
 
+    def cancel_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any]:
+        """Cancel a broker submission or tombstone it before it is submitted."""
+        if (not isinstance(idempotency_key, str)
+                or _BROKER_IDEMPOTENCY_KEY.fullmatch(idempotency_key) is None):
+            raise JobsError("Invalid broker idempotency key")
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT id FROM jobs WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if row is None:
+                cursor = db.execute(
+                    "INSERT OR IGNORE INTO cancelled_idempotency_keys"
+                    "(idempotency_key,created_at) VALUES(?,?)",
+                    (idempotency_key, iso_utc()),
+                )
+                if cursor.rowcount:
+                    self.event(db, None, "submission_cancelled", {})
+                return {
+                    "found": False, "job_id": None, "state": "cancelled",
+                    "cancel_requested": False,
+                }
+            job_id = row["id"]
+        record = self.cancel(job_id)
+        return {
+            "found": True, "job_id": record.id, "state": record.state,
+            "cancel_requested": record.cancel_requested,
+        }
+
     def cancelled(self, job_id: str) -> bool:
         with self.connect() as db:
             row = db.execute("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -1062,7 +1117,7 @@ class JobStore:
             try:
                 integrity=source.execute("PRAGMA integrity_check").fetchone()
                 version=int(source.execute("PRAGMA user_version").fetchone()[0])
-                if not integrity or integrity[0]!="ok" or version not in {1,2,3}:
+                if not integrity or integrity[0]!="ok" or version not in {1,2,3,4}:
                     raise JobsError("Queue backup failed integrity or schema-version validation")
                 temporary=self.db_path.with_name("queue.db.restore.tmp")
                 target=sqlite3.connect(temporary)

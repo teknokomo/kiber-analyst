@@ -289,6 +289,7 @@ def test_queue_initialization_rejects_symlinked_database(tmp_path: Path) -> None
 def _downgrade_test_queue_to_v1(store: JobStore) -> None:
     with store.transaction() as db:
         db.execute("ALTER TABLE jobs DROP COLUMN schedule_owner")
+        db.execute("DROP TABLE IF EXISTS cancelled_idempotency_keys")
         db.execute("DROP VIEW quota_ledger")
         db.execute("DROP TABLE quota_events")
         db.execute("DROP TABLE interactive_attempts")
@@ -305,7 +306,7 @@ def test_sqlite_v1_migration_is_repeatable_and_preserves_jobs(tmp_path: Path) ->
     store.initialize()
 
     with store.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert db.execute("SELECT id FROM jobs").fetchone()[0] == job.id
         assert db.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN "
@@ -316,7 +317,7 @@ def test_sqlite_v1_migration_is_repeatable_and_preserves_jobs(tmp_path: Path) ->
         ).fetchone()[0] == 1
 
 
-def test_v1_backup_restore_can_be_upgraded_to_v3(tmp_path: Path) -> None:
+def test_v1_backup_restore_can_be_upgraded_to_v4(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     job, _ = create_job(store, key="restore-v1")
     _downgrade_test_queue_to_v1(store)
@@ -332,7 +333,7 @@ def test_v1_backup_restore_can_be_upgraded_to_v3(tmp_path: Path) -> None:
 
     store.initialize()
     with store.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert db.execute("SELECT id FROM jobs").fetchone()[0] == job.id
 
 
@@ -355,6 +356,52 @@ def test_v2_upgrade_recovers_schedule_owner_by_event_sequence_and_restores_backu
     store.restore_from_backup(backup)
     store.initialize()
     assert store.get(job.id).next_run_at == target
+
+
+def test_cancel_by_idempotency_key_tombstones_unsubmitted_broker_job(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    request_id = str(uuid.uuid4())
+    key = f"broker:{request_id}:1"
+
+    cancelled = store.cancel_by_idempotency_key(key)
+    assert cancelled == {
+        "found": False, "job_id": None, "state": "cancelled",
+        "cancel_requested": False,
+    }
+    with store.connect() as db:
+        assert db.execute(
+            "SELECT count(*) FROM cancelled_idempotency_keys WHERE idempotency_key=?",
+            (key,),
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT count(*) FROM job_events WHERE job_id IS NULL AND kind='submission_cancelled'"
+        ).fetchone()[0] == 1
+
+    with pytest.raises(JobsError, match="submission was cancelled"):
+        store.create_job(
+            operation="search", command={"query": "safe"}, fingerprint="a" * 64,
+            idempotency_key=key,
+        )
+    assert store.cancel_by_idempotency_key(key)["found"] is False
+
+
+def test_cancel_by_idempotency_key_cancels_existing_job(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    key = f"broker:{uuid.uuid4()}:2"
+    job, created = store.create_job(
+        operation="search", command={"query": "safe"}, fingerprint="b" * 64,
+        idempotency_key=key,
+    )
+    assert created is True
+
+    result = store.cancel_by_idempotency_key(key)
+    assert result == {
+        "found": True, "job_id": job.id, "state": "cancelled",
+        "cancel_requested": False,
+    }
+    assert store.claim() is None
+    with pytest.raises(JobsError, match="Invalid broker idempotency key"):
+        store.cancel_by_idempotency_key("arbitrary-key")
 
 
 def test_interactive_restart_audits_uncertain_quota_and_abandons_request(

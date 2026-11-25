@@ -31,6 +31,8 @@ CONFIG = config_path("sources.json")
 PROJECT_ACCESS = config_path("project-access.json")
 SOCKET = runtime_path("broker.sock")
 CONTROLS = ('messages.jsonl', 'services.jsonl', 'manifest.json')
+CONTROL_FILE_MAX_BYTES = 32 * 1024**2
+SERVICES_MANIFEST_MAX_BYTES = 1024**2
 TERMINAL = {'done', 'failed', 'timed_out', 'cancelled'}
 ACTIVE = {'queued', 'running', 'waiting_retry', 'waiting_quota', 'submitting'}
 COMMANDS = {'ingest', 'embed', 'retry', 'job-status', 'job-list', 'job-logs',
@@ -38,7 +40,7 @@ COMMANDS = {'ingest', 'embed', 'retry', 'job-status', 'job-list', 'job-logs',
             'cancel', 'reindex', 'audit-log', 'renew-embed', 'search', 'asr',
             'asr-status', 'embed-asr', 'capabilities', 'project-list',
             'project-create', 'source-list', 'source-add', 'ingest-dry-run',
-            'search-source', 'search-project'}
+            'search-source', 'search-project', 'search-result'}
 TRANSIENT = {'transient_database_error', 'server_error', 'network_error',
              'request_timeout', 'network_timeout'}
 COUNTS = {'inserted', 'updated', 'skipped', 'absent', 'media_missing',
@@ -356,10 +358,11 @@ class Broker:
         self.root = root
         self.sources = sources
         self.authorized_projects = set(authorized_projects or ())
-        self.authorized_projects.update(
-            entry['project'] for entry in sources.values()
+        self.legacy_source_projects = {
+            source_id: entry['project']
+            for source_id, entry in sources.items()
             if isinstance(entry, dict) and isinstance(entry.get('project'), str)
-        )
+        }
         self.allow_project_create = bool(allow_project_create)
         self.worker_api = worker_api
         self.submit = submit
@@ -435,6 +438,21 @@ class Broker:
         _, chat, _, topic = source.split(':')
         return entry, fingerprint, chat, topic
 
+    @staticmethod
+    def _source_fingerprint_variants(source_id, entry):
+        compact = hashlib.sha256(
+            json.dumps(entry, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+        ).hexdigest()
+        variants = {compact}
+        if parse_source_id(source_id) is not None:
+            # The legacy static-source path used json.dumps' default spaces.
+            # Accept that exact historical identity for the same project.
+            legacy = hashlib.sha256(
+                json.dumps(entry, sort_keys=True).encode()
+            ).hexdigest()
+            variants.add(legacy)
+        return variants
+
     def _project_granted(self, owner, project):
         if project in self.authorized_projects:
             return True
@@ -444,7 +462,8 @@ class Broker:
 
     def _require_request_project(self, owner, row):
         project = self._argv_project(json.loads(row['argv']))
-        if project is not None and not self._project_granted(owner, project):
+        legacy_source_scope = self.legacy_source_projects.get(row['source']) == project
+        if project is not None and not self._project_granted(owner, project) and not legacy_source_scope:
             raise Refused('PROJECT_NOT_ALLOWED')
         return project
 
@@ -599,6 +618,11 @@ class Broker:
             if (export.chat_id != telegram_parts[0]
                     or str(export.topic_id) != telegram_parts[1]):
                 raise Refused('TELEGRAM_EXPORT_MISMATCH')
+            if (export.messages_size > CONTROL_FILE_MAX_BYTES
+                    or export.services_size > CONTROL_FILE_MAX_BYTES
+                    or export.manifest_size > CONTROL_FILE_MAX_BYTES
+                    or export.services_manifest_size > SERVICES_MANIFEST_MAX_BYTES):
+                raise Refused('TELEGRAM_EXPORT_TOO_LARGE')
             entry['hashes'] = {
                 'messages.jsonl': export.message_sha256,
                 'services.jsonl': export.service_sha256,
@@ -613,23 +637,26 @@ class Broker:
         grants = {row['project'] for row in self.db.execute(
             'SELECT project FROM project_grants WHERE owner=?', (owner,),
         )}
-        visible_projects = self.authorized_projects | grants
+        granted_projects = self.authorized_projects | grants
+        static_sources = {
+            (source_id, entry.get('project'), source_id.split(':', 1)[0])
+            for source_id, entry in self.sources.items()
+            if isinstance(entry, dict) and isinstance(entry.get('project'), str)
+        }
         if project is not None:
             if not isinstance(project, str) or SLUG_RE.fullmatch(project) is None:
                 raise Refused('INVALID_PROJECT')
-            if project not in visible_projects:
+            static_for_project = {record for record in static_sources if record[1] == project}
+            if project not in granted_projects and not static_for_project:
                 raise Refused('PROJECT_NOT_ALLOWED')
-            visible_projects = {project}
-        records = {
-            (source_id, entry.get('project'), source_id.split(':', 1)[0])
-            for source_id, entry in self.sources.items()
-            if isinstance(entry, dict) and entry.get('project') in visible_projects
-        }
+            static_sources = static_for_project
+            granted_projects = {project} if project in granted_projects else set()
+        records = set(static_sources)
         records.update(
             (row['source'], row['project'], row['provider'])
             for row in self.db.execute(
                 'SELECT source,project,provider FROM managed_sources WHERE owner=?', (owner,),
-            ) if row['project'] in visible_projects
+            ) if row['project'] in granted_projects
         )
         return {'sources': [
             {'source_id': source_id, 'project': target, 'provider': provider}
@@ -664,10 +691,10 @@ class Broker:
             stack.callback(os.close, fd)
             private(os.fstat(fd), directory=True)
             source = stack.enter_context(descend(fd, ['imports', chat, topic]))
-            data = {name: read_input(source, name) for name in CONTROLS}
+            data = {name: read_input(source, name, CONTROL_FILE_MAX_BYTES) for name in CONTROLS}
             if any(hashlib.sha256(data[n]).hexdigest() != entry['hashes'][n] for n in CONTROLS):
                 raise Refused('HASH_MISMATCH')
-            services = read_input(source, 'services_manifest.json', 1024**2)
+            services = read_input(source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES)
             service_meta = json.loads(services)
             if (service_meta.get('source_id') != source_id
                     or service_meta.get('services_sha256') != entry['hashes']['services.jsonl']
@@ -1052,7 +1079,8 @@ class Broker:
         attempt = self.db.execute('SELECT job_id FROM attempts WHERE request_id=? AND attempt=?',
                                   (row['id'], row['attempt'])).fetchone()
         if attempt is None:
-            return {'status': 'submitting', 'counts': {}, 'error_code': None,
+            unbound_state = 'cancelled' if row['state'] == 'cancelled' else 'submitting'
+            return {'status': unbound_state, 'counts': {}, 'error_code': None,
                     'attempt': row['attempt'], 'last_error_code': None,
                     'next_retry_at': None, 'profile_scope': None,
                     'retry_reason': None, 'retry_after_seconds': None,
@@ -1247,6 +1275,8 @@ class Broker:
                        since=None, limit=None, dry_run=False):
         # External sources: no staged files, the connector fetches from the API.
         provider, external_id = source_id.split(':', 1)
+        fingerprint_variants = self._source_fingerprint_variants(source_id, entry)
+        fingerprint_variants.add(fingerprint)
         if operation == 'ingest':
             if provider == 'gitlab':
                 host, project_path = external_id.split('/', 1)
@@ -1267,7 +1297,7 @@ class Broker:
                 (owner, source_id, 'ingest'),
             ).fetchall()
             ingest = next((row for row in ingests
-                           if self._base_fingerprint(row['fingerprint']) == fingerprint
+                           if self._base_fingerprint(row['fingerprint']) in fingerprint_variants
                            and self._argv_project(json.loads(row['argv'])) == entry['project']
                            and '--dry-run' not in json.loads(row['argv'])), None)
             if ingest is None or self.status(ingest)['status'] != 'done':
@@ -1281,27 +1311,32 @@ class Broker:
                WHERE owner=? AND source=? AND operation=? ORDER BY r.created DESC""",
             (owner, source_id, operation),
         ).fetchall()
+        request_fingerprint = f'{fingerprint}:dry-run' if dry_run else f'{fingerprint}:real'
+        matching_rows = []
+        active_row = None
         for row in relevant:
-            if self._base_fingerprint(row['source_fingerprint']) == fingerprint:
-                if self.status(row)['status'] not in TERMINAL:
-                    if json.loads(row['argv']) != argv:
-                        raise Refused('SOURCE_BUSY')
-                    return self.dispatch(row)
-                break
-        existing = self.db.execute(
-            'SELECT 1 FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
-            (owner, source_id, fingerprint, operation),
-        ).fetchone()
-        if existing is None:
-            request_fingerprint = fingerprint
-        else:
+            try:
+                row_project = self._argv_project(json.loads(row['argv']))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            row_argv = json.loads(row['argv'])
+            row_is_dry_run = isinstance(row_argv, list) and '--dry-run' in row_argv
+            if (self._base_fingerprint(row['source_fingerprint']) in fingerprint_variants
+                    and row_project == entry['project']
+                    and row_is_dry_run == dry_run):
+                matching_rows.append(row)
+                if row['state'] not in TERMINAL:
+                    current_status = self.status(row)
+                    if current_status['status'] not in TERMINAL and active_row is None:
+                        active_row = row
+        if active_row is not None:
+            if json.loads(active_row['argv']) != argv:
+                raise Refused('SOURCE_BUSY')
+            return self.dispatch(active_row)
+        if matching_rows:
             # Deterministic next generation: concurrent callers race on the
             # requests uniqueness constraint instead of both creating a run.
-            generation = self.db.execute(
-                'SELECT count(*) FROM requests WHERE owner=? AND source=? AND operation=?',
-                (owner, source_id, operation),
-            ).fetchone()[0]
-            request_fingerprint = f"{fingerprint}:{generation}"
+            request_fingerprint = f"{request_fingerprint}:{len(matching_rows)}"
         now = timestamp()
         request_id = str(uuid.uuid4())
         try:
@@ -1318,6 +1353,8 @@ class Broker:
             ).fetchone()
             if row is None:
                 raise Refused('SOURCE_BUSY') from None
+            if json.loads(row['argv']) != argv:
+                raise Refused('SOURCE_BUSY') from None
             return self.dispatch(row)
         return self.dispatch(self.row(owner, request_id))
 
@@ -1325,6 +1362,13 @@ class Broker:
     def _argv_project(argv):
         if not isinstance(argv, list):
             return None
+        if len(argv) >= 2 and argv[0] == 'gitlab' and argv[1] == 'ingest':
+            flag = '--project-slug'
+            try:
+                index = argv.index(flag)
+            except ValueError:
+                return None
+            return argv[index + 1] if index + 1 < len(argv) else None
         for flag in ('--project', '--project-slug'):
             try:
                 index = argv.index(flag)
@@ -1528,6 +1572,8 @@ class Broker:
         ).fetchall()
         row = None
         for candidate in matching:
+            if candidate['state'] in TERMINAL:
+                continue
             if self.status(candidate)['status'] not in TERMINAL:
                 row = candidate
                 break
@@ -1609,6 +1655,109 @@ class Broker:
                         'source_id': source_id, 'status': state or 'running',
                         'error_code': 'SEARCH_PENDING'}
             time.sleep(0.5)
+
+    def search_result(self, owner, request_id):
+        row = self.row(owner, identifier(request_id))
+        if row['operation'] not in {'search', 'project-search'}:
+            raise Refused('SEARCH_REQUEST_NOT_FOUND')
+        project = self._require_request_project(owner, row)
+        attempt = self.db.execute(
+            'SELECT job_id FROM attempts WHERE request_id=? AND attempt=?',
+            (row['id'], row['attempt']),
+        ).fetchone()
+        if attempt is None:
+            current = self.status(row)['status']
+            if current == 'cancelled':
+                return {'request_id': row['id'], 'job_id': None, 'status': 'cancelled',
+                        'error_code': None}
+            return {'request_id': row['id'], 'job_id': None, 'status': 'submitting',
+                    'error_code': 'SEARCH_PENDING'}
+
+        job_id = attempt['job_id']
+        try:
+            status = self.worker_api('status', job_id=job_id)
+        except JobsError:
+            raise Refused('WORKER_UNAVAILABLE') from None
+        state = status.get('state') if isinstance(status, dict) else None
+        if state not in TERMINAL | ACTIVE:
+            raise Refused('SEARCH_STATUS_INVALID')
+        if state != 'done':
+            if state in TERMINAL:
+                with self.db:
+                    self.db.execute(
+                        'UPDATE requests SET state=?,error_code=?,updated=? WHERE id=? AND owner=?',
+                        (state, 'SEARCH_FAILED', timestamp(), row['id'], owner),
+                    )
+                return {'request_id': row['id'], 'job_id': job_id, 'project': project,
+                        'status': state, 'error_code': 'SEARCH_FAILED'}
+            return {'request_id': row['id'], 'job_id': job_id, 'project': project,
+                    'status': state, 'error_code': 'SEARCH_PENDING'}
+
+        try:
+            result = self.worker_api('result', job_id=job_id)
+        except JobsError:
+            raise Refused('WORKER_UNAVAILABLE') from None
+        if (not isinstance(result, dict) or not isinstance(result.get('results'), list)
+                or result.get('mode') not in {'hybrid', 'fts'}
+                or type(result.get('degraded')) is not bool):
+            raise Refused('SEARCH_RESULT_INVALID')
+        argv = json.loads(row['argv'])
+        if not isinstance(argv, list):
+            raise Refused('SEARCH_RESULT_INVALID')
+        limit = 5
+        try:
+            limit_index = argv.index('--limit')
+        except ValueError:
+            limit_index = None
+        if limit_index is not None:
+            try:
+                limit = int(argv[limit_index + 1])
+            except (IndexError, TypeError, ValueError):
+                raise Refused('SEARCH_RESULT_INVALID') from None
+        if not 1 <= limit <= SEARCH_MAX_LIMIT:
+            raise Refused('SEARCH_RESULT_INVALID')
+        expected_source = row['source'] if row['operation'] == 'search' else None
+        safe_results = []
+        for item in result['results'][:limit]:
+            if not isinstance(item, dict):
+                raise Refused('SEARCH_RESULT_INVALID')
+            if expected_source is not None and item.get('source_id') != expected_source:
+                raise Refused('SEARCH_RESULT_INVALID')
+            safe_item = {key: item.get(key) for key in (
+                'source_id', 'chat_id', 'chat_title', 'topic_id', 'topic_title',
+                'message_id', 'author', 'score', 'thread_ref', 'item_ref',
+                'item_kind', 'url', 'state', 'labels',
+            )}
+            text_value = item.get('text') if isinstance(item.get('text'), str) else ''
+            safe_item.update({
+                'date': item.get('posted_at'), 'text': text_value[:1200],
+                'text_truncated': len(text_value) > 1200,
+            })
+            safe_results.append(safe_item)
+        degraded_reason = result.get('degraded_reason')
+        if degraded_reason not in {
+            None, 'quota', 'worker_unavailable', 'worker_busy', 'timeout',
+            'provider_unavailable',
+        }:
+            degraded_reason = None
+        with self.db:
+            self.db.execute(
+                "UPDATE requests SET state='done',counts=?,error_code=NULL,updated=? "
+                'WHERE id=? AND owner=?',
+                (json.dumps({'result_count': len(safe_results)}, sort_keys=True),
+                 timestamp(), row['id'], owner),
+            )
+        response = {
+            'request_id': row['id'], 'job_id': job_id, 'status': 'done',
+            'mode': result['mode'], 'degraded': result['degraded'],
+            'degraded_reason': degraded_reason, 'result_count': len(safe_results),
+            'results': safe_results,
+        }
+        if row['operation'] == 'search':
+            response['source_id'] = row['source']
+        else:
+            response['project'] = project
+        return response
 
     def renew_embed(self, owner, request_id):
         previous = self.row(owner, request_id)
@@ -1787,6 +1936,12 @@ class Broker:
         ).fetchall()
         by_operation = {}
         for row in rows:
+            try:
+                saved_argv = json.loads(row['argv'])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if self._argv_project(saved_argv) != entry['project']:
+                continue
             if row['operation'] not in by_operation:
                 by_operation[row['operation']] = {
                     'request_id': row['id'], 'status': self.status(row)['status'],
@@ -1884,6 +2039,8 @@ class Broker:
             return self.project_search(owner, args[0], query, limit_text)
         if command == 'job-status' and len(args) == 1:
             return self.safe_job_status(owner, args[0])
+        if command == 'search-result' and len(args) == 1:
+            return self.search_result(owner, args[0])
         if command == 'job-list' and len(args) <= 3:
             return self.job_list(owner, args)
         if command == 'provider-health' and args == ('--probe',):
@@ -1935,14 +2092,59 @@ class Broker:
                     and not (attempt is None and row['state'] in {'queued', 'submitting'})):
                 raise Refused('CANCEL_NOT_ALLOWED')
             if attempt is None:
-                with self.db:
-                    self.db.execute(
-                        "UPDATE requests SET state='cancelled',updated=? WHERE id=? AND owner=?",
-                        (timestamp(), row['id'], owner),
+                try:
+                    cancelled = self.worker_api(
+                        'cancel-idempotency',
+                        idempotency_key=f"broker:{row['id']}:{row['attempt']}",
                     )
-                return {'request_id': row['id'], 'job_id': None, 'status': 'cancelled',
-                        'cancel_requested': False}
+                except JobsError:
+                    raise Refused('CANCEL_UNCONFIRMED') from None
+                if not isinstance(cancelled, dict):
+                    raise Refused('CANCEL_UNCONFIRMED')
+                if (cancelled.get('found') is False and cancelled.get('job_id') is None
+                        and cancelled.get('state') == 'cancelled'
+                        and cancelled.get('cancel_requested') is False):
+                    with self.db:
+                        self.db.execute(
+                            "UPDATE requests SET state='cancelled',updated=? WHERE id=? AND owner=?",
+                            (timestamp(), row['id'], owner),
+                        )
+                    return {'request_id': row['id'], 'job_id': None, 'status': 'cancelled',
+                            'cancel_requested': False}
+                job_id = cancelled.get('job_id')
+                state = cancelled.get('state')
+                cancel_requested = cancelled.get('cancel_requested')
+                if (cancelled.get('found') is not True or not isinstance(job_id, str)
+                        or state not in {'queued', 'running', 'waiting_quota', 'waiting_retry',
+                                         'done', 'failed', 'timed_out', 'cancelled'}
+                        or type(cancel_requested) is not bool):
+                    raise Refused('CANCEL_UNCONFIRMED')
+                job_id = identifier(job_id)
+                with self.db:
+                    bound = self.db.execute(
+                        'SELECT job_id FROM attempts WHERE request_id=? AND attempt=?',
+                        (row['id'], row['attempt']),
+                    ).fetchone()
+                    if bound is not None and bound['job_id'] != job_id:
+                        raise Refused('CANCEL_UNCONFIRMED')
+                    self.db.execute(
+                        'INSERT OR IGNORE INTO attempts(request_id,attempt,job_id,bound) VALUES(?,?,?,?)',
+                        (row['id'], row['attempt'], job_id, timestamp()),
+                    )
+                    self.db.execute(
+                        'UPDATE requests SET state=?,updated=? WHERE id=? AND owner=?',
+                        (state, timestamp(), row['id'], owner),
+                    )
+                return {'request_id': row['id'], 'job_id': job_id, 'status': state,
+                        'cancel_requested': cancel_requested}
             cancelled = self.worker_api('cancel', job_id=attempt['job_id'])
+            if (not isinstance(cancelled, dict)
+                    or cancelled.get('state') not in {
+                        'queued', 'running', 'waiting_quota', 'waiting_retry',
+                        'done', 'failed', 'timed_out', 'cancelled',
+                    }
+                    or type(cancelled.get('cancel_requested')) is not bool):
+                raise Refused('CANCEL_UNCONFIRMED')
             return {'request_id': row['id'], 'job_id': attempt['job_id'],
                     'status': cancelled['state'],
                     'cancel_requested': cancelled['cancel_requested'] is True}
@@ -1952,13 +2154,19 @@ class Broker:
             raise Refused('RETRY_LIMIT')
         if not status['retryable']:
             raise Refused('RETRY_NOT_ALLOWED')
-        try:
+        saved_argv = json.loads(row['argv'])
+        project = self._argv_project(saved_argv)
+        static_entry = self.sources.get(row['source'])
+        if isinstance(static_entry, dict) and static_entry.get('project') == project:
             entry, fingerprint, chat, topic = self.source(row['source'])
-        except Refused as exc:
-            if str(exc) != 'SOURCE_NOT_ALLOWED':
-                raise
-            saved_argv = json.loads(row['argv'])
-            project = self._argv_project(saved_argv)
+        else:
+            if isinstance(static_entry, dict):
+                registered = self.db.execute(
+                    'SELECT 1 FROM managed_sources WHERE owner=? AND source=? AND project=?',
+                    (owner, row['source'], project),
+                ).fetchone()
+                if registered is None:
+                    raise Refused('SOURCE_REVISION_CHANGED')
             entry, fingerprint, parsed = self._managed_source_entry(owner, row['source'], project)
             if isinstance(parsed, tuple):
                 chat, topic = parsed
@@ -1974,14 +2182,15 @@ class Broker:
         if operation == 'ingest' and chat is None:
             # External reruns add a uniqueness suffix to the request fingerprint;
             # validate the source revision against its unsuffixed base.
-            if (
-                self._base_fingerprint(fingerprint)
-                != self._base_fingerprint(expected_fingerprint)
-            ):
+            variants = self._source_fingerprint_variants(row['source'], entry)
+            variants.add(fingerprint)
+            if self._base_fingerprint(expected_fingerprint) not in variants:
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'ingest':
             revision = media_revision(self.root, chat, topic)
             current = hashlib.sha256((fingerprint + revision).encode()).hexdigest() if revision else fingerprint
+            if '--dry-run' in saved_argv:
+                current = f'{current}:dry-run'
             if current != expected_fingerprint:
                 raise Refused('SOURCE_REVISION_CHANGED')
             self.stage(row['source'], entry, fingerprint, chat, topic, revision)

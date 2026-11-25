@@ -40,6 +40,9 @@ class TelegramExport:
     service_sha256: str
     manifest_sha256: str
     messages_size: int
+    services_size: int
+    manifest_size: int
+    services_manifest_size: int
     chat_title: str | None
     services_manifest: dict[str, Any]
 
@@ -187,7 +190,7 @@ def _scan_file(path: Path, validate: Any) -> tuple[str, int, int]:
 def inspect_export(path: Path, *, root: Path = TELEGRAM_ROOT) -> TelegramExport:
     export_dir = _safe_directory(path, root)
     manifest, manifest_bytes = _read_json(export_dir / "manifest.json")
-    services, _service_manifest_bytes = _read_json(export_dir / "services_manifest.json")
+    services, service_manifest_bytes = _read_json(export_dir / "services_manifest.json")
     if manifest.get("export_version") != 1 or manifest.get("complete") is not True:
         raise LoadError("Telegram message export is incomplete or unsupported")
     if manifest.get("scope_before") is not None:
@@ -231,7 +234,7 @@ def inspect_export(path: Path, *, root: Path = TELEGRAM_ROOT) -> TelegramExport:
         if item.get("type") not in _EVENT_TYPES:
             raise LoadError("Telegram service export contains an unsupported event type")
 
-    service_sha, service_count, _service_size = _scan_file(
+    service_sha, service_count, service_size = _scan_file(
         export_dir / "services.jsonl", validate_event
     )
     if service_sha != expected_services_sha:
@@ -249,6 +252,9 @@ def inspect_export(path: Path, *, root: Path = TELEGRAM_ROOT) -> TelegramExport:
         service_sha256=service_sha,
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         messages_size=messages_size,
+        services_size=service_size,
+        manifest_size=len(manifest_bytes),
+        services_manifest_size=len(service_manifest_bytes),
         chat_title=manifest.get("chat_title") if isinstance(manifest.get("chat_title"), str) else None,
         services_manifest=services,
     )

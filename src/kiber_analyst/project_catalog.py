@@ -117,7 +117,7 @@ def create_project(slug: str, title: str, owner: str, request_key: str) -> dict[
             row = conn.execute(
                 """INSERT INTO projects (slug, title, meta)
                    VALUES (%s, %s, jsonb_build_object(
-                     'kiber_control_owner', %s, 'kiber_control_request_key', %s))
+                     'kiber_control_owner', %s::text, 'kiber_control_request_key', %s::text))
                    ON CONFLICT (slug) DO NOTHING
                    RETURNING slug, title""",
                 (slug, normalized_title, owner, request_key),

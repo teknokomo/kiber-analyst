@@ -135,6 +135,8 @@ def test_project_create_uses_bound_parameters_and_is_idempotent(monkeypatch):
     }
     insert_sql, params = connection.calls[1]
     assert "ON CONFLICT (slug) DO NOTHING" in insert_sql
+    assert "'kiber_control_owner', %s::text" in insert_sql
+    assert "'kiber_control_request_key', %s::text" in insert_sql
     assert params == ("new-project", "New project", "operator", key)
     assert "New project" not in insert_sql
 

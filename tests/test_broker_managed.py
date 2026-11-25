@@ -107,6 +107,15 @@ def control(tmp_path, monkeypatch):
             job = jobs[kwargs["job_id"]]
             job["state"] = "cancelled"
             return {"state": "cancelled", "cancel_requested": True}
+        if action == "cancel-idempotency":
+            job_id = str(uuid.uuid5(uuid.NAMESPACE_OID, kwargs["idempotency_key"]))
+            job = jobs.get(job_id)
+            if job is None:
+                return {"found": False, "job_id": None, "state": "cancelled",
+                        "cancel_requested": False}
+            job["state"] = "cancelled"
+            return {"found": True, "job_id": job_id, "state": "cancelled",
+                    "cancel_requested": False}
         raise AssertionError(f"unexpected worker operation: {action}")
 
     def submit(argv, *, idempotency_key):
@@ -372,3 +381,283 @@ def test_capabilities_do_not_claim_kiber_controls_telegram_export(control):
     assert telegram["export"]["invoked_by_kiber_broker"] is False
     assert "register_complete_topic_export" in telegram["operations"]
     assert telegram["scopes"] == {"topic": True, "group": False}
+
+
+def test_static_source_does_not_grant_project_wide_access(control):
+    original, *_ = control
+    app = broker.Broker(
+        original.root, {TELEGRAM_SOURCE: {"project": PROJECT, "hashes": {}}},
+        original.worker_api, original.submit,
+    )
+    try:
+        assert app._project_granted("client", PROJECT) is False
+        assert app.project_list("client") == {"projects": []}
+        assert app.handle("client", "source-list", PROJECT) == {
+            "sources": [{
+                "source_id": TELEGRAM_SOURCE,
+                "project": PROJECT,
+                "provider": "telegram",
+            }],
+        }
+        with pytest.raises(broker.Refused, match="PROJECT_NOT_ALLOWED"):
+            app.project_search("client", PROJECT, "query")
+        with pytest.raises(broker.Refused, match="PROJECT_NOT_ALLOWED"):
+            app.handle("client", "source-add", GITHUB_SOURCE, PROJECT)
+
+        legacy_request = {
+            "source": TELEGRAM_SOURCE,
+            "argv": json.dumps(["telegram", "ingest", "--job", "job", "--project", PROJECT]),
+        }
+        assert app._require_request_project("client", legacy_request) == PROJECT
+    finally:
+        app.db.close()
+
+
+def test_gitlab_ingest_project_slug_is_used_for_request_authorization():
+    assert broker.Broker._argv_project([
+        "gitlab", "ingest", "--host", "gitlab.com", "--project", "group/repo",
+        "--project-slug", PROJECT,
+    ]) == PROJECT
+
+
+def test_telegram_registration_rejects_control_file_larger_than_stage_limit(
+    control, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from kiber_analyst import telegram_ingest
+
+    app, *_ = control
+    monkeypatch.setattr(telegram_ingest, "inspect_export", lambda *_args, **_kwargs: SimpleNamespace(
+        chat_id="-1009000", topic_id=1,
+        messages_size=broker.CONTROL_FILE_MAX_BYTES + 1,
+        services_size=0, manifest_size=0, services_manifest_size=0,
+        message_sha256="a" * 64, service_sha256="b" * 64,
+        manifest_sha256="c" * 64,
+    ))
+    with pytest.raises(broker.Refused, match="TELEGRAM_EXPORT_TOO_LARGE"):
+        app._managed_source_entry_for_add("client", TELEGRAM_SOURCE, PROJECT)
+
+
+def test_external_embed_accepts_legacy_spaced_source_fingerprint(control):
+    app, _projects, jobs, submitted, _api_calls = control
+    app.sources[GITHUB_SOURCE] = {"project": PROJECT}
+    app.handle("client", "source-add", GITHUB_SOURCE, PROJECT)
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps({"project": PROJECT}, sort_keys=True).encode()
+    ).hexdigest()
+    request_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    now = broker.timestamp()
+    argv = ["github", "ingest", "--repo", "example-org/example-repo",
+            "--project", PROJECT, "--since", "2000-01-01"]
+    with app.db:
+        app.db.execute(
+            "INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (request_id, "client", GITHUB_SOURCE, legacy_fingerprint, "ingest",
+             json.dumps(argv), now, now, "done"),
+        )
+        app.db.execute(
+            "INSERT INTO attempts(request_id,attempt,job_id,bound,state) VALUES(?,?,?,?,?)",
+            (request_id, 1, job_id, now, "done"),
+        )
+    jobs[job_id] = {"state": "done"}
+
+    embed = app.handle("client", "embed", GITHUB_SOURCE, PROJECT)
+    assert embed["job_id"] == submitted[-1][0]
+    assert submitted[-1][1] == [
+        "external", "embed", "--source", GITHUB_SOURCE, "--project", PROJECT,
+    ]
+
+
+def test_external_generation_conflict_does_not_dispatch_different_argv(control):
+    app, _projects, _jobs, submitted, _api_calls = control
+    app.handle("client", "source-add", GITHUB_SOURCE, PROJECT)
+    _entry, fingerprint, _parsed = app._managed_source_entry("client", GITHUB_SOURCE, PROJECT)
+    conflicting_id = str(uuid.uuid4())
+    now = broker.timestamp()
+    conflicting_argv = [
+        "github", "ingest", "--repo", "example-org/example-repo",
+        "--project", "different-project", "--since", "2020-01-01",
+    ]
+    with app.db:
+        app.db.execute(
+            "INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (conflicting_id, "client", GITHUB_SOURCE, f"{fingerprint}:real", "ingest",
+             json.dumps(conflicting_argv), now, now, "queued"),
+        )
+
+    with pytest.raises(broker.Refused, match="SOURCE_BUSY"):
+        app.handle("client", "ingest", GITHUB_SOURCE, PROJECT, "2000-01-01")
+    assert submitted == []
+
+
+def test_managed_retry_uses_the_saved_project_not_static_source_project(control):
+    app, _projects, jobs, submitted, _api_calls = control
+    app.sources[GITHUB_SOURCE] = {"project": "legacy-project"}
+    app.handle("client", "source-add", GITHUB_SOURCE, PROJECT)
+    first = app.handle("client", "ingest", GITHUB_SOURCE, PROJECT, "2000-01-01")
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    retry = app.handle("client", "retry", first["request_id"])
+    assert retry["attempt"] == 2
+    assert submitted[-1][1] == submitted[0][1]
+
+
+def test_telegram_dry_run_retry_keeps_the_dry_run_fingerprint_and_flag(
+    control, tmp_path,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    _telegram_export(tmp_path)
+    app.handle("client", "source-add", TELEGRAM_SOURCE, PROJECT)
+    first = app.handle("client", "ingest-dry-run", TELEGRAM_SOURCE, PROJECT)
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    retry = app.handle("client", "retry", first["request_id"])
+    assert retry["attempt"] == 2
+    assert "--dry-run" in submitted[-1][1]
+
+
+def test_search_result_retrieves_completed_project_and_source_searches(
+    control, monkeypatch,
+):
+    app, _projects, jobs, _submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    project_pending = app.handle("client", "search-project", PROJECT, "two words", "1")
+    assert project_pending["error_code"] == "SEARCH_PENDING"
+    jobs[project_pending["job_id"]].update(
+        state="done", result={
+            "mode": "hybrid", "degraded": False, "degraded_reason": None,
+            "results": [{"source_id": GITHUB_SOURCE, "message_id": "42",
+                         "text": "safe result", "path": "private", "sql": "private"}],
+        },
+    )
+    project_result = app.handle("client", "search-result", project_pending["request_id"])
+    assert project_result["status"] == "done"
+    assert project_result["project"] == PROJECT
+    assert project_result["results"][0]["message_id"] == "42"
+    assert "path" not in project_result["results"][0]
+    assert "sql" not in json.dumps(project_result)
+    with pytest.raises(broker.Refused, match="REQUEST_NOT_FOUND"):
+        app.handle("other-owner", "search-result", project_pending["request_id"])
+
+    app.sources[TELEGRAM_SOURCE] = {"project": PROJECT, "hashes": {}}
+    source_pending = app.handle("client", "search", TELEGRAM_SOURCE, "topic query", "1")
+    assert source_pending["error_code"] == "SEARCH_PENDING"
+    jobs[source_pending["job_id"]].update(
+        state="done", result={
+            "mode": "fts", "degraded": True, "degraded_reason": "quota",
+            "results": [{"source_id": TELEGRAM_SOURCE, "message_id": "1",
+                         "text": "safe source result"}],
+        },
+    )
+    source_result = app.handle("client", "search-result", source_pending["request_id"])
+    assert source_result["status"] == "done"
+    assert source_result["source_id"] == TELEGRAM_SOURCE
+    assert source_result["degraded_reason"] == "quota"
+
+
+def test_source_search_skips_status_lookup_for_known_terminal_requests(
+    control, monkeypatch,
+):
+    app, _projects, jobs, _submitted, api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    app.sources[TELEGRAM_SOURCE] = {"project": PROJECT, "hashes": {}}
+    fingerprint = broker.search_fingerprint(TELEGRAM_SOURCE, PROJECT, "repeat query", 1)
+    old_request_id = str(uuid.uuid4())
+    now = broker.timestamp()
+    with app.db:
+        app.db.execute(
+            "INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (old_request_id, "client", TELEGRAM_SOURCE, fingerprint, "search",
+             json.dumps(["search", "repeat query", "--project", PROJECT,
+                         "--limit", "1", "--source-kind", "telegram",
+                         "--source-id", TELEGRAM_SOURCE, "--json"]),
+             now, now, "done"),
+        )
+
+    app.handle("client", "search", TELEGRAM_SOURCE, "repeat query", "1")
+    status_ids = [kwargs["job_id"] for action, kwargs in api_calls if action == "status"]
+    assert old_request_id not in status_ids
+    assert len(status_ids) == 1
+
+
+def test_unbound_cancel_requires_worker_confirmation(control, monkeypatch):
+    app, _projects, jobs, _submitted, _api_calls = control
+    request_id = str(uuid.uuid4())
+    now = broker.timestamp()
+    argv = ["github", "ingest", "--repo", "example-org/example-repo",
+            "--project", PROJECT, "--since", "2000-01-01"]
+    with app.db:
+        app.db.execute(
+            "INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (request_id, "client", GITHUB_SOURCE, "c" * 64, "ingest",
+             json.dumps(argv), now, now, "submitting"),
+        )
+    result = app.handle("client", "cancel", request_id)
+    assert result == {
+        "request_id": request_id, "job_id": None, "status": "cancelled",
+        "cancel_requested": False,
+    }
+    assert app.handle("client", "job-status", request_id)["status"] == "cancelled"
+
+    another_id = str(uuid.uuid4())
+    with app.db:
+        app.db.execute(
+            "INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (another_id, "client", GITHUB_SOURCE, "d" * 64, "ingest",
+             json.dumps(argv), now, now, "submitting"),
+        )
+    original_api = app.worker_api
+
+    def unavailable(action, **kwargs):
+        if action == "cancel-idempotency":
+            raise JobsError("worker unavailable")
+        return original_api(action, **kwargs)
+
+    app.worker_api = unavailable
+    with pytest.raises(broker.Refused, match="CANCEL_UNCONFIRMED"):
+        app.handle("client", "cancel", another_id)
+    assert app.row("client", another_id)["state"] == "submitting"
+
+
+def test_telegram_source_status_ignores_newer_request_for_another_project(
+    control, tmp_path,
+):
+    app, *_ = control
+    export_dir = _telegram_export(tmp_path)
+    hashes = {
+        name: hashlib.sha256((export_dir / name).read_bytes()).hexdigest()
+        for name in broker.CONTROLS
+    }
+    app.sources[TELEGRAM_SOURCE] = {"project": PROJECT, "hashes": hashes}
+    older_id, newer_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with app.db:
+        app.db.execute(
+            "INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (older_id, "client", TELEGRAM_SOURCE, "e" * 64, "ingest",
+             json.dumps(["telegram", "ingest", "--job", "old", "--project", PROJECT]),
+             "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "done"),
+        )
+        app.db.execute(
+            "INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (newer_id, "client", TELEGRAM_SOURCE, "f" * 64, "ingest",
+             json.dumps(["telegram", "ingest", "--job", "new", "--project", "other-project"]),
+             "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z", "done"),
+        )
+
+    result = app.handle("client", "source-status", TELEGRAM_SOURCE)
+    assert result["ingest"]["request_id"] == older_id

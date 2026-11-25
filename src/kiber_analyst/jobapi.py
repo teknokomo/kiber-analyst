@@ -400,6 +400,6 @@ def wait_job(job_id: str, timeout: int = 30, *, socket_path: Path = DEFAULT_SOCK
 
 
 def api_call(action: str, *, socket_path: Path = DEFAULT_SOCKET, **payload: Any) -> dict[str, Any]:
-    if action not in {"status","result","ack","cancel","backup","extend","set-deadline","reschedule","reset_profile","doctor","source-overview","asr-source-overview","queue-overview","provider-overview","provider-probe","job-log","project-catalog"}:
+    if action not in {"status","result","ack","cancel","cancel-idempotency","backup","extend","set-deadline","reschedule","reset_profile","doctor","source-overview","asr-source-overview","queue-overview","provider-overview","provider-probe","job-log","project-catalog"}:
         raise JobsError("Unsupported worker operation")
     return request(socket_path,{"action":action,**payload},timeout=65)
