@@ -126,7 +126,7 @@ def test_source_search_uses_worker_and_returns_only_provenance_fields(setup, lim
     assert argv_log[0][argv_log[0].index('--limit') + 1] == limit_text
 
 
-def test_search_cache_keeps_old_audit_but_requeries_after_code_version_change(setup, monkeypatch):
+def test_search_requeries_identical_query_and_preserves_audit_across_code_version_change(setup, monkeypatch):
     app, _src, jobs, argv_log = setup
     current_title = ['Старая группа']
     results_by_job = {}
@@ -159,7 +159,7 @@ def test_search_cache_keeps_old_audit_but_requeries_after_code_version_change(se
     monkeypatch.setattr(broker, 'SEARCH_CACHE_VERSION', 1)
     old = app.handle('client', 'search', SOURCE, 'Example Station', '5')
     old_repeat = app.handle('client', 'search', SOURCE, 'Example Station', '5')
-    assert old_repeat['request_id'] == old['request_id']
+    assert old_repeat['request_id'] != old['request_id']
     assert old_repeat['results'][0]['chat_title'] == 'Старая группа'
 
     current_title[0] = 'Example Group'
@@ -169,9 +169,9 @@ def test_search_cache_keeps_old_audit_but_requeries_after_code_version_change(se
     assert current['results'][0]['chat_title'] == 'Example Group'
 
     repeated = app.handle('client', 'search', SOURCE, 'Example Station', '5')
-    assert repeated['request_id'] == current['request_id']
+    assert repeated['request_id'] != current['request_id']
     assert repeated['results'][0]['chat_title'] == 'Example Group'
-    assert app.db.execute("SELECT count(*) FROM requests WHERE operation='search'").fetchone()[0] == 2
+    assert app.db.execute("SELECT count(*) FROM requests WHERE operation='search'").fetchone()[0] == 4
 
 
 def test_search_ignores_legacy_unversioned_completed_request(setup):

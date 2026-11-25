@@ -15,11 +15,29 @@ def normalize_args(args):
             or any(not isinstance(value, str) or len(value) > MAX_ARGUMENT_CHARS for value in args)):
         raise ValueError('INVALID_REQUEST')
     normalized = list(args)
-    if normalized[0] == 'search' and len(normalized) > 4:
+    command = normalized[0]
+    if command == 'search' and len(normalized) > 4:
         if len(normalized) > MAX_SEARCH_TOKENS:
             raise ValueError('INVALID_REQUEST')
         normalized = [normalized[0], normalized[1], ' '.join(normalized[2:-1]), normalized[-1]]
-    if len(normalized) > 4:
+    elif command in {'search-source', 'search-project'} and (
+        len(normalized) > 4 or (command == 'search-project' and len(normalized) > 3)
+    ):
+        if len(normalized) > MAX_SEARCH_TOKENS:
+            raise ValueError('INVALID_REQUEST')
+        prefix = normalized[:3] if command == 'search-source' else normalized[:2]
+        remainder = normalized[len(prefix):]
+        # A multiword query must be quoted; then the final token is always the
+        # optional limit, allowing the broker to reject malformed values.
+        has_limit = len(remainder) > 1
+        query_tokens = remainder[:-1] if has_limit else remainder
+        if not query_tokens:
+            raise ValueError('INVALID_REQUEST')
+        normalized = [*prefix, ' '.join(query_tokens)]
+        if has_limit:
+            normalized.append(remainder[-1])
+    max_args = 5 if command in {'ingest-dry-run', 'search-source'} else 4
+    if len(normalized) > max_args:
         raise ValueError('INVALID_REQUEST')
     return normalized
 

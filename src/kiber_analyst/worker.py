@@ -268,6 +268,24 @@ class JobWorker:
             return self.query_embedding(request)
         if action=="submit":
             return self.submit(request,uid=uid)
+        if action=="project-catalog":
+            if uid not in {0,pwd.getpwnam("media").pw_uid}:
+                raise JobsError("Project catalog requires the media worker identity")
+            mode=request.get("mode")
+            if mode=="list" and set(request)=={"action","mode"}:
+                from kiber_analyst.project_catalog import list_projects
+
+                return {"projects":list_projects()}
+            if mode=="create" and set(request)=={
+                "action","mode","slug","title","owner","request_key"
+            }:
+                from kiber_analyst.project_catalog import create_project
+
+                return create_project(
+                    request.get("slug"),request.get("title"),
+                    request.get("owner"),request.get("request_key"),
+                )
+            raise JobsError("Invalid project catalog request")
         if action in {"set-deadline","reschedule"}:
             self._require_root(uid)
             job_id=str(request.get("job_id",""))

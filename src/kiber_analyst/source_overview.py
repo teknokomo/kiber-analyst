@@ -22,7 +22,14 @@ SELECT (SELECT count(*) FROM docs),
        (SELECT count(*) FROM telegram_service_events e JOIN source s ON s.id=e.source_id
         WHERE e.topic_id=%s),
        (SELECT count(*) FROM embeddings e JOIN messages ms ON ms.id::text=e.owner_id
-        WHERE e.owner_table='segments' AND e.model=%s)
+        WHERE e.owner_table='segments' AND e.model=%s),
+       count(*) FILTER (
+         WHERE m.text ~ '[^[:space:]]'
+           AND NOT EXISTS (
+             SELECT 1 FROM embeddings e
+             WHERE e.owner_table='segments' AND e.owner_id=m.id::text AND e.model=%s
+           )
+       )
 FROM messages m
 """
 
@@ -39,7 +46,10 @@ def source_overview(source_id, project):
     with _connect(_required_env(ENV_PATH)) as conn, conn.transaction():
         conn.execute('SET TRANSACTION READ ONLY')
         conn.execute("SET LOCAL statement_timeout='10s'")
-        row = conn.execute(_QUERY, (project, chat, topic, topic, MODEL_KEY)).fetchone()
+        row = conn.execute(
+            _QUERY, (project, chat, topic, topic, MODEL_KEY, MODEL_KEY)
+        ).fetchone()
     names = ('documents', 'messages', 'unique_messages', 'nonempty_messages',
-             'messages_with_media', 'service_events', 'embeddings')
+             'messages_with_media', 'service_events', 'embeddings',
+             'nonempty_messages_without_embeddings')
     return dict(zip(names, row, strict=True))

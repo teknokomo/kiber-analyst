@@ -188,7 +188,7 @@ def test_unknown_external_source_is_not_allowed(setup) -> None:
         app.handle("client", "ingest", "github:other/repo")
 
 
-def test_search_accepts_the_documented_limit_of_100(setup, monkeypatch) -> None:
+def test_search_accepts_limit_50_and_rejects_51(setup, monkeypatch) -> None:
     app, jobs, argv_log = setup
 
     def worker(action, **kwargs):
@@ -201,12 +201,12 @@ def test_search_accepts_the_documented_limit_of_100(setup, monkeypatch) -> None:
 
     app.worker_api = worker
     monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 1)
-    app.handle("client", "search", GITHUB_SOURCE, "query", "100")
+    app.handle("client", "search", GITHUB_SOURCE, "query", "50")
     assert argv_log[-1][:6] == [
-        "search", "query", "--project", "demo-github", "--limit", "100",
+        "search", "query", "--project", "demo-github", "--limit", "50",
     ]
     with pytest.raises(broker.Refused, match="INVALID_LIMIT"):
-        app.handle("client", "search", GITHUB_SOURCE, "query", "101")
+        app.handle("client", "search", GITHUB_SOURCE, "query", "51")
 
 
 def test_completed_ingest_does_not_suppress_a_new_provider_check(setup) -> None:

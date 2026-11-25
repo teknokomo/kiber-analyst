@@ -23,9 +23,12 @@ from kiber_analyst.connectors.source_ids import parse_source_id
 from kiber_analyst.jobapi import api_call, submit_command
 from kiber_analyst.jobqueue import JobsError
 from kiber_analyst.media_resume import resumed_photos
+from kiber_analyst.project_catalog import SLUG_RE, read_project_policy
+from kiber_analyst.project_catalog import request_key as project_request_key
 
 ROOT = data_path()
 CONFIG = config_path("sources.json")
+PROJECT_ACCESS = config_path("project-access.json")
 SOCKET = runtime_path("broker.sock")
 CONTROLS = ('messages.jsonl', 'services.jsonl', 'manifest.json')
 TERMINAL = {'done', 'failed', 'timed_out', 'cancelled'}
@@ -33,14 +36,19 @@ ACTIVE = {'queued', 'running', 'waiting_retry', 'waiting_quota', 'submitting'}
 COMMANDS = {'ingest', 'embed', 'retry', 'job-status', 'job-list', 'job-logs',
             'queue-health', 'provider-health', 'source-status', 'media-status',
             'cancel', 'reindex', 'audit-log', 'renew-embed', 'search', 'asr',
-            'asr-status', 'embed-asr'}
+            'asr-status', 'embed-asr', 'capabilities', 'project-list',
+            'project-create', 'source-list', 'source-add', 'ingest-dry-run',
+            'search-source', 'search-project'}
 TRANSIENT = {'transient_database_error', 'server_error', 'network_error',
              'request_timeout', 'network_timeout'}
 COUNTS = {'inserted', 'updated', 'skipped', 'absent', 'media_missing',
           'service_events', 'service_events_inserted', 'service_events_updated',
           'service_events_skipped', 'errors', 'segments_total', 'skipped_existing',
           'skipped_empty', 'completed', 'total', 'completed_batches', 'result_count',
-          'files_total', 'files_done', 'files_failed', 'files_skipped', 'segments', 'empty'}
+          'files_total', 'files_done', 'files_failed', 'files_skipped', 'segments', 'empty',
+          'threads', 'items', 'nonempty', 'incomplete', 'embeddings',
+          'nonempty_items_without_embeddings', 'messages', 'unique_messages',
+          'nonempty_messages', 'messages_with_media', 'nonempty_messages_without_embeddings'}
 RETRYABLE_ERRORS = TRANSIENT | {'rate_limited'}
 PUBLIC_ERROR_CATEGORIES = RETRYABLE_ERRORS | {
     'rate_limited', 'profile_auth', 'profile_configuration', 'policy_blocked',
@@ -48,7 +56,7 @@ PUBLIC_ERROR_CATEGORIES = RETRYABLE_ERRORS | {
 }
 MAX_ATTEMPTS = 3
 RESERVE = 5 * 1024**3
-SEARCH_MAX_LIMIT = 100
+SEARCH_MAX_LIMIT = 50
 SEARCH_MAX_QUERY_CHARS = 150
 SEARCH_WAIT_SECONDS = 55
 # Bump when search behavior or its public result shape changes. Old requests
@@ -59,6 +67,9 @@ ASR_VOICE_TYPES = {'voice', 'voice_message'}
 ASR_AUDIO_EXTENSIONS = {'.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.ogg', '.wav', '.webm'}
 ASR_MAX_FILE_BYTES = 25_000_000
 ASR_MAX_MEDIA_BYTES = 100 * 1024**2
+TELEGRAM_SOURCE_RE = re.compile(
+    r'telegram:(?P<chat>-[1-9][0-9]{0,18}):topic:(?P<topic>[1-9][0-9]{0,9})\Z'
+)
 
 
 class Refused(Exception):
@@ -142,6 +153,14 @@ def search_fingerprint(source_id, project, query, limit):
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def telegram_topic_source(source_id):
+    """Parse a Telegram topic identifier without accepting paths or flags."""
+    if not isinstance(source_id, str):
+        return None
+    match = TELEGRAM_SOURCE_RE.fullmatch(source_id)
+    return (match.group('chat'), match.group('topic')) if match else None
 
 
 def private(info, directory=False, *, owner=None):
@@ -332,9 +351,16 @@ def media_revision(root, chat, topic):
 
 
 class Broker:
-    def __init__(self, root, sources, worker_api=api_call, submit=submit_command):
+    def __init__(self, root, sources, worker_api=api_call, submit=submit_command,
+                 authorized_projects=None, allow_project_create=False):
         self.root = root
         self.sources = sources
+        self.authorized_projects = set(authorized_projects or ())
+        self.authorized_projects.update(
+            entry['project'] for entry in sources.values()
+            if isinstance(entry, dict) and isinstance(entry.get('project'), str)
+        )
+        self.allow_project_create = bool(allow_project_create)
         self.worker_api = worker_api
         self.submit = submit
         self.db = sqlite3.connect(root / 'broker' / 'requests.sqlite3')
@@ -379,7 +405,24 @@ class Broker:
                 phase TEXT NOT NULL,
                 selected_refs_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS project_grants (
+                owner TEXT NOT NULL, project TEXT NOT NULL, title TEXT NOT NULL,
+                request_key TEXT NOT NULL, created TEXT NOT NULL,
+                PRIMARY KEY(owner,project)
+            );
+            CREATE TABLE IF NOT EXISTS managed_sources (
+                owner TEXT NOT NULL, source TEXT NOT NULL, project TEXT NOT NULL,
+                provider TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', added TEXT NOT NULL,
+                PRIMARY KEY(owner,source,project)
+            );
         """)
+        managed_columns = {
+            row['name'] for row in self.db.execute('PRAGMA table_info(managed_sources)')
+        }
+        if 'metadata' not in managed_columns:
+            self.db.execute(
+                "ALTER TABLE managed_sources ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
+            )
 
     def source(self, source):
         if source not in self.sources:
@@ -391,6 +434,229 @@ class Broker:
             return entry, fingerprint, None, None
         _, chat, _, topic = source.split(':')
         return entry, fingerprint, chat, topic
+
+    def _project_granted(self, owner, project):
+        if project in self.authorized_projects:
+            return True
+        return self.db.execute(
+            'SELECT 1 FROM project_grants WHERE owner=? AND project=?', (owner, project),
+        ).fetchone() is not None
+
+    def _require_request_project(self, owner, row):
+        project = self._argv_project(json.loads(row['argv']))
+        if project is not None and not self._project_granted(owner, project):
+            raise Refused('PROJECT_NOT_ALLOWED')
+        return project
+
+    def project_list(self, owner):
+        catalog = self.worker_api('project-catalog', mode='list')
+        projects = catalog.get('projects') if isinstance(catalog, dict) else None
+        if not isinstance(projects, list):
+            raise Refused('PROJECT_CATALOG_UNAVAILABLE')
+        grants = {
+            row['project'] for row in self.db.execute(
+                'SELECT project FROM project_grants WHERE owner=?', (owner,),
+            )
+        }
+        visible = []
+        for item in projects:
+            if not isinstance(item, dict):
+                continue
+            slug, title = item.get('slug'), item.get('title')
+            if (isinstance(slug, str) and SLUG_RE.fullmatch(slug)
+                    and isinstance(title, str) and (slug in self.authorized_projects or slug in grants)):
+                visible.append({'slug': slug, 'title': title})
+        return {'projects': visible}
+
+    def project_create(self, owner, slug, title):
+        if not self.allow_project_create:
+            raise Refused('PROJECT_CREATE_DISABLED')
+        if (not isinstance(slug, str) or SLUG_RE.fullmatch(slug) is None
+                or not isinstance(title, str) or not title.strip() or len(title.strip()) > 120
+                or any(ord(char) < 32 or ord(char) == 127 for char in title)):
+            raise Refused('INVALID_PROJECT')
+        title = title.strip()
+        key = project_request_key(owner, slug, title)
+        grant = self.db.execute(
+            'SELECT title,request_key FROM project_grants WHERE owner=? AND project=?',
+            (owner, slug),
+        ).fetchone()
+        if grant is not None:
+            if grant['title'] != title or grant['request_key'] != key:
+                raise Refused('PROJECT_ALREADY_EXISTS')
+            return {'slug': slug, 'title': title, 'created': False}
+        try:
+            created = self.worker_api(
+                'project-catalog', mode='create', slug=slug, title=title,
+                owner=owner, request_key=key,
+            )
+        except JobsError as exc:
+            if 'PROJECT_ALREADY_EXISTS' in str(exc):
+                raise Refused('PROJECT_ALREADY_EXISTS') from None
+            raise Refused('PROJECT_CREATE_FAILED') from None
+        if (created.get('slug') != slug or created.get('title') != title
+                or created.get('request_key') != key
+                or type(created.get('created')) is not bool):
+            raise Refused('PROJECT_CREATE_FAILED')
+        with self.db:
+            self.db.execute(
+                'INSERT INTO project_grants(owner,project,title,request_key,created) VALUES(?,?,?,?,?)',
+                (owner, slug, title, key, timestamp()),
+            )
+        return {'slug': slug, 'title': title, 'created': bool(created.get('created'))}
+
+    @staticmethod
+    def _valid_external_source(source_id):
+        return parse_source_id(source_id) is not None
+
+    def _managed_source_entry(self, owner, source_id, project):
+        parsed_external = parse_source_id(source_id)
+        telegram_parts = telegram_topic_source(source_id)
+        if parsed_external is None and telegram_parts is None:
+            raise Refused('UNSUPPORTED_SOURCE')
+        if not isinstance(project, str) or SLUG_RE.fullmatch(project) is None:
+            raise Refused('INVALID_PROJECT')
+        if not self._project_granted(owner, project):
+            raise Refused('PROJECT_NOT_ALLOWED')
+        registered = self.db.execute(
+            'SELECT provider,metadata FROM managed_sources WHERE owner=? AND source=? AND project=?',
+            (owner, source_id, project),
+        ).fetchone()
+        static = self.sources.get(source_id)
+        if registered is None and not (isinstance(static, dict) and static.get('project') == project):
+            raise Refused('SOURCE_NOT_REGISTERED')
+        entry = {'project': project}
+        if telegram_parts is not None:
+            if registered is not None:
+                try:
+                    metadata = json.loads(registered['metadata'])
+                except (TypeError, json.JSONDecodeError):
+                    raise Refused('SOURCE_REGISTRATION_INVALID') from None
+                hashes = metadata.get('hashes') if isinstance(metadata, dict) else None
+                if (not isinstance(hashes, dict) or set(hashes) != set(CONTROLS)
+                        or any(not isinstance(value, str)
+                               or re.fullmatch(r'[0-9a-f]{64}', value) is None
+                               for value in hashes.values())):
+                    raise Refused('SOURCE_REGISTRATION_INVALID')
+                entry['hashes'] = hashes
+            elif isinstance(static.get('hashes'), dict):
+                entry['hashes'] = static['hashes']
+        fingerprint = hashlib.sha256(
+            json.dumps(entry, sort_keys=True, separators=(',', ':')).encode()
+        ).hexdigest()
+        return entry, fingerprint, parsed_external or telegram_parts
+
+    def source_add(self, owner, source_id, project):
+        entry, _fingerprint, parsed = self._managed_source_entry_for_add(owner, source_id, project)
+        provider = parsed.provider if hasattr(parsed, 'provider') else 'telegram'
+        metadata = {'hashes': entry['hashes']} if provider == 'telegram' else {}
+        encoded_metadata = json.dumps(metadata, sort_keys=True, separators=(',', ':'))
+        current = self.db.execute(
+            'SELECT metadata FROM managed_sources WHERE owner=? AND source=? AND project=?',
+            (owner, source_id, project),
+        ).fetchone()
+        if current is not None and current['metadata'] != encoded_metadata:
+            active = self.db.execute(
+                "SELECT * FROM requests WHERE owner=? AND source=? AND operation IN ('ingest','embed')",
+                (owner, source_id),
+            ).fetchall()
+            if any(self.status(row)['status'] not in TERMINAL for row in active):
+                raise Refused('SOURCE_BUSY')
+        with self.db:
+            self.db.execute(
+                'INSERT INTO managed_sources(owner,source,project,provider,metadata,added) '
+                'VALUES(?,?,?,?,?,?) ON CONFLICT(owner,source,project) DO UPDATE SET '
+                'provider=excluded.provider,metadata=excluded.metadata,added=excluded.added',
+                (owner, source_id, project, provider, encoded_metadata, timestamp()),
+            )
+        return {'source_id': source_id, 'project': entry['project'],
+                'provider': provider, 'registered': True}
+
+    def _managed_source_entry_for_add(self, owner, source_id, project):
+        if not isinstance(source_id, str):
+            raise Refused('UNSUPPORTED_SOURCE')
+        if not isinstance(project, str) or SLUG_RE.fullmatch(project) is None:
+            raise Refused('INVALID_PROJECT')
+        if not self._project_granted(owner, project):
+            raise Refused('PROJECT_NOT_ALLOWED')
+        catalog = self.worker_api('project-catalog', mode='list')
+        projects = catalog.get('projects', []) if isinstance(catalog, dict) else []
+        if not any(isinstance(item, dict) and item.get('slug') == project for item in projects):
+            raise Refused('PROJECT_NOT_FOUND')
+        parsed = parse_source_id(source_id)
+        telegram_parts = telegram_topic_source(source_id)
+        if parsed is None and telegram_parts is None:
+            raise Refused('UNSUPPORTED_SOURCE')
+        entry = {'project': project}
+        if telegram_parts is not None:
+            from kiber_analyst.telegram_ingest import inspect_export
+
+            export_path = self.root / 'imports' / telegram_parts[0] / telegram_parts[1]
+            try:
+                export = inspect_export(export_path, root=self.root / 'imports')
+            except Exception:
+                raise Refused('TELEGRAM_EXPORT_UNAVAILABLE') from None
+            if (export.chat_id != telegram_parts[0]
+                    or str(export.topic_id) != telegram_parts[1]):
+                raise Refused('TELEGRAM_EXPORT_MISMATCH')
+            entry['hashes'] = {
+                'messages.jsonl': export.message_sha256,
+                'services.jsonl': export.service_sha256,
+                'manifest.json': export.manifest_sha256,
+            }
+        fingerprint = hashlib.sha256(
+            json.dumps(entry, sort_keys=True, separators=(',', ':')).encode()
+        ).hexdigest()
+        return entry, fingerprint, parsed or telegram_parts
+
+    def source_list(self, owner, project=None):
+        grants = {row['project'] for row in self.db.execute(
+            'SELECT project FROM project_grants WHERE owner=?', (owner,),
+        )}
+        visible_projects = self.authorized_projects | grants
+        if project is not None:
+            if not isinstance(project, str) or SLUG_RE.fullmatch(project) is None:
+                raise Refused('INVALID_PROJECT')
+            if project not in visible_projects:
+                raise Refused('PROJECT_NOT_ALLOWED')
+            visible_projects = {project}
+        records = {
+            (source_id, entry.get('project'), source_id.split(':', 1)[0])
+            for source_id, entry in self.sources.items()
+            if isinstance(entry, dict) and entry.get('project') in visible_projects
+        }
+        records.update(
+            (row['source'], row['project'], row['provider'])
+            for row in self.db.execute(
+                'SELECT source,project,provider FROM managed_sources WHERE owner=?', (owner,),
+            ) if row['project'] in visible_projects
+        )
+        return {'sources': [
+            {'source_id': source_id, 'project': target, 'provider': provider}
+            for source_id, target, provider in sorted(records)
+        ]}
+
+    def capabilities(self):
+        return {'providers': {
+            'github': {'operations': ['register', 'dry_run', 'ingest', 'retry', 'embed', 'status', 'search'],
+                       'coverage': 'issues, pull requests, comments and available review/discussion endpoints'},
+            'gitlab': {'operations': ['register', 'dry_run', 'ingest', 'retry', 'embed', 'status', 'search'],
+                       'coverage': 'issues, merge requests, notes, discussions and available system events'},
+            'gitverse': {'operations': ['register', 'dry_run', 'ingest', 'retry', 'embed', 'status', 'search'],
+                         'coverage': 'issues, pull requests, comments and available reviews; unsupported endpoints remain partial'},
+            'telegram': {
+                'operations': ['register_complete_topic_export', 'dry_run', 'ingest', 'retry',
+                               'embed', 'status', 'search'],
+                'scopes': {'topic': True, 'group': False},
+                'export': {'available_via_separate_interface': True,
+                           'invoked_by_kiber_broker': False},
+                'ingest_requires': 'complete, unbounded topic export already staged in the fixed Telegram import directory',
+            },
+        }, 'project_operations': {
+            'list': True, 'select_existing': True,
+            'create': self.allow_project_create,
+        },
+            'unsupported': ['web', 'documents', 'unimplemented connectors']}
 
     def stage(self, source_id, entry, fingerprint, chat, topic, revision=""):
         with contextlib.ExitStack() as stack:
@@ -857,14 +1123,83 @@ class Broker:
                 'retry_after_seconds': retry_after if type(retry_after) in (int, float) and 0 <= retry_after <= 99_999_999 else None,
                 'created_at': row['created'], 'updated_at': status.get('updated_at', now if changed else row['updated'])}
 
-    def start(self, owner, operation, source_id):
-        entry, fingerprint, chat, topic = self.source(source_id)
+    def safe_job_status(self, owner, request_id):
+        row = self.row(owner, identifier(request_id))
+        self._require_request_project(owner, row)
+        report = self.status(row)
+        managed = self.db.execute(
+            'SELECT 1 FROM managed_sources WHERE owner=? AND source=? LIMIT 1',
+            (owner, row['source']),
+        ).fetchone() is not None
+        # Preserve the established static Telegram status contract.
+        if parse_source_id(row['source']) is None and not managed and row['operation'] != 'project-search':
+            return report
+        argv = json.loads(row['argv'])
+        project = self._argv_project(argv)
+        report.update({'request_id': row['id'], 'job_id': self.db.execute(
+            'SELECT job_id FROM attempts WHERE request_id=? AND attempt=?',
+            (row['id'], row['attempt']),
+        ).fetchone()[0] if self.db.execute(
+            'SELECT 1 FROM attempts WHERE request_id=? AND attempt=?',
+            (row['id'], row['attempt']),
+        ).fetchone() else None})
+        if project is not None:
+            report['project'] = project
+        if row['operation'] == 'ingest' and report['status'] in TERMINAL:
+            job_id = report.get('job_id')
+            if job_id:
+                try:
+                    payload = self.worker_api('result', job_id=job_id)
+                except JobsError:
+                    payload = {}
+                if isinstance(payload, dict):
+                    outcome = payload.get('status')
+                    if outcome in {'done', 'partial', 'dry_run'}:
+                        report['ingest_status'] = outcome
+                    reasons = payload.get('partial_reasons')
+                    if isinstance(reasons, list):
+                        report['partial_reasons'] = [
+                            value for value in reasons
+                            if isinstance(value, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,39}', value)
+                        ][:20]
+                    load = payload.get('load')
+                    if isinstance(load, dict):
+                        status = load.get('status')
+                        if isinstance(status, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,39}', status):
+                            report['load_status'] = status
+                        if type(load.get('rollback_confirmed')) is bool:
+                            report['rollback_confirmed'] = load['rollback_confirmed']
+                    counts = payload.get('counts')
+                    if isinstance(counts, dict):
+                        safe = {key: value for key, value in counts.items()
+                                if key in COUNTS and type(value) is int and value >= 0}
+                        report['counts'].update(safe)
+        return report
+
+    def start(self, owner, operation, source_id, *, entry_override=None,
+              since=None, limit=None, dry_run=False):
+        if entry_override is None:
+            entry, fingerprint, chat, topic = self.source(source_id)
+        else:
+            topic_source = telegram_topic_source(source_id)
+            if topic_source is None:
+                raise Refused('UNSUPPORTED_SOURCE')
+            entry = entry_override
+            chat, topic = topic_source
+            fingerprint = hashlib.sha256(
+                json.dumps(entry, sort_keys=True, separators=(',', ':')).encode()
+            ).hexdigest()
         if chat is None:
-            return self.start_external(owner, operation, source_id, entry, fingerprint)
+            return self.start_external(
+                owner, operation, source_id, entry, fingerprint,
+                since=since, limit=limit, dry_run=dry_run,
+            )
         base_fingerprint = fingerprint
         revision = media_revision(self.root, chat, topic) if operation == 'ingest' else ''
         if revision:
             fingerprint = hashlib.sha256((fingerprint + revision).encode()).hexdigest()
+        if operation == 'ingest' and dry_run:
+            fingerprint = f'{fingerprint}:dry-run'
         relevant = self.db.execute(
             """SELECT r.*, coalesce(e.base_fingerprint,r.fingerprint) AS source_fingerprint
                FROM requests r LEFT JOIN embed_renewals e ON e.request_id=r.id
@@ -883,6 +1218,8 @@ class Broker:
         if operation == 'ingest':
             staged = self.stage(source_id, entry, base_fingerprint, chat, topic, revision)
             argv = ['telegram', 'ingest', '--job', str(staged), '--project', entry['project']]
+            if dry_run:
+                argv.append('--dry-run')
         else:
             resume_hash = media_revision(self.root, chat, topic)
             ingest_key = hashlib.sha256((fingerprint + resume_hash).encode()).hexdigest() if resume_hash else fingerprint
@@ -906,9 +1243,38 @@ class Broker:
         # still allows a fresh request while the source revision stays stable.
         return str(value).split(':', 1)[0]
 
-    def start_external(self, owner, operation, source_id, entry, fingerprint):
+    def start_external(self, owner, operation, source_id, entry, fingerprint, *,
+                       since=None, limit=None, dry_run=False):
         # External sources: no staged files, the connector fetches from the API.
         provider, external_id = source_id.split(':', 1)
+        if operation == 'ingest':
+            if provider == 'gitlab':
+                host, project_path = external_id.split('/', 1)
+                argv = ['gitlab', 'ingest', '--host', host, '--project', project_path,
+                        '--project-slug', entry['project']]
+            else:
+                argv = [provider, 'ingest', '--repo', external_id, '--project', entry['project']]
+            if since is not None:
+                argv.extend(['--since', since])
+            if limit is not None:
+                argv.extend(['--limit', str(limit)])
+            if dry_run:
+                argv.append('--dry-run')
+        elif operation == 'embed':
+            ingests = self.db.execute(
+                'SELECT * FROM requests WHERE owner=? AND source=? AND operation=?'
+                ' ORDER BY created DESC',
+                (owner, source_id, 'ingest'),
+            ).fetchall()
+            ingest = next((row for row in ingests
+                           if self._base_fingerprint(row['fingerprint']) == fingerprint
+                           and self._argv_project(json.loads(row['argv'])) == entry['project']
+                           and '--dry-run' not in json.loads(row['argv'])), None)
+            if ingest is None or self.status(ingest)['status'] != 'done':
+                raise Refused('INGEST_REQUIRED')
+            argv = ['external', 'embed', '--source', source_id, '--project', entry['project']]
+        else:
+            raise Refused('COMMAND_NOT_ALLOWED')
         relevant = self.db.execute(
             """SELECT r.*, coalesce(e.base_fingerprint,r.fingerprint) AS source_fingerprint
                FROM requests r LEFT JOIN embed_renewals e ON e.request_id=r.id
@@ -918,36 +1284,10 @@ class Broker:
         for row in relevant:
             if self._base_fingerprint(row['source_fingerprint']) == fingerprint:
                 if self.status(row)['status'] not in TERMINAL:
-                    # An active identical request is never duplicated.
+                    if json.loads(row['argv']) != argv:
+                        raise Refused('SOURCE_BUSY')
                     return self.dispatch(row)
-                # A finished request must not suppress a new provider check;
-                # fall through and create a fresh run below.
                 break
-            if self.status(row)['status'] not in TERMINAL:
-                raise Refused('SOURCE_BUSY')
-        if operation == 'ingest':
-            if provider == 'gitlab':
-                host, project_path = external_id.split('/', 1)
-                argv = ['gitlab', 'ingest', '--host', host, '--project', project_path,
-                        '--project-slug', entry['project']]
-            else:
-                argv = [provider, 'ingest', '--repo', external_id, '--project', entry['project']]
-        elif operation == 'embed':
-            ingests = self.db.execute(
-                'SELECT * FROM requests WHERE owner=? AND source=? AND operation=?'
-                ' ORDER BY created DESC',
-                (owner, source_id, 'ingest'),
-            ).fetchall()
-            ingest = next(
-                (row for row in ingests
-                 if self._base_fingerprint(row['fingerprint']) == fingerprint),
-                None,
-            )
-            if ingest is None or self.status(ingest)['status'] != 'done':
-                raise Refused('INGEST_REQUIRED')
-            argv = ['external', 'embed', '--source', source_id, '--project', entry['project']]
-        else:
-            raise Refused('COMMAND_NOT_ALLOWED')
         existing = self.db.execute(
             'SELECT 1 FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
             (owner, source_id, fingerprint, operation),
@@ -981,6 +1321,19 @@ class Broker:
             return self.dispatch(row)
         return self.dispatch(self.row(owner, request_id))
 
+    @staticmethod
+    def _argv_project(argv):
+        if not isinstance(argv, list):
+            return None
+        for flag in ('--project', '--project-slug'):
+            try:
+                index = argv.index(flag)
+            except ValueError:
+                continue
+            if index + 1 < len(argv):
+                return argv[index + 1]
+        return None
+
     def external_source_status(self, owner, source_id, entry, command):
         if command != 'source-status':
             raise Refused('COMMAND_NOT_ALLOWED')
@@ -991,6 +1344,12 @@ class Broker:
         ).fetchall()
         by_operation = {}
         for row in rows:
+            try:
+                argv = json.loads(row['argv'])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if self._argv_project(argv) != entry['project']:
+                continue
             if row['operation'] not in by_operation:
                 by_operation[row['operation']] = {
                     'request_id': row['id'], 'status': self.status(row)['status'],
@@ -999,8 +1358,144 @@ class Broker:
                 'counts': db, 'ingest': by_operation.get('ingest'),
                 'embed': by_operation.get('embed')}
 
-    def source_search(self, owner, source_id, query, limit_text=None):
-        entry, _source_fingerprint, _chat, _topic = self.source(source_id)
+    def managed_ingest(self, owner, source_id, project, *, since=None, limit=None, dry_run=False):
+        entry, fingerprint, _parsed = self._managed_source_entry(owner, source_id, project)
+        is_telegram = telegram_topic_source(source_id) is not None
+        if since is not None:
+            if (not isinstance(since, str) or len(since) > 40
+                    or any(ord(char) < 32 or ord(char) == 127 for char in since)):
+                raise Refused('INVALID_SINCE')
+            try:
+                if re.fullmatch(r'\d{4}-\d{2}-\d{2}', since):
+                    datetime.date.fromisoformat(since)
+                else:
+                    parsed_since = datetime.datetime.fromisoformat(since.replace('Z', '+00:00'))
+                    if parsed_since.tzinfo is None or parsed_since.utcoffset() is None:
+                        raise ValueError
+            except ValueError:
+                raise Refused('INVALID_SINCE') from None
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 100):
+            raise Refused('INVALID_LIMIT')
+        if is_telegram and (since is not None or limit is not None):
+            raise Refused('TELEGRAM_EXPORT_IS_ALREADY_BOUNDED')
+        if dry_run and since is None and not is_telegram:
+            raise Refused('SINCE_REQUIRED_FOR_DRY_RUN')
+        if not dry_run and since is None and not is_telegram:
+            overview = self.worker_api('source-overview', source_id=source_id, project=project)
+            if overview.get('threads', 0) == 0:
+                raise Refused('SINCE_REQUIRED_FOR_INITIAL_IMPORT')
+        if is_telegram:
+            return self.start(
+                owner, 'ingest', source_id, entry_override=entry, dry_run=dry_run,
+            )
+        return self.start_external(
+            owner, 'ingest', source_id, entry, fingerprint,
+            since=since, limit=limit, dry_run=dry_run,
+        )
+
+    def managed_embed(self, owner, source_id, project):
+        entry, fingerprint, _parsed = self._managed_source_entry(owner, source_id, project)
+        if telegram_topic_source(source_id) is not None:
+            return self.start(owner, 'embed', source_id, entry_override=entry)
+        return self.start_external(owner, 'embed', source_id, entry, fingerprint)
+
+    def managed_search(self, owner, source_id, project, query, limit_text=None):
+        entry, _fingerprint, _parsed = self._managed_source_entry(owner, source_id, project)
+        return self.source_search(
+            owner, source_id, query, limit_text, entry_override=entry,
+        )
+
+    def project_search(self, owner, project, query, limit_text=None):
+        if not isinstance(project, str) or SLUG_RE.fullmatch(project) is None:
+            raise Refused('INVALID_PROJECT')
+        if not self._project_granted(owner, project):
+            raise Refused('PROJECT_NOT_ALLOWED')
+        if not isinstance(query, str) or not query.strip() or len(query) > SEARCH_MAX_QUERY_CHARS:
+            raise Refused('INVALID_QUERY')
+        if any(ord(char) < 32 or ord(char) == 127 for char in query) or query.lstrip().startswith('-'):
+            raise Refused('INVALID_QUERY')
+        if limit_text is None:
+            limit = 5
+        elif isinstance(limit_text, str) and re.fullmatch(r'(?:[1-9][0-9]?|100)', limit_text):
+            limit = int(limit_text)
+        else:
+            raise Refused('INVALID_LIMIT')
+        if limit > SEARCH_MAX_LIMIT:
+            raise Refused('INVALID_LIMIT')
+        nonce = str(uuid.uuid4())
+        source_key = f'project:{project}'
+        fingerprint = hashlib.sha256(json.dumps(
+            {'cache_version': SEARCH_CACHE_VERSION, 'project': project,
+             'query': query.strip(), 'limit': limit, 'request': nonce},
+            sort_keys=True, ensure_ascii=False, separators=(',', ':'),
+        ).encode()).hexdigest()
+        argv = ['search', query.strip(), '--project', project, '--limit', str(limit), '--json']
+        now = timestamp()
+        request_id = str(uuid.uuid4())
+        with self.db:
+            self.db.execute(
+                'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) '
+                'VALUES(?,?,?,?,?,?,?,?)',
+                (request_id, owner, source_key, fingerprint, 'project-search',
+                 json.dumps(argv), now, now),
+            )
+        row = self.row(owner, request_id)
+        dispatched = self.dispatch(row)
+        job_id = dispatched['job_id']
+        deadline = time.monotonic() + SEARCH_WAIT_SECONDS
+        while True:
+            state = self.worker_api('status', job_id=job_id).get('state')
+            if state == 'done':
+                result = self.worker_api('result', job_id=job_id)
+                if not isinstance(result, dict) or not isinstance(result.get('results'), list):
+                    raise Refused('SEARCH_RESULT_INVALID')
+                mode, degraded = result.get('mode'), result.get('degraded')
+                if mode not in {'hybrid', 'fts'} or type(degraded) is not bool:
+                    raise Refused('SEARCH_RESULT_INVALID')
+                results = []
+                for item in result['results'][:limit]:
+                    if not isinstance(item, dict):
+                        raise Refused('SEARCH_RESULT_INVALID')
+                    text = item.get('text') if isinstance(item.get('text'), str) else ''
+                    row_data = {key: item.get(key) for key in (
+                        'source_id', 'chat_id', 'chat_title', 'topic_id', 'topic_title',
+                        'message_id', 'author', 'score', 'thread_ref', 'item_ref',
+                        'item_kind', 'url', 'state', 'labels',
+                    )}
+                    row_data.update({
+                        'date': item.get('posted_at'), 'text': text[:1200],
+                        'text_truncated': len(text) > 1200,
+                    })
+                    results.append(row_data)
+                with self.db:
+                    self.db.execute(
+                        "UPDATE requests SET state='done',counts=?,updated=? WHERE id=?",
+                        (json.dumps({'result_count': len(results)}, sort_keys=True), timestamp(), request_id),
+                    )
+                return {'request_id': request_id, 'job_id': job_id, 'project': project,
+                        'mode': mode, 'degraded': degraded,
+                        'degraded_reason': result.get('degraded_reason'),
+                        'result_count': len(results), 'results': results}
+            if state in {'failed', 'timed_out', 'cancelled'}:
+                with self.db:
+                    self.db.execute(
+                        'UPDATE requests SET state=?,error_code=?,updated=? WHERE id=?',
+                        (state, 'SEARCH_FAILED', timestamp(), request_id),
+                    )
+                return {'request_id': request_id, 'job_id': job_id, 'project': project,
+                        'status': state, 'error_code': 'SEARCH_FAILED'}
+            if time.monotonic() >= deadline:
+                return {'request_id': request_id, 'job_id': job_id, 'project': project,
+                        'status': state or 'running', 'error_code': 'SEARCH_PENDING'}
+            time.sleep(0.5)
+
+    def source_search(self, owner, source_id, query, limit_text=None, *, entry_override=None):
+        if entry_override is None:
+            entry, _source_fingerprint, _chat, _topic = self.source(source_id)
+        else:
+            if parse_source_id(source_id) is None and telegram_topic_source(source_id) is None:
+                raise Refused('UNSUPPORTED_SOURCE')
+            entry = entry_override
         if not isinstance(query, str) or not query.strip() or len(query) > SEARCH_MAX_QUERY_CHARS:
             raise Refused('INVALID_QUERY')
         if limit_text is None:
@@ -1026,11 +1521,23 @@ class Broker:
             raise Refused('SOURCE_NOT_FOUND')
         normalized = query.strip()
         fingerprint = search_fingerprint(source_id, entry['project'], normalized, limit)
-        row = self.db.execute(
-            "SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation='search'",
-            (owner, source_id, fingerprint),
-        ).fetchone()
+        matching = self.db.execute(
+            "SELECT * FROM requests WHERE owner=? AND source=? AND operation='search' "
+            "AND (fingerprint=? OR fingerprint LIKE ?) ORDER BY created DESC",
+            (owner, source_id, fingerprint, f'{fingerprint}:%'),
+        ).fetchall()
+        row = None
+        for candidate in matching:
+            if self.status(candidate)['status'] not in TERMINAL:
+                row = candidate
+                break
         if row is None:
+            generation = self.db.execute(
+                "SELECT count(*) FROM requests WHERE owner=? AND source=? AND operation='search' "
+                "AND (fingerprint=? OR fingerprint LIKE ?)",
+                (owner, source_id, fingerprint, f'{fingerprint}:%'),
+            ).fetchone()[0]
+            request_fingerprint = fingerprint if generation == 0 else f'{fingerprint}:{generation}'
             argv = ['search', normalized, '--project', entry['project'], '--limit', str(limit),
                     '--source-kind', source_id.split(':', 1)[0] if external else 'telegram',
                     '--source-id', source_id, '--json']
@@ -1039,7 +1546,7 @@ class Broker:
             with self.db:
                 self.db.execute(
                     'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) VALUES(?,?,?,?,?,?,?,?)',
-                    (request_id, owner, source_id, fingerprint, 'search', json.dumps(argv), now, now),
+                    (request_id, owner, source_id, request_fingerprint, 'search', json.dumps(argv), now, now),
                 )
             row = self.row(owner, request_id)
         dispatched = self.dispatch(row)
@@ -1176,7 +1683,13 @@ class Broker:
         if selection.get('owner', owner) != owner:
             raise Refused('OWNER_NOT_ALLOWED')
         if 'source_id' in selection:
-            self.source(selection['source_id'])
+            if selection['source_id'] not in self.sources:
+                registered = self.db.execute(
+                    'SELECT 1 FROM managed_sources WHERE owner=? AND source=? LIMIT 1',
+                    (owner, selection['source_id']),
+                ).fetchone()
+                if registered is None:
+                    raise Refused('SOURCE_NOT_ALLOWED')
         if 'status' in selection and selection['status'] not in TERMINAL | ACTIVE:
             raise Refused('INVALID_STATUS')
         rows = self.db.execute(
@@ -1185,6 +1698,10 @@ class Broker:
         )
         results = []
         for row in rows:
+            try:
+                self._require_request_project(owner, row)
+            except Refused:
+                continue
             status = self.status(row)
             if selection.get('status', status['status']) == status['status']:
                 results.append({'request_id': row['id'], 'source_id': row['source'],
@@ -1300,7 +1817,8 @@ class Broker:
 
     def audit(self, owner, command, args, response, *, seq=None):
         candidates = [token.removeprefix('source_id=') for token in args]
-        source_id = next((value for value in candidates if value in self.sources), None)
+        source_id = next((value for value in candidates
+                          if value in self.sources or parse_source_id(value) is not None), None)
         request_id = response.get('request_id')
         job_id = response.get('job_id')
         if not request_id and command in {'job-status', 'job-logs', 'retry', 'cancel'} and args:
@@ -1328,6 +1846,44 @@ class Broker:
             )
 
     def handle(self, owner, command, *args):
+        if command == 'capabilities' and not args:
+            return self.capabilities()
+        if command == 'project-list' and not args:
+            return self.project_list(owner)
+        if command == 'project-create' and len(args) == 2:
+            return self.project_create(owner, args[0], args[1])
+        if command == 'source-list' and len(args) <= 1:
+            return self.source_list(owner, args[0] if args else None)
+        if command == 'source-add' and len(args) == 2:
+            return self.source_add(owner, args[0], args[1])
+        if command == 'source-status' and len(args) == 2:
+            entry, _fingerprint, _parsed = self._managed_source_entry(owner, args[0], args[1])
+            return self.external_source_status(owner, args[0], entry, command)
+        if command == 'ingest' and len(args) in {2, 3}:
+            return self.managed_ingest(owner, args[0], args[1], since=args[2] if len(args) == 3 else None)
+        if command == 'ingest-dry-run' and len(args) in {2, 3, 4}:
+            limit = None
+            since = args[2] if len(args) >= 3 else None
+            if len(args) == 4:
+                if not re.fullmatch(r'(?:[1-9][0-9]?|100)', args[3]):
+                    raise Refused('INVALID_LIMIT')
+                limit = int(args[3])
+            return self.managed_ingest(owner, args[0], args[1], since=since,
+                                       limit=limit, dry_run=True)
+        if command == 'embed' and len(args) == 2:
+            return self.managed_embed(owner, args[0], args[1])
+        if command == 'search-source' and len(args) in {3, 4}:
+            return self.managed_search(owner, args[0], args[1], args[2], args[3] if len(args) == 4 else None)
+        if command == 'search-project' and len(args) in {2, 3, 4}:
+            if len(args) == 4:
+                query = ' '.join(args[1:3])
+                limit_text = args[3]
+            else:
+                query = args[1]
+                limit_text = args[2] if len(args) == 3 else None
+            return self.project_search(owner, args[0], query, limit_text)
+        if command == 'job-status' and len(args) == 1:
+            return self.safe_job_status(owner, args[0])
         if command == 'job-list' and len(args) <= 3:
             return self.job_list(owner, args)
         if command == 'provider-health' and args == ('--probe',):
@@ -1345,7 +1901,9 @@ class Broker:
             n = args[1] if len(args) == 2 else '20'
             if not re.fullmatch(r'[1-9][0-9]?', n) or int(n) > 50:
                 raise Refused('INVALID_LIMIT')
-            return self.job_logs(self.row(owner, identifier(args[0])), int(n))
+            row = self.row(owner, identifier(args[0]))
+            self._require_request_project(owner, row)
+            return self.job_logs(row, int(n))
         if command == 'search' and len(args) in {2, 3}:
             return self.source_search(owner, args[0], args[1], args[2] if len(args) == 3 else None)
         if command == 'asr' and len(args) == 1:
@@ -1363,27 +1921,49 @@ class Broker:
             return self.start(owner, command, value)
         if command == 'renew-embed':
             return self.renew_embed(owner, identifier(value))
-        if command not in ('job-status', 'retry', 'cancel'):
+        if command not in ('retry', 'cancel'):
             raise Refused('COMMAND_NOT_ALLOWED')
         row = self.row(owner, identifier(value))
-        if command == 'job-status':
-            return self.status(row)
+        self._require_request_project(owner, row)
         status = self.status(row)
         if command == 'cancel':
-            if status['status'] not in {'running', 'waiting_quota', 'waiting_retry'}:
+            attempt = self.db.execute(
+                'SELECT job_id FROM attempts WHERE request_id=? AND attempt=?',
+                (row['id'], row['attempt']),
+            ).fetchone()
+            if (status['status'] not in {'queued', 'running', 'waiting_quota', 'waiting_retry'}
+                    and not (attempt is None and row['state'] in {'queued', 'submitting'})):
                 raise Refused('CANCEL_NOT_ALLOWED')
-            bound = self.db.execute('SELECT job_id FROM attempts WHERE request_id=? AND attempt=?',
-                                    (row['id'], row['attempt'])).fetchone()
-            cancelled = self.worker_api('cancel', job_id=bound[0])
-            return {'request_id': row['id'], 'job_id': bound[0], 'status': cancelled['state'],
+            if attempt is None:
+                with self.db:
+                    self.db.execute(
+                        "UPDATE requests SET state='cancelled',updated=? WHERE id=? AND owner=?",
+                        (timestamp(), row['id'], owner),
+                    )
+                return {'request_id': row['id'], 'job_id': None, 'status': 'cancelled',
+                        'cancel_requested': False}
+            cancelled = self.worker_api('cancel', job_id=attempt['job_id'])
+            return {'request_id': row['id'], 'job_id': attempt['job_id'],
+                    'status': cancelled['state'],
                     'cancel_requested': cancelled['cancel_requested'] is True}
-        if status['status'] == 'submitting':
+        if status['status'] in ACTIVE:
             return self.dispatch(row)
         if row['attempt'] >= MAX_ATTEMPTS:
             raise Refused('RETRY_LIMIT')
         if not status['retryable']:
             raise Refused('RETRY_NOT_ALLOWED')
-        entry, fingerprint, chat, topic = self.source(row['source'])
+        try:
+            entry, fingerprint, chat, topic = self.source(row['source'])
+        except Refused as exc:
+            if str(exc) != 'SOURCE_NOT_ALLOWED':
+                raise
+            saved_argv = json.loads(row['argv'])
+            project = self._argv_project(saved_argv)
+            entry, fingerprint, parsed = self._managed_source_entry(owner, row['source'], project)
+            if isinstance(parsed, tuple):
+                chat, topic = parsed
+            else:
+                chat = topic = None
         operation = row['operation']
         if operation in {'asr_pilot', 'asr_full', 'asr_embed'} and entry.get('asr_enabled') is not True:
             raise Refused('ASR_NOT_ENABLED')
@@ -1487,7 +2067,7 @@ class Handler(socketserver.StreamRequestHandler):
             if len(line) > 1024 or not line.endswith(b'\n'):
                 raise Refused('INVALID_REQUEST')
             tokens = json.loads(line)
-            if not isinstance(tokens, list) or not 1 <= len(tokens) <= 4 or not all(
+            if not isinstance(tokens, list) or not 1 <= len(tokens) <= 5 or not all(
                 isinstance(v, str) and len(v) <= 180 for v in tokens
             ):
                 raise Refused('INVALID_REQUEST')
@@ -1528,7 +2108,11 @@ def main():
         SOCKET.unlink(missing_ok=True)
         with socketserver.UnixStreamServer(str(SOCKET), Handler) as server:
             server.uid = int(os.environ.get("KIBER_ANALYST_BROKER_PEER_UID", str(os.getuid())))
-            server.broker = Broker(ROOT, registry(CONFIG))
+            authorized_projects, allow_project_create = read_project_policy(PROJECT_ACCESS)
+            server.broker = Broker(
+                ROOT, registry(CONFIG), authorized_projects=authorized_projects,
+                allow_project_create=allow_project_create,
+            )
             SOCKET.chmod(0o660)
             server.serve_forever()
 
