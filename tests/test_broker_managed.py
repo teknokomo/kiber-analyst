@@ -509,6 +509,199 @@ def test_managed_retry_uses_the_saved_project_not_static_source_project(control)
     assert submitted[-1][1] == submitted[0][1]
 
 
+def test_legacy_static_retry_keeps_its_scope_after_managed_registration(control):
+    app, _projects, jobs, submitted, _api_calls = control
+    app.sources[GITHUB_SOURCE] = {"project": PROJECT}
+    first = app.handle("client", "ingest", GITHUB_SOURCE)
+    original_argv = submitted[-1][1]
+    app.handle("client", "source-add", GITHUB_SOURCE, PROJECT)
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    retried = app.handle("client", "retry", first["request_id"])
+
+    assert retried["attempt"] == 2
+    assert submitted[-1][1] == original_argv
+    assert broker.Broker._argv_project(json.loads(
+        app.row("client", first["request_id"])["argv"]
+    )) == PROJECT
+
+
+def test_managed_embed_retry_uses_normalized_static_source_with_extra_config(control):
+    app, _projects, jobs, submitted, _api_calls = control
+    app.sources[GITHUB_SOURCE] = {
+        "project": PROJECT,
+        "connector_options": {"include_drafts": False},
+    }
+    ingest = app.handle("client", "ingest", GITHUB_SOURCE, PROJECT, "2000-01-01")
+    jobs[ingest["job_id"]]["state"] = "done"
+    embedding = app.handle("client", "embed", GITHUB_SOURCE, PROJECT)
+    original_argv = submitted[-1][1]
+    jobs[embedding["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    retried = app.handle("client", "retry", embedding["request_id"])
+
+    assert retried["attempt"] == 2
+    assert submitted[-1][1] == original_argv
+
+
+def test_project_search_retry_preserves_saved_project_query_and_limit(
+    control, monkeypatch,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    first = app.handle("client", "search-project", PROJECT, "two word query", "7")
+    assert first["error_code"] == "SEARCH_PENDING"
+    original_argv = submitted[-1][1]
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    retried = app.handle("client", "retry", first["request_id"])
+
+    assert retried["attempt"] == 2
+    assert submitted[-1][1] == original_argv
+    assert original_argv == [
+        "search", "two word query", "--project", PROJECT, "--limit", "7", "--json",
+    ]
+
+
+def test_legacy_project_search_retry_scope_is_backfilled_after_restart(
+    control, monkeypatch,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    first = app.handle("client", "search-project", PROJECT, "legacy query", "3")
+    original_argv = submitted[-1][1]
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+    with app.db:
+        app.db.execute(
+            "DELETE FROM project_search_scope WHERE request_id=?", (first["request_id"],),
+        )
+    app.db.close()
+
+    restarted = broker.Broker(
+        app.root, app.sources, app.worker_api, app.submit,
+        authorized_projects={PROJECT}, allow_project_create=True,
+    )
+    try:
+        assert restarted.db.execute(
+            "SELECT count(*) FROM project_search_scope WHERE request_id=?",
+            (first["request_id"],),
+        ).fetchone()[0] == 1
+        retried = restarted.handle("client", "retry", first["request_id"])
+        assert retried["attempt"] == 2
+        assert submitted[-1][1] == original_argv
+    finally:
+        restarted.db.close()
+
+
+@pytest.mark.parametrize(
+    ("revocation", "expected_error"),
+    [("project", "PROJECT_NOT_ALLOWED"), ("source", "SOURCE_REVISION_CHANGED")],
+)
+def test_saved_embed_renewal_rechecks_access_after_broker_restart(
+    control, revocation, expected_error,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    app.sources[GITHUB_SOURCE] = {"project": PROJECT}
+    app.handle("client", "source-add", GITHUB_SOURCE, PROJECT)
+    ingest = app.handle("client", "ingest", GITHUB_SOURCE, PROJECT, "2000-01-01")
+    jobs[ingest["job_id"]]["state"] = "done"
+    embedding = app.handle("client", "embed", GITHUB_SOURCE, PROJECT)
+    current = embedding
+    for attempt in range(1, 4):
+        jobs[current["job_id"]].update(
+            state="failed", progress={"completed_batches": 2},
+            error={"category": "network_error"},
+            result={"status": "failed", "error": {"category": "network_error"}},
+        )
+        if attempt < 3:
+            current = app.handle("client", "retry", embedding["request_id"])
+
+    before_dispatch_count = len(submitted)
+    failed_submit_calls = []
+
+    def fail_worker_submit(_argv, *, idempotency_key):
+        failed_submit_calls.append(idempotency_key)
+        raise JobsError("simulated worker submit outage")
+
+    app.submit = fail_worker_submit
+    with pytest.raises(JobsError, match="simulated worker submit outage"):
+        app.handle("client", "renew-embed", embedding["request_id"])
+    renewal = app.db.execute(
+        "SELECT request_id FROM embed_renewals WHERE previous_request_id=?",
+        (embedding["request_id"],),
+    ).fetchone()
+    assert renewal is not None
+    if revocation == "source":
+        with app.db:
+            app.db.execute(
+                "DELETE FROM managed_sources WHERE owner=? AND source=? AND project=?",
+                ("client", GITHUB_SOURCE, PROJECT),
+            )
+    app.db.close()
+
+    restarted = broker.Broker(
+        app.root, {}, app.worker_api, fail_worker_submit,
+        authorized_projects={PROJECT} if revocation == "source" else set(),
+    )
+    try:
+        with pytest.raises(broker.Refused, match=expected_error):
+            restarted.handle("client", "renew-embed", embedding["request_id"])
+        assert len(submitted) == before_dispatch_count
+        assert len(failed_submit_calls) == 1
+        assert restarted.db.execute(
+            "SELECT count(*) FROM attempts WHERE request_id=?",
+            (renewal["request_id"],),
+        ).fetchone()[0] == 0
+    finally:
+        restarted.db.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [("argv_query", "changed query"), ("argv_limit", "8"),
+     ("argv_project", "other-project"), ("source", "project:other-project")],
+)
+def test_project_search_retry_rejects_tampered_scope_or_parameters(
+    control, monkeypatch, field, replacement,
+):
+    app, _projects, jobs, submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    first = app.handle("client", "search-project", PROJECT, "two word query", "7")
+    row = app.row("client", first["request_id"])
+    argv = json.loads(row["argv"])
+    if field == "argv_query":
+        argv[1] = replacement
+    elif field == "argv_limit":
+        argv[5] = replacement
+    elif field == "argv_project":
+        argv[3] = replacement
+    with app.db:
+        if field == "source":
+            app.db.execute("UPDATE requests SET source=? WHERE id=?", (replacement, row["id"]))
+        else:
+            app.db.execute("UPDATE requests SET argv=? WHERE id=?", (json.dumps(argv), row["id"]))
+    jobs[first["job_id"]].update(
+        state="failed", error={"category": "network_error"},
+        result={"status": "failed", "error": {"category": "network_error"}},
+    )
+
+    with pytest.raises(broker.Refused):
+        app.handle("client", "retry", first["request_id"])
+    assert len(submitted) == 1
+
+
 def test_telegram_dry_run_retry_keeps_the_dry_run_fingerprint_and_flag(
     control, tmp_path,
 ):
@@ -683,6 +876,8 @@ def test_source_search_skips_status_lookup_for_known_terminal_requests(
     app.sources[TELEGRAM_SOURCE] = {"project": PROJECT, "hashes": {}}
     fingerprint = broker.search_fingerprint(TELEGRAM_SOURCE, PROJECT, "repeat query", 1)
     old_request_id = str(uuid.uuid4())
+    old_job_id = str(uuid.uuid4())
+    jobs[old_job_id] = {"state": "done", "progress": {}}
     now = broker.timestamp()
     with app.db:
         app.db.execute(
@@ -694,10 +889,14 @@ def test_source_search_skips_status_lookup_for_known_terminal_requests(
                          "--source-id", TELEGRAM_SOURCE, "--json"]),
              now, now, "done"),
         )
+        app.db.execute(
+            "INSERT INTO attempts(request_id,attempt,job_id,bound,state) VALUES(?,?,?,?,?)",
+            (old_request_id, 1, old_job_id, now, "done"),
+        )
 
     app.handle("client", "search", TELEGRAM_SOURCE, "repeat query", "1")
     status_ids = [kwargs["job_id"] for action, kwargs in api_calls if action == "status"]
-    assert old_request_id not in status_ids
+    assert old_job_id not in status_ids
     assert len(status_ids) == 1
 
 
@@ -740,6 +939,49 @@ def test_unbound_cancel_requires_worker_confirmation(control, monkeypatch):
     with pytest.raises(broker.Refused, match="CANCEL_UNCONFIRMED"):
         app.handle("client", "cancel", another_id)
     assert app.row("client", another_id)["state"] == "submitting"
+
+
+def test_cancelled_unbound_telegram_ingest_is_not_redispatched(control, tmp_path):
+    app, _projects, _jobs, _submitted, _api_calls = control
+    export = _telegram_export(tmp_path)
+    app.sources[TELEGRAM_SOURCE] = {"project": PROJECT}
+    app.handle("client", "source-add", TELEGRAM_SOURCE, PROJECT)
+    original_submit = app.submit
+    original_worker_api = app.worker_api
+    submit_calls = []
+    tombstones = set()
+
+    def submit(argv, *, idempotency_key):
+        submit_calls.append(idempotency_key)
+        if idempotency_key in tombstones:
+            raise JobsError("Job submission was cancelled")
+        if len(submit_calls) == 1:
+            raise JobsError("simulated worker submission outage")
+        return original_submit(argv, idempotency_key=idempotency_key)
+
+    def worker_api(action, **kwargs):
+        result = original_worker_api(action, **kwargs)
+        if action == "cancel-idempotency" and result.get("found") is False:
+            tombstones.add(kwargs["idempotency_key"])
+        return result
+
+    app.submit = submit
+    app.worker_api = worker_api
+    with pytest.raises(JobsError, match="simulated worker submission outage"):
+        app.handle("client", "ingest", TELEGRAM_SOURCE, PROJECT)
+    request_id = app.db.execute(
+        "SELECT id FROM requests WHERE source=? AND operation='ingest'",
+        (TELEGRAM_SOURCE,),
+    ).fetchone()[0]
+    cancelled = app.handle("client", "cancel", request_id)
+    assert cancelled["status"] == "cancelled"
+    assert (export / "messages.jsonl").is_file()
+    attempts_before = len(submit_calls)
+
+    with pytest.raises(broker.Refused, match="INGEST_CANCELLED"):
+        app.handle("client", "ingest", TELEGRAM_SOURCE, PROJECT)
+
+    assert len(submit_calls) == attempts_before
 
 
 def test_telegram_source_status_ignores_newer_request_for_another_project(

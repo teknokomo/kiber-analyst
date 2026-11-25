@@ -102,6 +102,13 @@ unavailable.
   `(source_id, external_ref)`, and external items by
   `(document_id, external_ref)`; repeated loads create no duplicates. Telegram
   segments keep their global `external_ref` uniqueness.
+- Consequently, all topics belonging to one Telegram chat currently share one
+  project scope. Importing a different topic from the same chat into another
+  project is rejected, even when that topic has no overlapping messages. The
+  load lock and conflict check are chat-wide; splitting topics safely requires
+  a separate data-model change to Telegram segment identity and uniqueness.
+  The managed broker accepts an already prepared, complete topic export; it
+  does not invoke Telegram export or transfer the export between services.
 - The same repository may be ingested into two projects: each project gets its
   own documents and segments, and search/embeddings stay scoped to the project.
   Rows are never moved between projects.

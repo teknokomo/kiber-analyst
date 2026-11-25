@@ -172,6 +172,39 @@ def test_import_key_ignores_manifest_export_timestamp(tmp_path: Path) -> None:
     assert first.import_key == second.import_key
 
 
+def test_inspect_export_checks_jsonl_size_before_scanning_and_accepts_exact_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kiber_analyst.telegram_ingest as telegram_ingest
+
+    root = tmp_path / "telegram"
+    topic = _make_export(root)
+    messages = topic / "messages.jsonl"
+    services = topic / "services.jsonl"
+    candidates = (messages, services)
+    largest = max(candidates, key=lambda path: path.stat().st_size)
+    limit = largest.stat().st_size
+
+    inspected = inspect_export(topic, root=root, max_jsonl_bytes=limit)
+    assert inspected.messages_size <= limit
+    assert inspected.services_size <= limit
+
+    _write_private(largest, largest.read_bytes() + b"x")
+    original_scan = telegram_ingest._iter_jsonl_stream
+    scanned_streams = []
+
+    def count_scanned(stream):
+        scanned_streams.append(stream)
+        yield from original_scan(stream)
+
+    monkeypatch.setattr(telegram_ingest, "_iter_jsonl_stream", count_scanned)
+    with pytest.raises(LoadError, match="inspection byte limit"):
+        inspect_export(topic, root=root, max_jsonl_bytes=limit)
+
+    expected_scanned_files = 1 if largest == services else 0
+    assert len(scanned_streams) == expected_scanned_files
+
+
 def test_media_metadata_is_checked_and_missing_media_counted(tmp_path: Path) -> None:
     root = tmp_path / "telegram"
     topic = _make_export(root, media=True)

@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -245,6 +247,21 @@ def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
         assert project_counts(conn, project_a) == project_a_before_dry
         project_a_before_cross_project = project_counts(conn, project_a)
         project_b_before = project_counts(conn, project_b)
+        project_id = conn.execute("SELECT id FROM projects WHERE slug=%s", (project_a,)).fetchone()[0]
+        message_before = conn.execute(
+            """SELECT seg.id, seg.document_id, seg.text, seg.content_hash, seg.meta
+               FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+               JOIN sources so ON so.id=doc.source_id
+               WHERE so.project_id=%s AND seg.external_ref=%s""",
+            (project_id, f"tg:{chat_id}:101"),
+        ).fetchone()
+        assert message_before is not None
+        assert message_before[2] == "Изолированная проверка импорта"
+        search_before = execute_search(
+            conn, "изолированная проверка", project=project_a, vector=None,
+            limit=5, source_id=f"telegram:{chat_id}:topic:1",
+        )
+        assert len(search_before["results"]) == 1
 
     with pytest.raises(LoadError, match="TELEGRAM_PROJECT_CONFLICT"):
         load_telegram_export(
@@ -259,23 +276,14 @@ def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
     with _connect(credentials) as conn:
         assert project_counts(conn, project_b) == project_b_before == (0, 0, 0, 0, 0, 0)
         assert project_counts(conn, project_a) == project_a_before_cross_project
-        project_id = conn.execute("SELECT id FROM projects WHERE slug=%s", (project_a,)).fetchone()[0]
-        message = conn.execute(
+        message_after = conn.execute(
             """SELECT seg.id, seg.document_id, seg.text, seg.content_hash, seg.meta
                FROM segments seg JOIN documents doc ON doc.id=seg.document_id
                JOIN sources so ON so.id=doc.source_id
                WHERE so.project_id=%s AND seg.external_ref=%s""",
             (project_id, f"tg:{chat_id}:101"),
         ).fetchone()
-        assert message is not None
-        assert message[2] == "Изолированная проверка импорта"
-        assert conn.execute(
-            """SELECT seg.id, seg.document_id, seg.text, seg.content_hash, seg.meta
-               FROM segments seg JOIN documents doc ON doc.id=seg.document_id
-               JOIN sources so ON so.id=doc.source_id
-               WHERE so.project_id=%s AND seg.external_ref=%s""",
-            (project_id, f"tg:{chat_id}:101"),
-        ).fetchone() == message
+        assert message_after == message_before
         assert conn.execute(
             "SELECT count(*) FROM segments WHERE external_ref=%s",
             (f"tg:{chat_id}:101",),
@@ -284,14 +292,113 @@ def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
             conn, "изолированная проверка", project=project_a, vector=None,
             limit=5, source_id=f"telegram:{chat_id}:topic:1",
         )
+        assert a_search == search_before
         b_search = execute_search(
             conn, "изолированная проверка", project=project_b, vector=None, limit=5,
         )
         assert len(a_search["results"]) == 1
-        assert a_search["results"][0]["text"] == message[2]
+        assert a_search["results"][0]["text"] == message_before[2]
         assert b_search["results"] == []
         with pytest.raises(SearchError, match="Telegram source or topic does not exist"):
             execute_search(
                 conn, "изолированная проверка", project=project_b, vector=None,
                 limit=5, source_id=f"telegram:{chat_id}:topic:1",
             )
+
+
+def test_concurrent_same_chat_import_keeps_project_a_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dotenv import dotenv_values
+
+    import kiber_analyst.load as load_module
+    from kiber_analyst.errors import LoadError
+    from kiber_analyst.search_core import execute_search
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    project_a = f"kiber-race-a-{uuid.uuid4().hex[:10]}"
+    project_b = f"kiber-race-b-{uuid.uuid4().hex[:10]}"
+    with _connect(credentials) as conn:
+        conn.execute(
+            "INSERT INTO projects (slug, title) VALUES (%s, %s), (%s, %s)",
+            (project_a, "Race A", project_b, "Race B"),
+        )
+
+    export_root = tmp_path / "telegram-race"
+    source = _fixture(export_root)
+    chat_id = json.loads((source / "manifest.json").read_text(encoding="utf-8"))["chat_id"]
+    load_telegram_export(
+        source, tmp_path / "artifacts" / "initial", env_path=Path(TEST_ENV),
+        project_slug=project_a, root=export_root,
+    )
+
+    def project_snapshot(conn, slug: str) -> tuple[tuple[str, ...], ...]:
+        queries = (
+            ("projects", "SELECT to_jsonb(p)::text FROM projects p WHERE p.slug=%s ORDER BY p.id"),
+            ("sources", "SELECT to_jsonb(s)::text FROM sources s JOIN projects p ON p.id=s.project_id WHERE p.slug=%s ORDER BY s.id"),
+            ("snapshots", "SELECT to_jsonb(sn)::text FROM snapshots sn JOIN sources s ON s.id=sn.source_id JOIN projects p ON p.id=s.project_id WHERE p.slug=%s ORDER BY sn.id"),
+            ("documents", "SELECT to_jsonb(d)::text FROM documents d JOIN sources s ON s.id=d.source_id JOIN projects p ON p.id=s.project_id WHERE p.slug=%s ORDER BY d.id"),
+            ("segments", "SELECT to_jsonb(seg)::text FROM segments seg JOIN documents d ON d.id=seg.document_id JOIN sources s ON s.id=d.source_id JOIN projects p ON p.id=s.project_id WHERE p.slug=%s ORDER BY seg.id"),
+            ("runs", "SELECT to_jsonb(r)::text FROM runs r JOIN projects p ON p.id=r.project_id WHERE p.slug=%s ORDER BY r.id"),
+            ("service_events", "SELECT to_jsonb(ev)::text FROM telegram_service_events ev JOIN sources s ON s.id=ev.source_id JOIN projects p ON p.id=s.project_id WHERE p.slug=%s ORDER BY ev.id"),
+        )
+        return tuple(
+            tuple(row[0] for row in conn.execute(query, (slug,)).fetchall())
+            for _name, query in queries
+        )
+
+    with _connect(credentials) as conn:
+        project_a_before = project_snapshot(conn, project_a)
+        project_b_before = project_snapshot(conn, project_b)
+        search_before = execute_search(
+            conn, "изолированная проверка", project=project_a, vector=None,
+            limit=5, source_id=f"telegram:{chat_id}:topic:1",
+        )
+    assert len(search_before["results"]) == 1
+
+    real_connect = load_module._connect
+    connection_barrier = threading.Barrier(3)
+    backend_pids: list[int] = []
+    pid_lock = threading.Lock()
+
+    def synchronized_connect(config):
+        conn = real_connect(config)
+        with pid_lock:
+            backend_pids.append(conn.info.backend_pid)
+        connection_barrier.wait(timeout=20)
+        return conn
+
+    monkeypatch.setattr(load_module, "_connect", synchronized_connect)
+
+    def import_for(slug: str):
+        try:
+            return load_telegram_export(
+                source, tmp_path / "artifacts" / slug, env_path=Path(TEST_ENV),
+                project_slug=slug, root=export_root,
+            )
+        except Exception as exc:  # Return exceptions to the coordinator thread.
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        retry_a = pool.submit(import_for, project_a)
+        conflict_b = pool.submit(import_for, project_b)
+        connection_barrier.wait(timeout=20)
+        result_a = retry_a.result(timeout=30)
+        result_b = conflict_b.result(timeout=30)
+
+    assert len(set(backend_pids)) == 2
+    assert not isinstance(result_a, Exception), repr(result_a)
+    assert (result_a["inserted"], result_a["skipped"]) == (0, 1)
+    assert isinstance(result_b, LoadError)
+    assert "TELEGRAM_PROJECT_CONFLICT" in str(result_b)
+
+    with _connect(credentials) as conn:
+        assert project_snapshot(conn, project_a) == project_a_before
+        assert project_snapshot(conn, project_b) == project_b_before
+        search_after = execute_search(
+            conn, "изолированная проверка", project=project_a, vector=None,
+            limit=5, source_id=f"telegram:{chat_id}:topic:1",
+        )
+        assert search_after == search_before

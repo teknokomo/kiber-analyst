@@ -76,8 +76,11 @@ CREATE TABLE runs (
 
 GRANT USAGE, CREATE ON SCHEMA public TO knowledge_owner;
 GRANT SELECT, INSERT ON schema_migrations TO knowledge_owner;
+GRANT SELECT ON schema_migrations TO knowledge_app;
 GRANT REFERENCES ON projects TO knowledge_owner;
 GRANT SELECT ON projects, sources, documents, segments, embeddings, runs TO knowledge_owner;
 GRANT USAGE ON SCHEMA public TO knowledge_app;
 GRANT SELECT, INSERT, UPDATE ON projects, sources, runs TO knowledge_app;
+GRANT SELECT, INSERT, UPDATE ON embeddings TO knowledge_app;
 GRANT USAGE, SELECT ON SEQUENCE segments_id_seq TO knowledge_app;
+GRANT USAGE, SELECT ON SEQUENCE embeddings_id_seq TO knowledge_app;

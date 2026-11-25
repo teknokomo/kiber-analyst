@@ -418,6 +418,11 @@ class Broker:
                 provider TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', added TEXT NOT NULL,
                 PRIMARY KEY(owner,source,project)
             );
+            CREATE TABLE IF NOT EXISTS project_search_scope (
+                request_id TEXT PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
+                project TEXT NOT NULL, query_sha256 TEXT NOT NULL,
+                result_limit INTEGER NOT NULL, request_fingerprint TEXT NOT NULL
+            );
         """)
         managed_columns = {
             row['name'] for row in self.db.execute('PRAGMA table_info(managed_sources)')
@@ -426,6 +431,44 @@ class Broker:
             self.db.execute(
                 "ALTER TABLE managed_sources ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
             )
+        self._backfill_project_search_scope()
+
+    def _backfill_project_search_scope(self):
+        """Pin parameters of pre-scope project-search requests for future retries."""
+        rows = self.db.execute(
+            """SELECT r.* FROM requests r LEFT JOIN project_search_scope s ON s.request_id=r.id
+               WHERE r.operation='project-search' AND s.request_id IS NULL"""
+        ).fetchall()
+        for row in rows:
+            try:
+                argv = json.loads(row['argv'])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            project = self._argv_project(argv)
+            if (not isinstance(argv, list) or len(argv) != 7 or argv[0] != 'search'
+                    or project is None or row['source'] != f'project:{project}'
+                    or argv[2:5] != ['--project', project, '--limit']
+                    or argv[6] != '--json'):
+                continue
+            query = argv[1]
+            limit_text = argv[5]
+            if (not isinstance(row['fingerprint'], str)
+                    or re.fullmatch(r'[0-9a-f]{64}', row['fingerprint']) is None
+                    or not isinstance(query, str) or not query or query != query.strip()
+                    or len(query) > SEARCH_MAX_QUERY_CHARS
+                    or any(ord(char) < 32 or ord(char) == 127 for char in query)
+                    or query.lstrip().startswith('-')
+                    or not isinstance(limit_text, str)
+                    or re.fullmatch(r'(?:[1-9][0-9]?|50)', limit_text) is None):
+                continue
+            with self.db:
+                self.db.execute(
+                    """INSERT OR IGNORE INTO project_search_scope
+                       (request_id,project,query_sha256,result_limit,request_fingerprint)
+                       VALUES(?,?,?,?,?)""",
+                    (row['id'], project, hashlib.sha256(query.encode()).hexdigest(),
+                     int(limit_text), row['fingerprint']),
+                )
 
     def source(self, source):
         if source not in self.sources:
@@ -466,6 +509,50 @@ class Broker:
         if project is not None and not self._project_granted(owner, project) and not legacy_source_scope:
             raise Refused('PROJECT_NOT_ALLOWED')
         return project
+
+    def _retry_source_candidates(self, owner, source_id, project):
+        """Return current source identities without changing the request's saved scope."""
+        candidates = []
+        static = self.sources.get(source_id)
+        static_matches = isinstance(static, dict) and static.get('project') == project
+        registered = self.db.execute(
+            'SELECT 1 FROM managed_sources WHERE owner=? AND source=? AND project=?',
+            (owner, source_id, project),
+        ).fetchone() is not None
+
+        if registered or static_matches:
+            try:
+                candidates.append(self._managed_source_entry(owner, source_id, project))
+            except Refused:
+                # A legacy static request can still use its exact configured
+                # source scope when no managed project grant exists.
+                pass
+        if static_matches:
+            try:
+                candidates.append(self.source(source_id))
+            except Refused:
+                pass
+        unique = []
+        seen = set()
+        for candidate in candidates:
+            if len(candidate) == 3:
+                entry, fingerprint, parsed = candidate
+                chat, topic = parsed if isinstance(parsed, tuple) and len(parsed) == 2 else (None, None)
+            else:
+                entry, fingerprint, chat, topic = candidate
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                unique.append((entry, fingerprint, chat, topic))
+        return unique
+
+    def _embed_source_for_request(self, owner, row, expected_fingerprint):
+        project = self._require_request_project(owner, row)
+        candidates = self._retry_source_candidates(owner, row['source'], project)
+        for candidate in candidates:
+            if (self._base_fingerprint(candidate[1])
+                    == self._base_fingerprint(expected_fingerprint)):
+                return candidate
+        raise Refused('SOURCE_REVISION_CHANGED')
 
     def project_list(self, owner):
         catalog = self.worker_api('project-catalog', mode='list')
@@ -612,7 +699,11 @@ class Broker:
 
             export_path = self.root / 'imports' / telegram_parts[0] / telegram_parts[1]
             try:
-                export = inspect_export(export_path, root=self.root / 'imports')
+                export = inspect_export(
+                    export_path,
+                    root=self.root / 'imports',
+                    max_jsonl_bytes=CONTROL_FILE_MAX_BYTES,
+                )
             except Exception:
                 raise Refused('TELEGRAM_EXPORT_UNAVAILABLE') from None
             if (export.chat_id != telegram_parts[0]
@@ -1237,6 +1328,16 @@ class Broker:
         for row in relevant:
             if row['source_fingerprint'] == fingerprint:
                 if operation == 'ingest':
+                    bound_attempt = self.db.execute(
+                        'SELECT 1 FROM attempts WHERE request_id=? AND attempt=?',
+                        (row['id'], row['attempt']),
+                    ).fetchone()
+                    if row['state'] == 'cancelled' and bound_attempt is None:
+                        # The worker may have recorded a cancellation tombstone
+                        # for this idempotency key before a job was bound. Never
+                        # redispatch that key; require an explicit new source
+                        # revision/request instead.
+                        raise Refused('INGEST_CANCELLED')
                     self.stage(source_id, entry, base_fingerprint, chat, topic, revision)
                 elif self.status(row)['retryable']:
                     return self.handle(owner, 'retry', row['id'])
@@ -1468,6 +1569,7 @@ class Broker:
             raise Refused('INVALID_LIMIT')
         nonce = str(uuid.uuid4())
         source_key = f'project:{project}'
+        request_id = str(uuid.uuid4())
         fingerprint = hashlib.sha256(json.dumps(
             {'cache_version': SEARCH_CACHE_VERSION, 'project': project,
              'query': query.strip(), 'limit': limit, 'request': nonce},
@@ -1475,13 +1577,19 @@ class Broker:
         ).encode()).hexdigest()
         argv = ['search', query.strip(), '--project', project, '--limit', str(limit), '--json']
         now = timestamp()
-        request_id = str(uuid.uuid4())
         with self.db:
             self.db.execute(
                 'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) '
                 'VALUES(?,?,?,?,?,?,?,?)',
                 (request_id, owner, source_key, fingerprint, 'project-search',
                  json.dumps(argv), now, now),
+            )
+            self.db.execute(
+                """INSERT INTO project_search_scope
+                   (request_id,project,query_sha256,result_limit,request_fingerprint)
+                   VALUES(?,?,?,?,?)""",
+                (request_id, project, hashlib.sha256(query.strip().encode()).hexdigest(),
+                 limit, fingerprint),
             )
         row = self.row(owner, request_id)
         dispatched = self.dispatch(row)
@@ -1532,6 +1640,30 @@ class Broker:
                 return {'request_id': request_id, 'job_id': job_id, 'project': project,
                         'status': state or 'running', 'error_code': 'SEARCH_PENDING'}
             time.sleep(0.5)
+
+    def _validate_project_search_retry(self, row, argv, project):
+        if (not isinstance(project, str) or SLUG_RE.fullmatch(project) is None
+                or row['source'] != f'project:{project}'
+                or not isinstance(argv, list) or len(argv) != 7
+                or argv[0] != 'search' or argv[2:5] != ['--project', project, '--limit']
+                or argv[6] != '--json'):
+            raise Refused('SOURCE_REVISION_CHANGED')
+        query = argv[1]
+        limit_text = argv[5]
+        if (not isinstance(query, str) or not query or query != query.strip()
+                or len(query) > SEARCH_MAX_QUERY_CHARS
+                or any(ord(char) < 32 or ord(char) == 127 for char in query)
+                or query.lstrip().startswith('-') or not isinstance(limit_text, str)
+                or re.fullmatch(r'(?:[1-9][0-9]?|50)', limit_text) is None):
+            raise Refused('SOURCE_REVISION_CHANGED')
+        scope = self.db.execute(
+            'SELECT * FROM project_search_scope WHERE request_id=?', (row['id'],),
+        ).fetchone()
+        if (scope is None or scope['project'] != project
+                or scope['query_sha256'] != hashlib.sha256(query.encode()).hexdigest()
+                or scope['result_limit'] != int(limit_text)
+                or scope['request_fingerprint'] != row['fingerprint']):
+            raise Refused('SOURCE_REVISION_CHANGED')
 
     def source_search(self, owner, source_id, query, limit_text=None, *, entry_override=None):
         if entry_override is None:
@@ -1763,6 +1895,7 @@ class Broker:
         previous = self.row(owner, request_id)
         if previous['operation'] != 'embed':
             raise Refused('RENEW_EMBED_NOT_ALLOWED')
+        self._require_request_project(owner, previous)
         prior_renewal = self.db.execute(
             'SELECT * FROM embed_renewals WHERE previous_request_id=?', (request_id,),
         ).fetchone()
@@ -1772,18 +1905,15 @@ class Broker:
         if (status['status'] != 'failed' or status['attempts_remaining'] != 0
                 or status['error_code'] not in RETRYABLE_ERRORS):
             raise Refused('RENEW_EMBED_NOT_ALLOWED')
-        _, fingerprint, _, _ = self.source(previous['source'])
         old_base = self.db.execute(
             'SELECT base_fingerprint FROM embed_renewals WHERE request_id=?', (request_id,),
         ).fetchone()
         expected_fingerprint = (
             old_base[0] if old_base else self._base_fingerprint(previous['fingerprint'])
         )
-        if (
-            self._base_fingerprint(fingerprint)
-            != self._base_fingerprint(expected_fingerprint)
-        ):
-            raise Refused('SOURCE_REVISION_CHANGED')
+        _entry, fingerprint, _chat, _topic = self._embed_source_for_request(
+            owner, previous, expected_fingerprint,
+        )
         for row in self.db.execute(
             "SELECT * FROM requests WHERE owner=? AND source=? AND operation='embed' AND id<>?",
             (owner, previous['source'], request_id),
@@ -1793,7 +1923,10 @@ class Broker:
         previous_job = self.db.execute(
             'SELECT job_id FROM attempts WHERE request_id=? AND attempt=?',
             (request_id, previous['attempt']),
-        ).fetchone()[0]
+        ).fetchone()
+        if previous_job is None:
+            raise Refused('RENEW_EMBED_NOT_ALLOWED')
+        previous_job = previous_job[0]
         new_id = str(uuid.uuid4())
         new_fingerprint = hashlib.sha256(f"{fingerprint}:renew:{request_id}".encode()).hexdigest()
         now = timestamp()
@@ -1812,7 +1945,13 @@ class Broker:
         ).fetchone())
 
     def renewal_result(self, owner, link):
+        previous = self.row(owner, link['previous_request_id'])
         row = self.row(owner, link['request_id'])
+        if (previous['operation'] != 'embed' or row['operation'] != 'embed'
+                or row['source'] != previous['source'] or row['argv'] != previous['argv']):
+            raise Refused('RENEWAL_SCOPE_INVALID')
+        self._embed_source_for_request(owner, previous, link['base_fingerprint'])
+        self._embed_source_for_request(owner, row, link['base_fingerprint'])
         return {
             **self.dispatch(row),
             'source_id': row['source'],
@@ -2156,42 +2295,54 @@ class Broker:
             raise Refused('RETRY_NOT_ALLOWED')
         saved_argv = json.loads(row['argv'])
         project = self._argv_project(saved_argv)
-        static_entry = self.sources.get(row['source'])
-        registered = self.db.execute(
-            'SELECT 1 FROM managed_sources WHERE owner=? AND source=? AND project=?',
-            (owner, row['source'], project),
-        ).fetchone()
-        if registered is not None:
-            entry, fingerprint, parsed = self._managed_source_entry(owner, row['source'], project)
-            if isinstance(parsed, tuple):
-                chat, topic = parsed
-            else:
-                chat = topic = None
-        elif isinstance(static_entry, dict) and static_entry.get('project') == project:
-            entry, fingerprint, chat, topic = self.source(row['source'])
-        else:
-            raise Refused('SOURCE_REVISION_CHANGED')
         operation = row['operation']
-        if operation in {'asr_pilot', 'asr_full', 'asr_embed'} and entry.get('asr_enabled') is not True:
-            raise Refused('ASR_NOT_ENABLED')
         renewal = self.db.execute(
             'SELECT base_fingerprint FROM embed_renewals WHERE request_id=?', (row['id'],),
         ).fetchone()
         expected_fingerprint = renewal[0] if renewal else row['fingerprint']
+        if operation == 'project-search':
+            entry, fingerprint, chat, topic = {'project': project}, None, None, None
+            candidates = []
+        else:
+            candidates = self._retry_source_candidates(owner, row['source'], project)
+            if not candidates:
+                raise Refused('SOURCE_REVISION_CHANGED')
+            entry, fingerprint, chat, topic = candidates[0]
+        if operation in {'asr_pilot', 'asr_full', 'asr_embed'} and entry.get('asr_enabled') is not True:
+            raise Refused('ASR_NOT_ENABLED')
         if operation == 'ingest' and chat is None:
             # External reruns add a uniqueness suffix to the request fingerprint;
             # validate the source revision against its unsuffixed base.
-            variants = self._source_fingerprint_variants(row['source'], entry)
-            variants.add(fingerprint)
-            if self._base_fingerprint(expected_fingerprint) not in variants:
+            selected = next((candidate for candidate in candidates
+                             if candidate[2] is None and
+                             self._base_fingerprint(expected_fingerprint) in
+                             (self._source_fingerprint_variants(row['source'], candidate[0])
+                              | {candidate[1]})), None)
+            if selected is None:
                 raise Refused('SOURCE_REVISION_CHANGED')
+            entry, fingerprint, chat, topic = selected
         elif operation == 'ingest':
-            revision = media_revision(self.root, chat, topic)
-            current = hashlib.sha256((fingerprint + revision).encode()).hexdigest() if revision else fingerprint
-            if '--dry-run' in saved_argv:
-                current = f'{current}:dry-run'
-            if current != expected_fingerprint:
+            selected = None
+            revision = ''
+            for candidate in candidates:
+                candidate_entry, candidate_fingerprint, candidate_chat, candidate_topic = candidate
+                if candidate_chat is None:
+                    continue
+                candidate_revision = media_revision(
+                    self.root, candidate_chat, candidate_topic,
+                )
+                current = (hashlib.sha256(
+                    (candidate_fingerprint + candidate_revision).encode()
+                ).hexdigest() if candidate_revision else candidate_fingerprint)
+                if '--dry-run' in saved_argv:
+                    current = f'{current}:dry-run'
+                if current == expected_fingerprint:
+                    selected = candidate
+                    revision = candidate_revision
+                    break
+            if selected is None:
                 raise Refused('SOURCE_REVISION_CHANGED')
+            entry, fingerprint, chat, topic = selected
             self.stage(row['source'], entry, fingerprint, chat, topic, revision)
         elif operation in {'asr_pilot', 'asr_full'}:
             meta = self.db.execute(
@@ -2209,13 +2360,16 @@ class Broker:
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'asr_embed':
             overview = self.asr_overview(row['source'])
-            current = hashlib.sha256(json.dumps(
-                {'source_id': row['source'], 'source_fingerprint': fingerprint,
-                 'asr_revision': overview.get('revision'), 'project': entry['project']},
+            selected = next((candidate for candidate in candidates if hashlib.sha256(json.dumps(
+                {'source_id': row['source'], 'source_fingerprint': candidate[1],
+                 'asr_revision': overview.get('revision'), 'project': candidate[0]['project']},
                 sort_keys=True, separators=(',', ':'),
-            ).encode()).hexdigest()
-            if current != expected_fingerprint:
+            ).encode()).hexdigest() == expected_fingerprint), None)
+            if selected is None:
                 raise Refused('SOURCE_REVISION_CHANGED')
+            entry, fingerprint, chat, topic = selected
+        elif operation == 'project-search':
+            self._validate_project_search_retry(row, saved_argv, project)
         elif operation == 'search':
             argv = json.loads(row['argv'])
             parsed_source = parse_source_id(row['source'])
@@ -2249,11 +2403,9 @@ class Broker:
             if self._base_fingerprint(expected_fingerprint) != current:
                 raise Refused('SOURCE_REVISION_CHANGED')
         elif operation == 'embed':
-            if (
-                self._base_fingerprint(fingerprint)
-                != self._base_fingerprint(expected_fingerprint)
-            ):
-                raise Refused('SOURCE_REVISION_CHANGED')
+            entry, fingerprint, chat, topic = self._embed_source_for_request(
+                owner, row, expected_fingerprint,
+            )
         else:
             raise Refused('RETRY_NOT_ALLOWED')
         active_operations = (

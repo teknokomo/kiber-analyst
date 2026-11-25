@@ -131,10 +131,18 @@ def test_root_control_does_not_require_media_account_lookup(tmp_path: Path, monk
         worker.handle(1001, {"action": "project-catalog", "mode": "list"})
 
 
-def test_worker_cancels_broker_submission_by_idempotency_key(tmp_path: Path) -> None:
+def test_worker_cancels_broker_submission_by_idempotency_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
     store = JobStore(tmp_path / "queue", require_mount=False)
     store.initialize()
     worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    monkeypatch.setattr(
+        "kiber_analyst.worker.pwd.getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=4321),
+    )
     request_id = str(uuid.uuid4())
     key = f"broker:{request_id}:1"
 
