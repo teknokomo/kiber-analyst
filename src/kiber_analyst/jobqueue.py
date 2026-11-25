@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import threading
@@ -51,6 +52,22 @@ def parse_utc(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         raise ValueError("timestamp must be timezone-aware")
+    return parsed.astimezone(UTC)
+
+
+_RFC3339_UTC = re.compile(
+    r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)\Z"
+)
+
+
+def parse_rfc3339_utc(value: str) -> datetime:
+    """Parse an explicit RFC 3339 UTC timestamp; reject local/other offsets."""
+    if not isinstance(value, str) or not _RFC3339_UTC.fullmatch(value):
+        raise ValueError("timestamp must be RFC 3339 UTC")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise ValueError("timestamp must be UTC")
     return parsed.astimezone(UTC)
 
 
@@ -316,7 +333,7 @@ class JobStore:
         with self._write_lock, self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             current_version = int(db.execute("PRAGMA user_version").fetchone()[0])
-            if current_version > 2:
+            if current_version > 3:
                 raise JobsError("Queue schema is newer than this worker supports")
             from kiber_analyst.gemini_quota import SCHEMA as GEMINI_QUOTA_SCHEMA
 
@@ -331,6 +348,24 @@ class JobStore:
                         + QUEUE_SCHEMA_V2
                         + "\nPRAGMA user_version=2;\nCOMMIT;"
                     )
+                except sqlite3.Error:
+                    if db.in_transaction:
+                        db.rollback()
+                    raise
+            if current_version <= 2:
+                try:
+                    db.executescript("""BEGIN IMMEDIATE;
+                        ALTER TABLE jobs ADD COLUMN schedule_owner TEXT NOT NULL DEFAULT 'provider'
+                          CHECK(schedule_owner IN ('operator','provider'));
+                        UPDATE jobs SET schedule_owner='operator'
+                        WHERE next_run_at IS NOT NULL AND (
+                          SELECT kind FROM job_events
+                          WHERE job_id=jobs.id AND kind IN
+                            ('scheduled','rescheduled','waiting_quota','waiting_retry')
+                          ORDER BY seq DESC LIMIT 1
+                        ) IN ('scheduled','rescheduled');
+                        PRAGMA user_version=3;
+                        COMMIT;""")
                 except sqlite3.Error:
                     if db.in_transaction:
                         db.rollback()
@@ -382,6 +417,8 @@ class JobStore:
         command: dict[str, Any],
         fingerprint: str,
         deadline_hours: float = 24,
+        deadline_at: str | None = None,
+        next_run_at: str | None = None,
         priority: int = 0,
         items: list[dict[str, Any]] | None = None,
         idempotency_key: str | None = None,
@@ -395,12 +432,45 @@ class JobStore:
         ).hexdigest()
         with self.transaction() as db:
             def insert_job(job_key: str) -> tuple[sqlite3.Row, bool]:
+                existing = db.execute(
+                    "SELECT * FROM jobs WHERE idempotency_key=?", (job_key,)
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["operation"] != operation
+                        or existing["fingerprint"] != fingerprint
+                    ):
+                        raise JobsError(
+                            "Idempotency key was already used for a different job"
+                        )
+                    return existing, False
+
+                if deadline_at is None:
+                    deadline = now + timedelta(hours=deadline_hours)
+                else:
+                    try:
+                        deadline = parse_rfc3339_utc(deadline_at)
+                    except (TypeError, ValueError):
+                        raise JobsError("Deadline must be RFC 3339 UTC") from None
+                    if not now < deadline <= now + timedelta(hours=72):
+                        raise JobsError(
+                            "Deadline must be within 72 hours of job creation"
+                        )
+                scheduled = None
+                if next_run_at is not None:
+                    try:
+                        scheduled = parse_rfc3339_utc(next_run_at)
+                    except (TypeError, ValueError):
+                        raise JobsError("Next run time must be RFC 3339 UTC") from None
+                    if not now <= scheduled < deadline:
+                        raise JobsError("Next run time must be before the deadline")
+
                 job_id = str(uuid.uuid4())
                 db.execute(
                     """INSERT INTO jobs
                        (id,operation,command_json,fingerprint,idempotency_key,state,priority,
-                        created_at,updated_at,deadline_at)
-                       VALUES(?,?,?,?,?,'queued',?,?,?,?)
+                        created_at,updated_at,deadline_at,next_run_at,schedule_owner)
+                       VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)
                        ON CONFLICT(idempotency_key) DO NOTHING""",
                     (
                         job_id,
@@ -411,7 +481,9 @@ class JobStore:
                         priority,
                         iso_utc(now),
                         iso_utc(now),
-                        iso_utc(now + timedelta(hours=deadline_hours)),
+                        iso_utc(deadline),
+                        iso_utc(scheduled) if scheduled else None,
+                        "operator" if scheduled else "provider",
                     ),
                 )
                 inserted_row = db.execute(
@@ -427,6 +499,13 @@ class JobStore:
                 was_created = inserted_row["id"] == job_id
                 if was_created:
                     self.event(db, job_id, "submitted", {"operation": operation})
+                    if scheduled is not None:
+                        self.event(
+                            db,
+                            job_id,
+                            "scheduled",
+                            {"next_run_at": iso_utc(scheduled)},
+                        )
                     job_dir = self.jobs_dir / job_id
                     job_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
                     os.chmod(job_dir,0o700)
@@ -659,7 +738,7 @@ class JobStore:
                 result = None
             else:
                 updated = db.execute(
-                    "UPDATE jobs SET state='running',updated_at=?,next_run_at=NULL WHERE id=? AND state=?",
+                    "UPDATE jobs SET state='running',updated_at=?,next_run_at=NULL,schedule_owner='provider' WHERE id=? AND state=?",
                     (now, row["id"], row["state"]),
                 )
                 if updated.rowcount != 1:
@@ -837,7 +916,7 @@ class JobStore:
             raise JobsError("Invalid wait state")
         with self.transaction() as db:
             db.execute(
-                """UPDATE jobs SET state=?,next_run_at=?,diagnostic_json=?,updated_at=?
+                """UPDATE jobs SET state=?,next_run_at=?,schedule_owner='provider',diagnostic_json=?,updated_at=?
                    WHERE id=? AND state='running'""",
                 (state, iso_utc(next_run_at), canonical_json(diagnostic), iso_utc(), job_id),
             )
@@ -983,7 +1062,7 @@ class JobStore:
             try:
                 integrity=source.execute("PRAGMA integrity_check").fetchone()
                 version=int(source.execute("PRAGMA user_version").fetchone()[0])
-                if not integrity or integrity[0]!="ok" or version not in {1,2}:
+                if not integrity or integrity[0]!="ok" or version not in {1,2,3}:
                     raise JobsError("Queue backup failed integrity or schema-version validation")
                 temporary=self.db_path.with_name("queue.db.restore.tmp")
                 target=sqlite3.connect(temporary)
@@ -1034,6 +1113,68 @@ class JobStore:
                 (iso_utc(deadline), iso_utc(), job_id),
             )
             self.event(db, job_id, "deadline_extended", {"hours": hours})
+        return self.get(job_id)
+
+    def set_deadline(self, job_id: str, deadline_at: str) -> JobRecord:
+        """Set an absolute deadline idempotently, without extending past 72h."""
+        try:
+            deadline = parse_rfc3339_utc(deadline_at)
+        except (TypeError, ValueError):
+            raise JobsError("Deadline must be RFC 3339 UTC") from None
+        now = utc_now()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise JobsError("Job not found")
+            if row["state"] not in {"queued", "waiting_quota", "waiting_retry"}:
+                raise JobsError("Only queued or waiting jobs can change deadline")
+            current = parse_utc(row["deadline_at"])
+            if deadline == current:
+                return self._record(row)
+            created = parse_utc(row["created_at"])
+            if deadline < current:
+                raise JobsError("Deadline cannot be shortened")
+            if not now < deadline <= created + timedelta(hours=72):
+                raise JobsError("Deadline must be in the future and within 72 hours of creation")
+            if row["next_run_at"] and deadline <= parse_utc(row["next_run_at"]):
+                raise JobsError("Deadline must be after the scheduled run time")
+            db.execute(
+                "UPDATE jobs SET deadline_at=?,updated_at=? WHERE id=?",
+                (iso_utc(deadline), iso_utc(now), job_id),
+            )
+            self.event(db, job_id, "deadline_set", {"deadline_at": iso_utc(deadline)})
+        return self.get(job_id)
+
+    def reschedule(self, job_id: str, at: str) -> JobRecord:
+        """Move only a queued/waiting job; provider cooldown state is untouched."""
+        try:
+            scheduled = parse_rfc3339_utc(at)
+        except (TypeError, ValueError):
+            raise JobsError("Next run time must be RFC 3339 UTC") from None
+        now = utc_now()
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise JobsError("Job not found")
+            if row["state"] not in {"queued", "waiting_quota", "waiting_retry"}:
+                raise JobsError("Only queued or waiting jobs can be rescheduled")
+            current = parse_utc(row["next_run_at"]) if row["next_run_at"] else None
+            if scheduled == current:
+                if row["schedule_owner"] != "operator":
+                    db.execute("UPDATE jobs SET schedule_owner='operator' WHERE id=?", (job_id,))
+                return self._record(row)
+            deadline = parse_utc(row["deadline_at"])
+            if not now <= scheduled < deadline:
+                raise JobsError("Next run time must be before the deadline")
+            db.execute(
+                "UPDATE jobs SET next_run_at=?,schedule_owner='operator',updated_at=? WHERE id=?",
+                (iso_utc(scheduled), iso_utc(now), job_id),
+            )
+            self.event(db, job_id, "rescheduled", {"next_run_at": iso_utc(scheduled)})
         return self.get(job_id)
 
     def next_wake_seconds(self, cap: float = 30.0) -> float:

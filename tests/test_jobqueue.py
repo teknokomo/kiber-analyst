@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from kiber_analyst import jobqueue
 from kiber_analyst.jobqueue import (
     JobsError,
     JobStore,
     _resolved_within,
     iso_utc,
+    parse_rfc3339_utc,
     utc_now,
 )
 
@@ -60,6 +62,105 @@ def test_idempotency_key_cannot_be_reused_for_different_input(tmp_path: Path) ->
             fingerprint="b" * 64,
             idempotency_key="same",
         )
+
+
+def test_scheduled_job_is_durable_and_not_claimed_before_next_run(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    now = utc_now()
+    scheduled = now + timedelta(hours=2)
+    deadline = now + timedelta(hours=24)
+    job, created = store.create_job(
+        operation="search",
+        command={"query": "test"},
+        fingerprint="c" * 64,
+        idempotency_key="scheduled",
+        deadline_at=iso_utc(deadline),
+        next_run_at=iso_utc(scheduled),
+    )
+
+    assert created
+    assert store.get(job.id).next_run_at is not None
+    assert store.claim() is None
+
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE jobs SET deadline_at=? WHERE id=?",
+            (iso_utc(utc_now() - timedelta(seconds=1)), job.id),
+        )
+    duplicate, created_again = store.create_job(
+        operation="search", command={"query": "test"}, fingerprint="c" * 64,
+        idempotency_key="scheduled", deadline_at=iso_utc(utc_now() - timedelta(hours=1)),
+        next_run_at=iso_utc(utc_now() + timedelta(hours=2)),
+    )
+    assert duplicate.id == job.id and not created_again
+
+
+def test_absolute_deadline_and_reschedule_are_idempotent_and_bounded(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    job, _ = create_job(store)
+    initial = parse_rfc3339_utc(job.deadline_at)
+    extended = initial + timedelta(hours=12)
+    # Keep the target under the per-job 72-hour ceiling.
+    created = parse_rfc3339_utc(job.created_at)
+    extended = min(extended, created + timedelta(hours=72))
+    deadline_text = iso_utc(extended)
+
+    assert store.set_deadline(job.id, deadline_text).deadline_at == deadline_text
+    assert store.set_deadline(job.id, deadline_text).deadline_at == deadline_text
+    with store.connect() as db:
+        assert db.execute(
+            "SELECT count(*) FROM job_events WHERE job_id=? AND kind='deadline_set'",
+            (job.id,),
+        ).fetchone()[0] == 1
+
+    scheduled = utc_now() + timedelta(hours=1)
+    scheduled_text = iso_utc(scheduled)
+    assert store.reschedule(job.id, scheduled_text).next_run_at == scheduled_text
+    assert store.reschedule(job.id, scheduled_text).next_run_at == scheduled_text
+    assert store.claim() is None
+
+    with pytest.raises(ValueError, match="RFC 3339 UTC"):
+        parse_rfc3339_utc("2026-11-23T12:00:00+03:00")
+    with pytest.raises(ValueError, match="RFC 3339 UTC"):
+        parse_rfc3339_utc("2026-11-23 12:00:00")
+
+
+def test_same_schedule_and_deadline_are_idempotent_after_their_times_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = make_store(tmp_path)
+    start = datetime(2026, 11, 25, 10, 0, tzinfo=UTC)
+    deadline = start + timedelta(hours=1)
+    scheduled = start + timedelta(minutes=30)
+    monkeypatch.setattr(jobqueue, "utc_now", lambda: start)
+    job, _ = store.create_job(
+        operation="search",
+        command={"query": "test"},
+        fingerprint="d" * 64,
+        idempotency_key="past-schedule-retry",
+        deadline_at=iso_utc(deadline),
+        next_run_at=iso_utc(scheduled),
+    )
+
+    monkeypatch.setattr(jobqueue, "utc_now", lambda: deadline + timedelta(seconds=1))
+    assert store.reschedule(job.id, iso_utc(scheduled)).next_run_at == iso_utc(scheduled)
+    assert store.set_deadline(job.id, iso_utc(deadline)).deadline_at == iso_utc(deadline)
+
+    with store.connect() as db:
+        row = db.execute(
+            "SELECT deadline_at,next_run_at,updated_at FROM jobs WHERE id=?", (job.id,)
+        ).fetchone()
+        assert row["deadline_at"] == iso_utc(deadline)
+        assert row["next_run_at"] == iso_utc(scheduled)
+        assert row["updated_at"] == iso_utc(start)
+        assert db.execute(
+            "SELECT count(*) FROM job_events WHERE job_id=? AND kind='rescheduled'",
+            (job.id,),
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT count(*) FROM job_events WHERE job_id=? AND kind='deadline_set'",
+            (job.id,),
+        ).fetchone()[0] == 0
 
 
 def test_expired_job_has_a_retrievable_persisted_result(tmp_path: Path) -> None:
@@ -187,6 +288,7 @@ def test_queue_initialization_rejects_symlinked_database(tmp_path: Path) -> None
 
 def _downgrade_test_queue_to_v1(store: JobStore) -> None:
     with store.transaction() as db:
+        db.execute("ALTER TABLE jobs DROP COLUMN schedule_owner")
         db.execute("DROP VIEW quota_ledger")
         db.execute("DROP TABLE quota_events")
         db.execute("DROP TABLE interactive_attempts")
@@ -203,7 +305,7 @@ def test_sqlite_v1_migration_is_repeatable_and_preserves_jobs(tmp_path: Path) ->
     store.initialize()
 
     with store.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert db.execute("SELECT id FROM jobs").fetchone()[0] == job.id
         assert db.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN "
@@ -214,7 +316,7 @@ def test_sqlite_v1_migration_is_repeatable_and_preserves_jobs(tmp_path: Path) ->
         ).fetchone()[0] == 1
 
 
-def test_v1_backup_restore_can_be_upgraded_to_v2(tmp_path: Path) -> None:
+def test_v1_backup_restore_can_be_upgraded_to_v3(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     job, _ = create_job(store, key="restore-v1")
     _downgrade_test_queue_to_v1(store)
@@ -230,8 +332,29 @@ def test_v1_backup_restore_can_be_upgraded_to_v2(tmp_path: Path) -> None:
 
     store.initialize()
     with store.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert db.execute("SELECT id FROM jobs").fetchone()[0] == job.id
+
+
+def test_v2_upgrade_recovers_schedule_owner_by_event_sequence_and_restores_backup(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    job, _ = create_job(store, key="legacy")
+    assert store.claim() is not None
+    store.postpone(job.id, "waiting_quota", utc_now() + timedelta(hours=1), {"reason": "all_profiles_disabled"})
+    target = iso_utc(utc_now() + timedelta(hours=2))
+    store.reschedule(job.id, target)
+    with store.transaction() as db:
+        db.execute("UPDATE job_events SET at='2026-01-01T00:00:00Z' WHERE job_id=?", (job.id,))
+        db.execute("ALTER TABLE jobs DROP COLUMN schedule_owner")
+        db.execute("PRAGMA user_version=2")
+    store.initialize()
+    store.initialize()
+    with store.connect() as db:
+        assert db.execute("SELECT schedule_owner FROM jobs WHERE id=?", (job.id,)).fetchone()[0] == "operator"
+    backup = store.backup(pre_upgrade=True)
+    store.restore_from_backup(backup)
+    store.initialize()
+    assert store.get(job.id).next_run_at == target
 
 
 def test_interactive_restart_audits_uncertain_quota_and_abandons_request(

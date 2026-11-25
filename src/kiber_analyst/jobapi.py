@@ -372,6 +372,8 @@ def submit_command(
     strategy: str | None = None,
     profile: str | None = None,
     idempotency_key: str | None = None,
+    deadline_at: str | None = None,
+    next_run_at: str | None = None,
     socket_path: Path = DEFAULT_SOCKET,
 ) -> dict[str, Any]:
     if profile and (pool or strategy):
@@ -385,6 +387,8 @@ def submit_command(
             "strategy": strategy,
             "profile": profile,
             "idempotency_key": idempotency_key,
+            "deadline_at": deadline_at,
+            "next_run_at": next_run_at,
         },
     )
 
@@ -396,6 +400,6 @@ def wait_job(job_id: str, timeout: int = 30, *, socket_path: Path = DEFAULT_SOCK
 
 
 def api_call(action: str, *, socket_path: Path = DEFAULT_SOCKET, **payload: Any) -> dict[str, Any]:
-    if action not in {"status","result","ack","cancel","backup","extend","reset_profile","doctor","source-overview","asr-source-overview","queue-overview","provider-overview","provider-probe","job-log"}:
+    if action not in {"status","result","ack","cancel","backup","extend","set-deadline","reschedule","reset_profile","doctor","source-overview","asr-source-overview","queue-overview","provider-overview","provider-probe","job-log"}:
         raise JobsError("Unsupported worker operation")
     return request(socket_path,{"action":action,**payload},timeout=65)

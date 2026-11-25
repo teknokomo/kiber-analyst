@@ -20,6 +20,24 @@ def test_job_api_accepts_supported_search_and_fingerprints_filters() -> None:
     assert len(items[0]["fingerprint"]) == 64
 
 
+def test_worker_submit_and_schedule_controls_use_explicit_allowlisted_actions(monkeypatch) -> None:
+    captured = []
+    monkeypatch.setattr(jobapi, "request", lambda _socket, payload, **_kwargs: captured.append(payload) or {})
+    jobapi.submit_command(
+        ["search", "query", "--project", "sample-project"],
+        idempotency_key="scheduled-request",
+        deadline_at="2026-11-24T12:00:00Z",
+        next_run_at="2026-11-24T10:00:00Z",
+    )
+    jobapi.api_call("set-deadline", job_id="job", deadline_at="2026-11-24T12:00:00Z")
+    jobapi.api_call("reschedule", job_id="job", at="2026-11-24T10:00:00Z")
+    assert captured[0]["deadline_at"] == "2026-11-24T12:00:00Z"
+    assert captured[0]["next_run_at"] == "2026-11-24T10:00:00Z"
+    assert [payload["action"] for payload in captured[1:]] == ["set-deadline", "reschedule"]
+    with pytest.raises(JobsError, match="Unsupported worker operation"):
+        jobapi.api_call("execute-shell")
+
+
 def test_telegram_ingest_item_fingerprint_matches_worker_import_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
