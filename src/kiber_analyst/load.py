@@ -25,6 +25,10 @@ class _DryRunRollback(Exception):
     """Internal signal to roll back a fully executed dry-run transaction."""
 
 
+class TelegramProjectConflict(LoadError):
+    """A Telegram message reference is already owned by another project."""
+
+
 def document_title_for(topic_id: str | None, topic_title: str | None) -> str | None:
     return topic_title if topic_id is not None else NO_TOPIC_TITLE
 
@@ -79,6 +83,8 @@ def _connect(config: dict[str, str]) -> Any:
 
 
 def _safe_error(exc: Exception, config: dict[str, str] | None) -> str:
+    if isinstance(exc, TelegramProjectConflict):
+        return "TELEGRAM_PROJECT_CONFLICT"
     state = getattr(exc, "sqlstate", None)
     if not isinstance(state, str) or not re.fullmatch(r"[0-9A-Z]{5}", state):
         state = None
@@ -120,6 +126,60 @@ def _precount_messages(path: Path) -> tuple[Counter[str | None], int]:
     for record in iter_messages(path):
         counts[_group_key(record)] += 1
     return counts, sum(counts.values())
+
+
+def _assert_telegram_refs_project(
+    cursor: Any, path: Path, project_slug: str, chat_id: str
+) -> None:
+    """Reject cross-project Telegram refs before creating any knowledge rows."""
+    cursor.execute(
+        """SELECT 1
+           FROM sources src
+           JOIN projects project ON project.id = src.project_id
+           WHERE src.kind = 'telegram' AND src.external_id = %s
+             AND project.slug IS DISTINCT FROM %s
+           LIMIT 1""",
+        (chat_id, project_slug),
+    )
+    if cursor.fetchone() is not None:
+        raise TelegramProjectConflict("Telegram source is already assigned to another project")
+
+    references: list[str] = []
+
+    def check_batch() -> None:
+        if not references:
+            return
+        cursor.execute(
+            """SELECT 1
+               FROM segments seg
+               JOIN documents doc ON doc.id = seg.document_id
+               JOIN sources src ON src.id = doc.source_id
+               JOIN projects project ON project.id = src.project_id
+               WHERE seg.external_ref = ANY(%s)
+                 AND project.slug IS DISTINCT FROM %s
+               LIMIT 1""",
+            (references, project_slug),
+        )
+        if cursor.fetchone() is not None:
+            raise TelegramProjectConflict("Telegram source is already assigned to another project")
+        references.clear()
+
+    for record in iter_messages(path):
+        record_chat_id = record.get("chat_id")
+        message_id = record.get("message_id")
+        message_id_text = str(message_id) if isinstance(message_id, (str, int)) else ""
+        if (
+            isinstance(record_chat_id, bool)
+            or not isinstance(record_chat_id, (str, int))
+            or str(record_chat_id) != chat_id
+            or isinstance(message_id, bool)
+            or re.fullmatch(r"[1-9][0-9]{0,18}", message_id_text) is None
+        ):
+            raise LoadError("Normalized Telegram message identity is invalid")
+        references.append(f"tg:{chat_id}:{message_id_text}")
+        if len(references) == 500:
+            check_batch()
+    check_batch()
 
 
 def _project_id(cursor: Any, project_slug: str = PROJECT_SLUG) -> str:
@@ -387,6 +447,7 @@ def _upsert_segment(
     record: dict[str, Any],
     document_id: str,
     seq: int,
+    project_id: str,
 ) -> str:
     message_id = record.get("message_id")
     chat_id = record.get("chat_id")
@@ -403,8 +464,12 @@ def _upsert_segment(
     posted_at = _posted_at(record)
     speaker = record.get("author") if isinstance(record.get("author"), str) else None
     cursor.execute(
-        """SELECT id, document_id, seq, content_hash, speaker, posted_at, meta
-           FROM segments WHERE external_ref = %s""",
+        """SELECT seg.id, seg.document_id, seg.seq, seg.content_hash,
+                  seg.speaker, seg.posted_at, seg.meta, src.project_id
+           FROM segments seg
+           JOIN documents doc ON doc.id = seg.document_id
+           JOIN sources src ON src.id = doc.source_id
+           WHERE seg.external_ref = %s""",
         (external_ref,),
     )
     existing = cursor.fetchone()
@@ -417,7 +482,12 @@ def _upsert_segment(
             old_speaker,
             old_posted,
             old_meta_value,
+            old_project_id,
         ) = existing
+        if str(old_project_id) != project_id:
+            raise TelegramProjectConflict(
+                "Telegram source is already assigned to another project"
+            )
         old_meta = _db_json(old_meta_value)
         text_changed = old_hash != content_hash
         was_absent = old_meta.get("presence") == "absent_in_snapshot"
@@ -624,17 +694,29 @@ def load_job(
         conn = _connect(config)
         try:
             with conn.transaction(), conn.cursor() as cursor:
+                chat_value = manifest.get("chat_id")
+                if (
+                    isinstance(chat_value, bool)
+                    or not isinstance(chat_value, (str, int))
+                    or re.fullmatch(r"-?[1-9][0-9]{0,18}", str(chat_value)) is None
+                ):
+                    raise LoadError("manifest.json is missing a valid chat_id")
+                chat_id = str(chat_value)
+                # Lock by Telegram chat identity, not project-specific source UUID,
+                # so concurrent imports into different projects cannot race.
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"telegram-project-import:{chat_id}",),
+                )
+                _assert_telegram_refs_project(
+                    cursor, paths["messages"], project_slug, chat_id,
+                )
                 project_id = _project_id(cursor, project_slug)
                 source_id = _source_id(cursor, project_id, manifest)
                 snapshot_id = _snapshot_id(
                     cursor, source_id, sha256, size, uri, scope, scope_topic_id
                 )
                 import_key = manifest.get("telegram_import_key")
-                if service_events_path is not None:
-                    cursor.execute(
-                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                        (f"telegram-ingest:{source_id}",),
-                    )
                 topic_data = {
                     str(item.get("topic_id")): item.get("topic_title")
                     for item in manifest.get("parse", {}).get("topics", [])
@@ -725,7 +807,9 @@ def load_job(
                         if document_id is None:
                             raise LoadError(f"No export document prepared for topic {topic_id!r}")
                         seq_by_doc[document_id] += 1
-                        outcome = _upsert_segment(cursor, record, document_id, seq_by_doc[document_id])
+                        outcome = _upsert_segment(
+                            cursor, record, document_id, seq_by_doc[document_id], project_id,
+                        )
                         counters[outcome] += 1
                         message_ref = f"tg:{record.get('chat_id')}:{record.get('message_id')}"
                         refs_by_doc[document_id].add(message_ref)
@@ -781,9 +865,11 @@ def load_job(
         rolled_back = True
     except Exception as exc:
         safe_error = _safe_error(exc, config)
-        if not dry_run:
+        failed_run_recorded = False
+        if not dry_run and not isinstance(exc, TelegramProjectConflict):
             try:
                 _write_failed_run(config, manifest, job_dir, safe_error, project_slug)
+                failed_run_recorded = True
             except Exception as failed_run_exc:  # noqa: BLE001 - failed-run write is best effort
                 safe_error += f"; failed-run record could not be written ({type(failed_run_exc).__name__})"
         manifest["load"] = {
@@ -803,7 +889,7 @@ def load_job(
             "errors": 1,
             "project_slug": project_slug,
             "project_id": None,
-            "failed_run_recorded": not dry_run,
+            "failed_run_recorded": failed_run_recorded,
             "error": safe_error,
         }
         write_json_atomic(paths["manifest"], manifest)

@@ -118,6 +118,7 @@ PostgreSQL integration tests are skipped unless an isolated disposable test data
 - `docs/` describes the data flow, schema, installation, search, and security boundaries.
 - `examples/synthetic/` and `tests/` contain invented data only.
 - Trusted operator-side queue integrations can set absolute job deadlines and start times; see [scheduled queue jobs](docs/job-scheduling.md).
+- The project-scoped restricted broker workflow is described in [managed source control](docs/managed-control.md); Telegram export uses a separate restricted interface.
 
 Provider keys and proxy credentials belong in local configuration files or a secret manager; never commit them. The MCP listener should bind to loopback and use a read-only database role. The broker accepts only its configured source allowlist and fixed operations; do not expose its socket to untrusted users. See [SECURITY.md](SECURITY.md) and [docs/security.md](docs/security.md).
 

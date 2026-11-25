@@ -20,10 +20,13 @@ ROOT = Path(__file__).parents[1]
 BASELINE_SQL = ROOT / "tests/fixtures/migration_runner_baseline.sql"
 MIGRATIONS = ROOT / "migrations"
 ADMIN_DSN = os.environ.get("KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN")
-pytestmark = pytest.mark.skipif(
-    not ADMIN_DSN,
-    reason="set KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN for an isolated disposable PostgreSQL service",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not ADMIN_DSN,
+        reason="set KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN for an isolated disposable PostgreSQL service",
+    ),
+    pytest.mark.usefixtures("loopback_postgres_driver"),
+]
 
 
 def test_runner_dry_run_target_full_lock_and_atomic_rollback(tmp_path: Path) -> None:

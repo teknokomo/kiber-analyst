@@ -18,21 +18,23 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 TEST_ENV = os.environ.get("KIBER_ANALYST_INGEST_TEST_ENV")
-pytestmark = pytest.mark.skipif(
-    not TEST_ENV or not Path(TEST_ENV).is_file(),
-    reason="set KIBER_ANALYST_INGEST_TEST_ENV to an isolated disposable test database env file",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not TEST_ENV or not Path(TEST_ENV).is_file(),
+        reason="set KIBER_ANALYST_INGEST_TEST_ENV to an isolated disposable test database env file",
+    ),
+    pytest.mark.usefixtures("disposable_postgres_credentials"),
+]
 
 MIGRATION = Path(__file__).parents[1] / "migrations" / "0006_external_discussions.sql"
 
 
 def _connect(credentials: dict[str, str], *, autocommit: bool = True):
-    return psycopg.connect(
-        host=credentials["KNOWLEDGE_HOST"],
-        port=int(credentials["KNOWLEDGE_PORT"]),
-        dbname=credentials["KNOWLEDGE_DB"],
-        user=credentials["KNOWLEDGE_USER"],
-        password=credentials["KNOWLEDGE_PASSWORD"],
+    from conftest import connect_validated_postgres
+
+    return connect_validated_postgres(
+        credentials,
+        psycopg.connect,
         autocommit=autocommit,
     )
 
@@ -1212,12 +1214,14 @@ def test_tsv_migration_converts_plain_column_and_is_idempotent(tmp_path: Path) -
     database owner (the migration rewrites the table, so the application role
     cannot run it).
     """
+    from conftest import validate_disposable_postgres_credentials
     from dotenv import dotenv_values
 
     from kiber_analyst.external_load import load_external
 
-    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
-    owner_password = credentials.get("TEST_OWNER_PASSWORD")
+    values = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
+    credentials = validate_disposable_postgres_credentials(values)
+    owner_password = values.get("TEST_OWNER_PASSWORD")
     if not owner_password:
         pytest.skip("TEST_OWNER_PASSWORD is required to apply migration 0007")
 

@@ -85,6 +85,84 @@ def test_agents_cannot_pin_a_provider_profile(tmp_path: Path) -> None:
     assert submitted["state"] == "queued"
 
 
+def test_project_catalog_is_fixed_and_worker_only(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from kiber_analyst import project_catalog
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    monkeypatch.setattr(project_catalog, "list_projects", lambda: [])
+    monkeypatch.setattr(project_catalog, "create_project", lambda *args: {
+        "slug": args[0], "title": args[1], "created": True,
+        "request_key": args[3],
+    })
+    monkeypatch.setattr("kiber_analyst.worker.pwd.getpwnam", lambda _name: SimpleNamespace(pw_uid=1000))
+
+    assert worker.handle(0, {"action": "project-catalog", "mode": "list"}) == {"projects": []}
+    created = worker.handle(0, {
+        "action": "project-catalog", "mode": "create", "slug": "new-project",
+        "title": "New project", "owner": "operator", "request_key": "a" * 64,
+    })
+    assert created["created"] is True
+    with pytest.raises(JobsError, match="requires the media worker identity"):
+        worker.handle(1001, {"action": "project-catalog", "mode": "list"})
+    with pytest.raises(JobsError, match="Invalid project catalog request"):
+        worker.handle(0, {"action": "project-catalog", "mode": "list", "path": "/tmp"})
+
+
+def test_root_control_does_not_require_media_account_lookup(tmp_path: Path, monkeypatch) -> None:
+    from kiber_analyst import project_catalog
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    monkeypatch.setattr(project_catalog, "list_projects", lambda: [])
+
+    def missing_account(_name):
+        raise KeyError("media")
+
+    monkeypatch.setattr("kiber_analyst.worker.pwd.getpwnam", missing_account)
+    assert worker.handle(0, {"action": "project-catalog", "mode": "list"}) == {
+        "projects": [],
+    }
+    with pytest.raises(JobsError, match="requires the media worker identity"):
+        worker.handle(1001, {"action": "project-catalog", "mode": "list"})
+
+
+def test_worker_cancels_broker_submission_by_idempotency_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    worker = JobWorker(store=store, pools={"gemini_query": make_query_pool()})
+    monkeypatch.setattr(
+        "kiber_analyst.worker.pwd.getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=4321),
+    )
+    request_id = str(uuid.uuid4())
+    key = f"broker:{request_id}:1"
+
+    cancelled = worker.handle(0, {
+        "action": "cancel-idempotency", "idempotency_key": key,
+    })
+    assert cancelled == {
+        "found": False, "job_id": None, "state": "cancelled",
+        "cancel_requested": False,
+    }
+    with pytest.raises(JobsError, match="Invalid submission cancellation request"):
+        worker.handle(0, {
+            "action": "cancel-idempotency", "idempotency_key": key, "path": "/tmp",
+        })
+    with pytest.raises(JobsError, match="requires the media worker identity"):
+        worker.handle(1001, {
+            "action": "cancel-idempotency", "idempotency_key": f"broker:{uuid.uuid4()}:1",
+        })
+
+
 def test_scheduled_submit_and_schedule_control_require_operator_identity(
     tmp_path: Path,
 ) -> None:

@@ -31,9 +31,13 @@ def test_worker_submit_and_schedule_controls_use_explicit_allowlisted_actions(mo
     )
     jobapi.api_call("set-deadline", job_id="job", deadline_at="2026-11-24T12:00:00Z")
     jobapi.api_call("reschedule", job_id="job", at="2026-11-24T10:00:00Z")
+    jobapi.api_call("cancel-idempotency", idempotency_key="broker:request:1")
     assert captured[0]["deadline_at"] == "2026-11-24T12:00:00Z"
     assert captured[0]["next_run_at"] == "2026-11-24T10:00:00Z"
-    assert [payload["action"] for payload in captured[1:]] == ["set-deadline", "reschedule"]
+    assert [payload["action"] for payload in captured[1:]] == [
+        "set-deadline", "reschedule", "cancel-idempotency",
+    ]
+    assert captured[3]["idempotency_key"] == "broker:request:1"
     with pytest.raises(JobsError, match="Unsupported worker operation"):
         jobapi.api_call("execute-shell")
 

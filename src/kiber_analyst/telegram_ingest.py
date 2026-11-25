@@ -40,6 +40,9 @@ class TelegramExport:
     service_sha256: str
     manifest_sha256: str
     messages_size: int
+    services_size: int
+    manifest_size: int
+    services_manifest_size: int
     chat_title: str | None
     services_manifest: dict[str, Any]
 
@@ -115,22 +118,26 @@ def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
     return value, raw
 
 
+def _iter_jsonl_stream(stream) -> Iterator[tuple[bytes, dict[str, Any]]]:
+    for number, raw in enumerate(stream, 1):
+        if len(raw) > _MAX_LINE_BYTES:
+            raise LoadError(f"Telegram JSONL record {number} is oversized")
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise LoadError(f"Telegram JSONL record {number} is invalid") from None
+        if not isinstance(value, dict):
+            raise LoadError(f"Telegram JSONL record {number} is not an object")
+        yield raw, value
+
+
 def _iter_jsonl(path: Path) -> Iterator[tuple[bytes, dict[str, Any]]]:
     try:
         stream = _open_private(path)
     except LoadError:
         raise
     with stream:
-        for number, raw in enumerate(stream, 1):
-            if len(raw) > _MAX_LINE_BYTES:
-                raise LoadError(f"Telegram JSONL record {number} is oversized")
-            try:
-                value = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise LoadError(f"Telegram JSONL record {number} is invalid") from None
-            if not isinstance(value, dict):
-                raise LoadError(f"Telegram JSONL record {number} is not an object")
-            yield raw, value
+        yield from _iter_jsonl_stream(stream)
 
 
 def _chat_id(value: Any) -> str:
@@ -164,30 +171,54 @@ def _validate_message(value: dict[str, Any], chat_id: str, topic_id: int) -> Non
         raise LoadError("Telegram message belongs to another chat")
 
 
-def _scan_file(path: Path, validate: Any) -> tuple[str, int, int]:
+def _scan_file(
+    path: Path,
+    validate: Any,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[str, int, int]:
     digest = hashlib.sha256()
     count = 0
     identifiers: set[int] = set()
-    for raw, value in _iter_jsonl(path):
-        validate(value)
-        identifier = value.get("message_id", value.get("event_id"))
-        if type(identifier) is int:
-            if identifier in identifiers:
-                raise LoadError("Telegram export contains duplicate IDs")
-            identifiers.add(identifier)
-        digest.update(raw)
-        count += 1
     try:
-        size = path.stat(follow_symlinks=False).st_size
-    except OSError:
-        raise LoadError("Telegram export file disappeared during validation") from None
+        stream = _open_private(path)
+    except LoadError:
+        raise
+    with stream:
+        size = os.fstat(stream.fileno()).st_size
+        if max_bytes is not None and size > max_bytes:
+            raise LoadError("Telegram export file exceeds its inspection byte limit")
+        scanned = 0
+        for raw, value in _iter_jsonl_stream(stream):
+            scanned += len(raw)
+            if scanned > size or (max_bytes is not None and scanned > max_bytes):
+                raise LoadError("Telegram export file changed or exceeded its inspection byte limit")
+            validate(value)
+            identifier = value.get("message_id", value.get("event_id"))
+            if type(identifier) is int:
+                if identifier in identifiers:
+                    raise LoadError("Telegram export contains duplicate IDs")
+                identifiers.add(identifier)
+            digest.update(raw)
+            count += 1
+        if scanned != size:
+            raise LoadError("Telegram export file changed during validation")
     return digest.hexdigest(), count, size
 
 
-def inspect_export(path: Path, *, root: Path = TELEGRAM_ROOT) -> TelegramExport:
+def inspect_export(
+    path: Path,
+    *,
+    root: Path = TELEGRAM_ROOT,
+    max_jsonl_bytes: int | None = None,
+) -> TelegramExport:
+    if max_jsonl_bytes is not None and (
+        type(max_jsonl_bytes) is not int or max_jsonl_bytes <= 0
+    ):
+        raise LoadError("Telegram export inspection byte limit is invalid")
     export_dir = _safe_directory(path, root)
     manifest, manifest_bytes = _read_json(export_dir / "manifest.json")
-    services, _service_manifest_bytes = _read_json(export_dir / "services_manifest.json")
+    services, service_manifest_bytes = _read_json(export_dir / "services_manifest.json")
     if manifest.get("export_version") != 1 or manifest.get("complete") is not True:
         raise LoadError("Telegram message export is incomplete or unsupported")
     if manifest.get("scope_before") is not None:
@@ -205,6 +236,7 @@ def inspect_export(path: Path, *, root: Path = TELEGRAM_ROOT) -> TelegramExport:
     message_sha, message_count, messages_size = _scan_file(
         export_dir / "messages.jsonl",
         lambda item: _validate_message(item, chat_id, topic_id),
+        max_bytes=max_jsonl_bytes,
     )
     if message_sha != expected_messages_sha:
         raise LoadError("Telegram messages.jsonl SHA-256 does not match its manifest")
@@ -231,8 +263,8 @@ def inspect_export(path: Path, *, root: Path = TELEGRAM_ROOT) -> TelegramExport:
         if item.get("type") not in _EVENT_TYPES:
             raise LoadError("Telegram service export contains an unsupported event type")
 
-    service_sha, service_count, _service_size = _scan_file(
-        export_dir / "services.jsonl", validate_event
+    service_sha, service_count, service_size = _scan_file(
+        export_dir / "services.jsonl", validate_event, max_bytes=max_jsonl_bytes,
     )
     if service_sha != expected_services_sha:
         raise LoadError("Telegram services.jsonl SHA-256 does not match its manifest")
@@ -249,6 +281,9 @@ def inspect_export(path: Path, *, root: Path = TELEGRAM_ROOT) -> TelegramExport:
         service_sha256=service_sha,
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         messages_size=messages_size,
+        services_size=service_size,
+        manifest_size=len(manifest_bytes),
+        services_manifest_size=len(service_manifest_bytes),
         chat_title=manifest.get("chat_title") if isinstance(manifest.get("chat_title"), str) else None,
         services_manifest=services,
     )

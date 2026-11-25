@@ -179,6 +179,60 @@ def test_asr_retry_after_transient_error_reuses_same_run_and_selection(asr_setup
     assert argv_log[0][argv_log[0].index('--run-id') + 1].startswith('ka-')
 
 
+def test_asr_retry_uses_enabled_static_source_when_managed_candidate_is_normalized(asr_setup):
+    app, _source, jobs, argv_log, _overview, _original = asr_setup
+    app.authorized_projects.add('sample-project')
+    static_entry = app.sources[SOURCE]
+    with app.db:
+        app.db.execute(
+            'INSERT INTO managed_sources(owner,source,project,provider,metadata,added) '
+            'VALUES(?,?,?,?,?,?)',
+            ('client', SOURCE, 'sample-project', 'telegram',
+             json.dumps({'hashes': static_entry['hashes']}), '2026-01-01T00:00:00+00:00'),
+        )
+    candidates = app._retry_source_candidates('client', SOURCE, 'sample-project')
+    assert candidates[0][0].get('asr_enabled') is None
+    assert any(candidate[0].get('asr_enabled') is True for candidate in candidates)
+    first = app.handle('client', 'asr', SOURCE)
+    original_argv = list(argv_log[-1])
+    jobs[first['job_id']].update(
+        state='failed', error={'category': 'rate_limited'},
+        last_provider_error={'http_code': 429, 'category': 'rate_limited'},
+    )
+
+    retried = app.handle('client', 'retry', first['request_id'])
+
+    assert retried['request_id'] == first['request_id']
+    assert retried['attempt'] == 2
+    assert retried['job_id'] != first['job_id']
+    assert len(argv_log) == 2
+    assert argv_log[0] == original_argv == argv_log[1]
+
+
+def test_asr_retry_still_requires_current_static_asr_enablement(asr_setup):
+    app, _source, jobs, argv_log, _overview, _original = asr_setup
+    app.authorized_projects.add('sample-project')
+    static_entry = app.sources[SOURCE]
+    with app.db:
+        app.db.execute(
+            'INSERT INTO managed_sources(owner,source,project,provider,metadata,added) '
+            'VALUES(?,?,?,?,?,?)',
+            ('client', SOURCE, 'sample-project', 'telegram',
+             json.dumps({'hashes': static_entry['hashes']}), '2026-01-01T00:00:00+00:00'),
+        )
+    first = app.handle('client', 'asr', SOURCE)
+    jobs[first['job_id']].update(
+        state='failed', error={'category': 'rate_limited'},
+        last_provider_error={'http_code': 429, 'category': 'rate_limited'},
+    )
+    app.sources[SOURCE].pop('asr_enabled')
+
+    with pytest.raises(broker.Refused, match='ASR_NOT_ENABLED'):
+        app.handle('client', 'retry', first['request_id'])
+
+    assert len(argv_log) == 1
+
+
 def test_embed_asr_requires_asr_completion_and_uses_asr_only_job(asr_setup):
     app, _source, jobs, argv_log, overview, _original = asr_setup
     with pytest.raises(broker.Refused, match='ASR_INCOMPLETE'):

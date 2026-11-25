@@ -31,7 +31,13 @@ SELECT (SELECT count(*) FROM docs),
        (SELECT count(*) FROM items WHERE text ~ '[^[:space:]]'),
        (SELECT count(*) FROM embeddings e
         JOIN items i ON i.id::text=e.owner_id
-        WHERE e.owner_table='segments' AND e.model=%s)
+        WHERE e.owner_table='segments' AND e.model=%s),
+       (SELECT count(*) FROM items i
+        WHERE i.text ~ '[^[:space:]]'
+          AND NOT EXISTS (
+            SELECT 1 FROM embeddings e
+            WHERE e.owner_table='segments' AND e.owner_id=i.id::text AND e.model=%s
+          ))
 """
 
 
@@ -47,7 +53,7 @@ def external_source_overview(source_id, project):
         conn.execute("SET TRANSACTION READ ONLY")
         conn.execute("SET LOCAL statement_timeout='10s'")
         row = conn.execute(
-            _QUERY, (project, parsed.external_id, parsed.provider, MODEL_KEY)
+            _QUERY, (project, parsed.external_id, parsed.provider, MODEL_KEY, MODEL_KEY)
         ).fetchone()
     names = (
         "threads",
@@ -61,5 +67,6 @@ def external_source_overview(source_id, project):
         "threads_closed_or_merged",
         "nonempty_items",
         "embeddings",
+        "nonempty_items_without_embeddings",
     )
     return dict(zip(names, row, strict=True))

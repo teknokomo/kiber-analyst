@@ -67,6 +67,23 @@ def test_client_sends_query_as_one_rpc_argument(monkeypatch, capsys):
     assert captured['args'] == ['search', SOURCE, 'Example Station', '5']
 
 
+@pytest.mark.parametrize(
+    ('command', 'text', 'expected'),
+    [
+        ('search-source', f'{SOURCE} sample-project "Sample Project" 5',
+         ['search-source', SOURCE, 'sample-project', 'Sample Project', '5']),
+        ('search-project', 'sample-project "Sample Project" 5',
+         ['search-project', 'sample-project', 'Sample Project', '5']),
+        ('search-project', 'sample-project "Sample Project"',
+         ['search-project', 'sample-project', 'Sample Project']),
+        ('search-project', 'sample-project "Sample Project" invalid',
+         ['search-project', 'sample-project', 'Sample Project', 'invalid']),
+    ],
+)
+def test_managed_search_commands_preserve_multiword_query(command, text, expected):
+    assert broker_client.normalize_args([command, *shlex.split(text)]) == expected
+
+
 @pytest.mark.parametrize('args', [
     ['ingest', SOURCE, 'unexpected', 'args', 'here'],
     ['search', SOURCE, *(['x'] * 31), '5'],
