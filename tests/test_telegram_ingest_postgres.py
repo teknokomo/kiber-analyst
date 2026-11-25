@@ -12,10 +12,13 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 TEST_ENV = os.environ.get("KIBER_ANALYST_INGEST_TEST_ENV")
-pytestmark = pytest.mark.skipif(
-    not TEST_ENV or not Path(TEST_ENV).is_file(),
-    reason="set KIBER_ANALYST_INGEST_TEST_ENV to an isolated disposable test database env file",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not TEST_ENV or not Path(TEST_ENV).is_file(),
+        reason="set KIBER_ANALYST_INGEST_TEST_ENV to an isolated disposable test database env file",
+    ),
+    pytest.mark.usefixtures("disposable_postgres_credentials"),
+]
 
 
 def _write_private(path: Path, payload: bytes) -> None:
@@ -28,13 +31,16 @@ def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def _connect(credentials: dict[str, str], *, autocommit: bool = True):
-    return psycopg.connect(
-        host=credentials["KNOWLEDGE_HOST"],
-        port=int(credentials["KNOWLEDGE_PORT"]),
-        dbname=credentials["KNOWLEDGE_DB"],
-        user=credentials["KNOWLEDGE_USER"],
-        password=credentials["KNOWLEDGE_PASSWORD"],
+def _connect(
+    credentials: dict[str, str],
+    *,
+    autocommit: bool = True,
+):
+    from conftest import connect_validated_postgres
+
+    return connect_validated_postgres(
+        credentials,
+        psycopg.connect,
         autocommit=autocommit,
     )
 
@@ -106,22 +112,15 @@ def _fixture(root: Path) -> Path:
     return topic
 
 
-def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_path: Path) -> None:
-    from dotenv import dotenv_values
-
+def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(
+    tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
+) -> None:
     from kiber_analyst.telegram_ingest import load_telegram_export
 
     assert TEST_ENV is not None
     project_slug = f"kiber-test-{uuid.uuid4().hex[:12]}"
-    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
-    with psycopg.connect(
-        host=credentials["KNOWLEDGE_HOST"],
-        port=int(credentials["KNOWLEDGE_PORT"]),
-        dbname=credentials["KNOWLEDGE_DB"],
-        user=credentials["KNOWLEDGE_USER"],
-        password=credentials["KNOWLEDGE_PASSWORD"],
-        autocommit=True,
-    ) as conn:
+    with _connect(disposable_postgres_credentials, autocommit=True) as conn:
         assert conn.execute(
             """SELECT count(*) FROM sources
                WHERE external_id = %s AND project_id IN
@@ -160,13 +159,7 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_pat
         for path in source.iterdir()
         if path.is_file()
     } == before
-    with psycopg.connect(
-        host=credentials["KNOWLEDGE_HOST"],
-        port=int(credentials["KNOWLEDGE_PORT"]),
-        dbname=credentials["KNOWLEDGE_DB"],
-        user=credentials["KNOWLEDGE_USER"],
-        password=credentials["KNOWLEDGE_PASSWORD"],
-    ) as conn:
+    with _connect(disposable_postgres_credentials, autocommit=False) as conn:
         project_id = conn.execute("SELECT id FROM projects WHERE slug=%s", (project_slug,)).fetchone()[0]
         source_id = conn.execute(
             "SELECT id FROM sources WHERE project_id=%s AND external_id=%s",
@@ -189,18 +182,16 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(tmp_pat
 
 def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
     tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
 ) -> None:
-    from dotenv import dotenv_values
-
     from kiber_analyst.errors import LoadError, SearchError
     from kiber_analyst.search_core import execute_search
     from kiber_analyst.telegram_ingest import load_telegram_export
 
     assert TEST_ENV is not None
-    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
     project_a = f"kiber-iso-a-{uuid.uuid4().hex[:10]}"
     project_b = f"kiber-iso-b-{uuid.uuid4().hex[:10]}"
-    with _connect(credentials) as conn:
+    with _connect(disposable_postgres_credentials) as conn:
         conn.execute(
             "INSERT INTO projects (slug, title) VALUES (%s, %s), (%s, %s)",
             (project_a, "Isolation A", project_b, "Isolation B"),
@@ -236,14 +227,14 @@ def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
             (slug, slug, slug, slug, slug, slug),
         ).fetchone()
 
-    with _connect(credentials) as conn:
+    with _connect(disposable_postgres_credentials) as conn:
         project_a_before_dry = project_counts(conn, project_a)
     dry = load_telegram_export(
         source, artifacts, env_path=Path(TEST_ENV), project_slug=project_a,
         dry_run=True, root=export_root,
     )
     assert dry["status"] == "dry_run" and dry["rollback_confirmed"] is True
-    with _connect(credentials) as conn:
+    with _connect(disposable_postgres_credentials) as conn:
         assert project_counts(conn, project_a) == project_a_before_dry
         project_a_before_cross_project = project_counts(conn, project_a)
         project_b_before = project_counts(conn, project_b)
@@ -273,7 +264,7 @@ def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
             dry_run=True, root=export_root,
         )
 
-    with _connect(credentials) as conn:
+    with _connect(disposable_postgres_credentials) as conn:
         assert project_counts(conn, project_b) == project_b_before == (0, 0, 0, 0, 0, 0)
         assert project_counts(conn, project_a) == project_a_before_cross_project
         message_after = conn.execute(
@@ -308,19 +299,17 @@ def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
 
 def test_concurrent_same_chat_import_keeps_project_a_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    disposable_postgres_credentials: dict[str, str],
 ) -> None:
-    from dotenv import dotenv_values
-
     import kiber_analyst.load as load_module
     from kiber_analyst.errors import LoadError
     from kiber_analyst.search_core import execute_search
     from kiber_analyst.telegram_ingest import load_telegram_export
 
     assert TEST_ENV is not None
-    credentials = {key: str(value) for key, value in dotenv_values(TEST_ENV).items() if value}
     project_a = f"kiber-race-a-{uuid.uuid4().hex[:10]}"
     project_b = f"kiber-race-b-{uuid.uuid4().hex[:10]}"
-    with _connect(credentials) as conn:
+    with _connect(disposable_postgres_credentials) as conn:
         conn.execute(
             "INSERT INTO projects (slug, title) VALUES (%s, %s), (%s, %s)",
             (project_a, "Race A", project_b, "Race B"),
@@ -349,7 +338,7 @@ def test_concurrent_same_chat_import_keeps_project_a_unchanged(
             for _name, query in queries
         )
 
-    with _connect(credentials) as conn:
+    with _connect(disposable_postgres_credentials) as conn:
         project_a_before = project_snapshot(conn, project_a)
         project_b_before = project_snapshot(conn, project_b)
         search_before = execute_search(
@@ -394,7 +383,7 @@ def test_concurrent_same_chat_import_keeps_project_a_unchanged(
     assert isinstance(result_b, LoadError)
     assert "TELEGRAM_PROJECT_CONFLICT" in str(result_b)
 
-    with _connect(credentials) as conn:
+    with _connect(disposable_postgres_credentials) as conn:
         assert project_snapshot(conn, project_a) == project_a_before
         assert project_snapshot(conn, project_b) == project_b_before
         search_after = execute_search(
