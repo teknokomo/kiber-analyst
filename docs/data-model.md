@@ -32,7 +32,9 @@ Each item (body, comment, review, review comment, reply, or event) is a
 `<thread_ref>:body` or `<thread_ref>:<item_kind>:<external_id>`; the new
 `thread_ref`, `parent_external_ref`, and `item_kind` columns make thread and
 parent links queryable. `content_hash` is the SHA-256 of the normalized text;
-`posted_at` is the publication time with a timezone.
+`posted_at` is the publication time with a timezone. GitVerse does not expose a
+readable inline review-comment collection, so its `review_comments` counter is
+not turned into items and its pull requests with inline comments are `partial`.
 
 Revision and deletion rules:
 
