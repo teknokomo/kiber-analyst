@@ -13,28 +13,101 @@ queue v4 запрещено. MCP и база knowledge не входят в об
 
 ## Перед обновлением
 
-1. Согласовать окно обслуживания, закрыть приём новых команд и дождаться
-   завершения активных задач либо согласовать отдельный план для каждой из
-   них. Остановить broker и worker и убедиться, что процессы закрыты.
-2. Зафиксировать build-id/commit обоих компонентов, версии схем, SQLite
+Порядок backup важен: `kiber-analyst-queue-backup` делает обычный backup
+через worker и не принимает `pre_upgrade`; для этого этапа используется
+`kiber-analyst jobs backup --pre-upgrade`. Worker должен оставаться доступен
+до завершения этой команды. Broker backup снимается отдельно после остановки
+broker, через SQLite Backup API, а не `cp` живого файла.
+
+1. Согласовать окно обслуживания и закрыть приём новых broker-команд. Дождаться
+   завершения уже принятых RPC, остановить broker и убедиться, что его процесс
+   завершён и больше не принимает запросы. Worker пока оставить работающим.
+2. До backup проверить через штатный status/queue интерфейс, что нет
+   `queued`, `running`, `waiting_retry` или `waiting_quota` jobs. Если такие
+   jobs есть, дождаться их завершения либо отдельно согласовать их удержание;
+   не снимать pre-upgrade snapshot, пока worker может поменять состояние job.
+   Зафиксировать build-id/commit обоих компонентов, версии схем, SQLite
    `user_version`, полный список request/job ID, состояния, operation,
-   attempts, checkpoints, `next_run_at`, ссылки между `requests` и
-   `attempts`, а также SHA-256 доступных результатов. Секреты и env-значения
-   не включать в отчёт.
+   attempts, checkpoints, `next_run_at`, связи `requests`/`attempts` и SHA-256
+   доступных результатов. Секреты и значения env не включать.
 3. Сохранить код, units и конфигурацию broker/worker как один rollback-набор.
    Закрытые env-файлы хранить только в защищённом backup с исходными правами;
    в отчёт включать лишь имена, права и контрольные суммы.
-4. Пока worker ещё работает на исходной схеме, создать backup queue через
-   `kiber-analyst-queue-backup` или worker control `backup` с
-   `pre_upgrade=true`. Broker backup `requests.sqlite3` создать через
-   SQLite Backup API. Оба backup сделать в одном quiesced окне после
-   остановки writer-процессов. Не копировать живой `queue.db` обычным `cp`:
-   подтверждённые транзакции могут находиться в WAL.
-5. Сохранить пару backup с общей меткой времени. Проверить SHA-256,
-   `PRAGMA integrity_check = 'ok'`, версии схем, а также восстановление
-   каждого файла в отдельный scratch-каталог. Сравнить ID и контрольные
-   поля с инвентарём до остановки. Production-сервисы не запускать, пока
-   обе проверки не пройдены.
+4. Пока broker уже остановлен, а worker доступен и очередь не содержит
+   нетерминальных jobs, выполнить от root через его control socket:
+
+   ```bash
+   sudo -n env XDG_RUNTIME_DIR=/run \
+     /opt/kiber-analyst/.venv/bin/kiber-analyst jobs backup --pre-upgrade
+   ```
+
+   Сохранить возвращённый `backup_path`. Этот вызов создаёт queue snapshot
+   через SQLite Backup API и требует root. Не заменять его командой
+   `kiber-analyst-queue-backup`: она создаёт обычную daily-копию, не
+   pre-upgrade. После успешного ответа остановить worker и подтвердить, что
+   оба writer-процесса остановлены.
+5. Скопировать уже закрытый queue backup в защищённый каталог пары; это файл
+   snapshot, не рабочая `queue.db`. Broker `requests.sqlite3` снять после
+   остановки broker тем же SQLite Backup API. Ниже пример для оператора:
+   `DATA_ROOT` должен быть фактическим корнем из worker doctor/config, а
+   `PAIR_DIR` — новый каталог maintenance-снимка. Оба пути проверь вручную;
+   не получай их из непроверенного пользовательского ввода.
+
+   ```bash
+   install -d -m 0700 "$PAIR_DIR"
+   install -m 0600 "$QUEUE_BACKUP" "$PAIR_DIR/queue.sqlite3"
+   KIBER_BROKER_DB="$DATA_ROOT/broker/requests.sqlite3" \
+   KIBER_BROKER_SNAPSHOT="$PAIR_DIR/requests.sqlite3" \
+   python3 - <<'PY'
+   import os
+   import sqlite3
+   from pathlib import Path
+
+   source = Path(os.environ['KIBER_BROKER_DB'])
+   snapshot = Path(os.environ['KIBER_BROKER_SNAPSHOT'])
+   if source.is_symlink() or not source.is_file() or snapshot.exists():
+       raise SystemExit('unsafe broker backup input or destination')
+   fd = os.open(snapshot, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+   os.close(fd)
+   with sqlite3.connect(source) as src, sqlite3.connect(snapshot) as dst:
+       src.backup(dst)
+       if dst.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+           raise SystemExit('broker backup integrity check failed')
+   os.chmod(snapshot, 0o600)
+   PY
+   sha256sum "$PAIR_DIR/queue.sqlite3" "$PAIR_DIR/requests.sqlite3"
+   PAIR_DIR="$PAIR_DIR" python3 - <<'PY'
+   import os
+   import sqlite3
+   import tempfile
+   from pathlib import Path
+
+   pair = Path(os.environ['PAIR_DIR'])
+   for name in ('queue.sqlite3', 'requests.sqlite3'):
+       snapshot = pair / name
+       with tempfile.TemporaryDirectory(dir=pair) as scratch_name:
+           restored = Path(scratch_name) / name
+           with sqlite3.connect(snapshot) as src, sqlite3.connect(restored) as dst:
+               src.backup(dst)
+               if dst.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                   raise SystemExit(f'{name}: restore integrity check failed')
+               version = dst.execute('PRAGMA user_version').fetchone()[0]
+               tables = dst.execute(
+                   "SELECT count(*) FROM sqlite_master WHERE type='table'"
+               ).fetchone()[0]
+           print(f'{name}: restore=ok user_version={version} tables={tables}')
+   PY
+   ```
+
+   Так как broker остановлен, его database/WAL состояние фиксировано; worker
+   уже снял queue snapshot и остановлен. До queue snapshot требуется ноль
+   нетерминальных jobs, поэтому между двумя снимками не должно быть переходов
+   состояния или новых связей. Сохранить оба файла под одной maintenance
+   меткой. Проверить `PRAGMA integrity_check = 'ok'`, schema versions, список
+   ID/связей и успешное восстановление каждого файла в отдельный scratch-каталог
+   командами выше.
+   Если любое условие не выполнено, обновление не начинать. Не копировать
+   рабочие SQLite-файлы обычным `cp`.
 
 ## Обновление
 
@@ -103,13 +176,28 @@ job и повторит действие. Поэтому до запуска н�
 - результаты и checkpoints, используемые для reconciliation, должны иметь
   проверенные контрольные суммы и соответствовать request/job.
 
-Автоматический reconciliation пока не реализован. Не редактировать SQLite
-вручную произвольными SQL-командами и не угадывать состояние. Если нет
-проверенной операторской процедуры, способной безопасно внести подтверждённые
-результаты в обе базы, **оставить оба сервиса остановленными** и передать
-случай оператору для подготовленного offline-repair. Запуск разрешён только
-после фиксации результатов сверки и выполнения всех условий выше. Если
-неопределённый job нельзя надёжно удержать от исполнения, worker не запускать.
+Автоматического reconciliation и проверенной production-процедуры
+offline-repair пока нет. Приведённые выше сравнения — условия допуска, а не
+инструкция вручную переписывать SQLite. Не выполнять ad hoc `UPDATE`, не
+менять `user_version` и не угадывать исход внешнего запроса.
+
+После восстановления запуск разрешён только если сверка подтверждает, что:
+
+- сохранённые post-upgrade snapshots и inventory читаются, checksum совпадает;
+- все jobs/requests/attempts из восстановленной пары согласованы по ID,
+  operation, source, параметрам и состоянию, а каждый broker job ID существует
+  в queue;
+- ни одна задача, завершённая или отменённая после pre-upgrade snapshot, не
+  остаётся runnable в восстановленной паре;
+- каждая новая или изменённая после snapshot запись классифицирована, её
+  результат/checkpoint имеет проверяемый hash, а внешние исходы подтверждены;
+- неопределённых внешних попыток нет.
+
+Если для выполнения этих условий нужно менять восстановленные записи, запуск
+запрещён до отдельной проверенной offline-repair процедуры/инструмента и её
+проверки на копии обеих БД. Сохранить оба сервиса остановленными и передать
+случай оператору; один audit-журнал не разрешает запуск. Если неоднозначный
+job нельзя гарантированно удержать от исполнения, worker не запускать.
 
 ## Проверенные сценарии и ограничения
 
@@ -122,6 +210,9 @@ job и повторит действие. Поэтому до запуска н�
   согласованное восстановление пары убирает dangling reference, сохраняя
   post-upgrade пару для reconciliation.
 
-Тесты моделируют ручную сверку только на временных базах. Они не являются
-автоматическим production-reconciler и не подтверждают готовность
-production-отката. Релиз этого runbook не разрешает production-деплой.
+Тесты моделируют backup, обнаружение расхождений и исправление только на
+временных базах. Они не являются автоматическим production-reconciler и не
+подтверждают готовность вручную менять production SQLite. Пока нет
+проверенного offline-repair инструмента, rollback с обнаруженными
+расхождениями требует остановки сервисов и отдельного операторского решения.
+Этот runbook не разрешает production-деплой.

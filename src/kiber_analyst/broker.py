@@ -2288,6 +2288,13 @@ class Broker:
                     'status': cancelled['state'],
                     'cancel_requested': cancelled['cancel_requested'] is True}
         if status['status'] in ACTIVE:
+            if row['operation'] == 'embed':
+                renewal = self.db.execute(
+                    'SELECT base_fingerprint FROM embed_renewals WHERE request_id=?',
+                    (row['id'],),
+                ).fetchone()
+                expected_fingerprint = renewal[0] if renewal else row['fingerprint']
+                self._embed_source_for_request(owner, row, expected_fingerprint)
             return self.dispatch(row)
         if row['attempt'] >= MAX_ATTEMPTS:
             raise Refused('RETRY_LIMIT')
@@ -2307,9 +2314,14 @@ class Broker:
             candidates = self._retry_source_candidates(owner, row['source'], project)
             if not candidates:
                 raise Refused('SOURCE_REVISION_CHANGED')
+            if operation in {'asr_pilot', 'asr_full', 'asr_embed'}:
+                candidates = [
+                    candidate for candidate in candidates
+                    if candidate[0].get('asr_enabled') is True
+                ]
+                if not candidates:
+                    raise Refused('ASR_NOT_ENABLED')
             entry, fingerprint, chat, topic = candidates[0]
-        if operation in {'asr_pilot', 'asr_full', 'asr_embed'} and entry.get('asr_enabled') is not True:
-            raise Refused('ASR_NOT_ENABLED')
         if operation == 'ingest' and chat is None:
             # External reruns add a uniqueness suffix to the request fingerprint;
             # validate the source revision against its unsuffixed base.
@@ -2351,13 +2363,24 @@ class Broker:
             ).fetchone()
             if meta is None:
                 raise Refused('ASR_REQUEST_METADATA_MISSING')
-            revision = media_revision(self.root, chat, topic)
-            staged = self.stage(row['source'], entry, fingerprint, chat, topic, revision)
-            plan, _workspace = self.asr_workspace(
-                row['source'], entry, staged, fingerprint, revision
-            )
-            if plan['input_fingerprint'] != meta[0]:
+            selected = None
+            for candidate in candidates:
+                candidate_entry, candidate_fingerprint, candidate_chat, candidate_topic = candidate
+                revision = media_revision(self.root, candidate_chat, candidate_topic)
+                staged = self.stage(
+                    row['source'], candidate_entry, candidate_fingerprint,
+                    candidate_chat, candidate_topic, revision,
+                )
+                plan, _workspace = self.asr_workspace(
+                    row['source'], candidate_entry, staged,
+                    candidate_fingerprint, revision,
+                )
+                if plan['input_fingerprint'] == meta[0]:
+                    selected = candidate
+                    break
+            if selected is None:
                 raise Refused('SOURCE_REVISION_CHANGED')
+            entry, fingerprint, chat, topic = selected
         elif operation == 'asr_embed':
             overview = self.asr_overview(row['source'])
             selected = next((candidate for candidate in candidates if hashlib.sha256(json.dumps(

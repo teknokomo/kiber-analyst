@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,73 @@ def _restore_sqlite_snapshot(snapshot, target) -> None:
     for suffix in ("-wal", "-shm"):
         (target.parent / (target.name + suffix)).unlink(missing_ok=True)
     os.replace(temporary, target)
+
+
+def test_preupgrade_backup_order_snapshots_queue_and_stopped_broker_with_sqlite_api(tmp_path):
+    store = JobStore(tmp_path / "queue", require_mount=False)
+    store.initialize()
+    (tmp_path / "broker").mkdir(mode=0o700)
+    source_id = "github:example/backup-order"
+
+    def submit(argv, *, idempotency_key):
+        record, _created = store.create_job(
+            operation="external_ingest", command={"argv": argv},
+            fingerprint=hashlib.sha256(json.dumps(argv, sort_keys=True).encode()).hexdigest(),
+            idempotency_key=idempotency_key,
+        )
+        return {"job_id": record.id}
+
+    def worker_api(action, **kwargs):
+        if action == "source-overview":
+            return {"threads": 1}
+        if action == "status":
+            record = store.status(kwargs["job_id"])
+            return {"state": record["state"], "progress": {}}
+        if action == "result":
+            return store.result(kwargs["job_id"])
+        if action == "backup":
+            return {
+                "backup_path": str(store.backup(pre_upgrade=kwargs["pre_upgrade"])),
+            }
+        raise AssertionError(f"unexpected worker API call: {action}")
+
+    broker = Broker(
+        tmp_path, {source_id: {"project": "backup-order"}}, worker_api, submit,
+    )
+    request = broker.handle("operator", "ingest", source_id)
+    store.complete(request["job_id"], {"status": "done", "items": 1})
+    broker.status(broker.row("operator", request["request_id"]))
+
+    # The broker writer is closed first. The worker still serves its
+    # pre-upgrade backup operation; all jobs are terminal and state is stable.
+    broker.db.close()
+    queue_snapshot = Path(worker_api("backup", pre_upgrade=True)["backup_path"])
+
+    # After the worker is stopped, snapshot the now-stopped broker database
+    # through SQLite Backup API rather than copying its database file.
+    broker_snapshot = tmp_path / "broker-backup" / "requests.sqlite3"
+    broker_snapshot.parent.mkdir(mode=0o700)
+    _sqlite_backup(tmp_path / "broker" / "requests.sqlite3", broker_snapshot)
+
+    for snapshot in (queue_snapshot, broker_snapshot):
+        with sqlite3.connect(snapshot) as db:
+            assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    with sqlite3.connect(queue_snapshot) as db:
+        job_id = db.execute(
+            "SELECT id FROM jobs WHERE idempotency_key=?",
+            (f"broker:{request['request_id']}:1",),
+        ).fetchone()[0]
+        assert db.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()[0] == "done"
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+    with sqlite3.connect(broker_snapshot) as db:
+        assert db.execute(
+            "SELECT state FROM requests WHERE id=?", (request["request_id"],),
+        ).fetchone()[0] == "done"
+        linked_job = db.execute(
+            "SELECT job_id FROM attempts WHERE request_id=? AND attempt=1",
+            (request["request_id"],),
+        ).fetchone()[0]
+    assert linked_job == job_id == request["job_id"]
 
 
 @pytest.mark.parametrize("terminal_state", ["done", "cancelled"])

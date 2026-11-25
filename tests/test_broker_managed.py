@@ -668,6 +668,70 @@ def test_saved_embed_renewal_rechecks_access_after_broker_restart(
         restarted.db.close()
 
 
+def test_unbound_embed_retry_rechecks_source_registration_after_broker_restart(control):
+    app, _projects, jobs, submitted, _api_calls = control
+    app.handle("client", "source-add", GITHUB_SOURCE, PROJECT)
+    ingest = app.handle("client", "ingest", GITHUB_SOURCE, PROJECT, "2000-01-01")
+    jobs[ingest["job_id"]]["state"] = "done"
+    original = app.handle("client", "embed", GITHUB_SOURCE, PROJECT)
+    current = original
+    for attempt in range(1, broker.MAX_ATTEMPTS + 1):
+        jobs[current["job_id"]].update(
+            state="failed", progress={"completed_batches": 2},
+            error={"category": "network_error"},
+            result={"status": "failed", "error": {"category": "network_error"}},
+        )
+        if attempt < broker.MAX_ATTEMPTS:
+            current = app.handle("client", "retry", original["request_id"])
+
+    failed_submissions = []
+
+    def interrupted_submit(argv, *, idempotency_key):
+        failed_submissions.append((list(argv), idempotency_key))
+        raise JobsError("simulated worker submit outage")
+
+    app.submit = interrupted_submit
+    with pytest.raises(JobsError, match="simulated worker submit outage"):
+        app.handle("client", "renew-embed", original["request_id"])
+    renewal = app.db.execute(
+        "SELECT request_id FROM embed_renewals WHERE previous_request_id=?",
+        (original["request_id"],),
+    ).fetchone()
+    assert renewal is not None
+    request = app.row("client", renewal["request_id"])
+    assert app.db.execute(
+        "SELECT 1 FROM attempts WHERE request_id=?", (request["id"],),
+    ).fetchone() is None
+
+    with app.db:
+        app.db.execute(
+            "DELETE FROM managed_sources WHERE owner=? AND source=? AND project=?",
+            ("client", GITHUB_SOURCE, PROJECT),
+        )
+    app.db.close()
+
+    retry_submissions = []
+
+    def record_submit(argv, *, idempotency_key):
+        retry_submissions.append((list(argv), idempotency_key))
+        return {"job_id": str(uuid.uuid5(uuid.NAMESPACE_OID, idempotency_key))}
+
+    restarted = broker.Broker(
+        app.root, {}, app.worker_api, record_submit, authorized_projects={PROJECT},
+    )
+    try:
+        with pytest.raises(broker.Refused, match="SOURCE_REVISION_CHANGED"):
+            restarted.handle("client", "retry", request["id"])
+        assert len(failed_submissions) == 1
+        assert len(submitted) == broker.MAX_ATTEMPTS + 1
+        assert retry_submissions == []
+        assert restarted.db.execute(
+            "SELECT 1 FROM attempts WHERE request_id=?", (request["id"],),
+        ).fetchone() is None
+    finally:
+        restarted.db.close()
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [("argv_query", "changed query"), ("argv_limit", "8"),
