@@ -302,7 +302,9 @@ def test_invalid_input_leaves_no_staging_or_request(setup, kind):
 
 
 @pytest.mark.parametrize('live_db', [False, True])
-def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(tmp_path, monkeypatch, live_db):
+def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
+    tmp_path, monkeypatch, live_db, loopback_postgres_driver,
+):
     dsn = os.environ.get('KIBER_MEDIA_RESUME_TEST_DSN')
     if live_db and not dsn:
         pytest.skip('requires disposable PostgreSQL fixture DSN')

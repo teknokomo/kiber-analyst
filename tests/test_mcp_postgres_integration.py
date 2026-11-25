@@ -17,10 +17,13 @@ from kiber_analyst_mcp.server import create_app  # noqa: E402
 from kiber_analyst_mcp.tools import ToolFailure, ToolService  # noqa: E402
 
 TEST_DSN = os.environ.get("KIBER_ANALYST_MCP_TEST_DSN")
-pytestmark = pytest.mark.skipif(
-    not TEST_DSN,
-    reason="set KIBER_ANALYST_MCP_TEST_DSN to an isolated disposable acceptance database",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not TEST_DSN,
+        reason="set KIBER_ANALYST_MCP_TEST_DSN to an isolated disposable acceptance database",
+    ),
+    pytest.mark.usefixtures("loopback_postgres_driver"),
+]
 DOCUMENT_ID = "00000000-0000-0000-0000-000000000020"
 
 
@@ -30,7 +33,7 @@ def mcp_config() -> MCPConfig:
     values = psycopg.conninfo.conninfo_to_dict(TEST_DSN)
     host = values.get("host", "127.0.0.1")
     resolved_host = "127.0.0.1" if host == "localhost" else host
-    assert ipaddress.ip_address(resolved_host).is_private
+    assert ipaddress.ip_address(resolved_host).is_loopback
     assert values.get("dbname") == "knowledge"
     assert values.get("user") == "knowledge_reader"
     return MCPConfig(

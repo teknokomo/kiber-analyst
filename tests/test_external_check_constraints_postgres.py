@@ -11,10 +11,13 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 ADMIN_DSN = os.environ.get("KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN")
-pytestmark = pytest.mark.skipif(
-    not ADMIN_DSN,
-    reason="set KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN for disposable PostgreSQL",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not ADMIN_DSN,
+        reason="set KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN for disposable PostgreSQL",
+    ),
+    pytest.mark.usefixtures("loopback_postgres_driver"),
+]
 
 ROOT = Path(__file__).parents[1]
 BASELINE_SQL = ROOT / "tests/fixtures/migration_runner_baseline.sql"
