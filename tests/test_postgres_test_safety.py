@@ -96,6 +96,7 @@ def test_validated_test_credentials_are_the_only_values_passed_to_driver(
 def test_libpq_environment_hostaddr_cannot_override_loopback_driver_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("psycopg")
     monkeypatch.setenv("PGHOSTADDR", "192.0.2.45")
     connect_calls: list[dict[str, object]] = []
 
@@ -116,6 +117,7 @@ def test_libpq_environment_hostaddr_cannot_override_loopback_driver_target(
 
 
 def test_nonloopback_conninfo_is_rejected_before_driver_connect() -> None:
+    pytest.importorskip("psycopg")
     connect_calls: list[dict[str, object]] = []
 
     def connector(**kwargs: object) -> object:
