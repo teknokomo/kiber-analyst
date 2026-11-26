@@ -71,11 +71,30 @@ def test_media_resume_rejects_receipts_over_their_declared_limit(size, limit):
         resumed_media(checkpoint, hashes, messages)
 
 
-def test_media_resume_rejects_record_limit_above_export_limit():
+def test_media_resume_clamps_record_limit_to_export_limit():
     hashes = {"messages.jsonl": "d" * 64}
     checkpoint = json.dumps({
         "inputs": hashes,
         "requested_max_file_bytes": 100 * 1024**2,
+        "records": {"7": {
+            "export_status": "downloaded", "path": "media-resume/7/file.bin",
+            "size": 101, "sha256": "e" * 64, "type": "document",
+            "max_file_bytes": 4_000_000_000,
+        }},
+    }).encode()
+    messages = [{"message_id": 7, "media": {"kind": "document"}}]
+
+    result = resumed_media(checkpoint, hashes, messages)
+
+    assert result[7]["size"] == 101
+    assert result[7]["max_file_bytes"] == 100 * 1024**2
+
+
+def test_media_resume_rejects_file_size_above_export_limit_even_if_receipt_limit_is_higher():
+    hashes = {"messages.jsonl": "d" * 64}
+    checkpoint = json.dumps({
+        "inputs": hashes,
+        "requested_max_file_bytes": 100,
         "records": {"7": {
             "export_status": "downloaded", "path": "media-resume/7/file.bin",
             "size": 101, "sha256": "e" * 64, "type": "document",

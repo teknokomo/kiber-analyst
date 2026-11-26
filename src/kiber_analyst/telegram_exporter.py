@@ -270,22 +270,46 @@ class Dir:
                      0o600, dir_fd=self.fd)
         digest = hashlib.sha256()
         total = 0
+        buffer = bytearray()
+        batch_limit = 256 * 1024
+        old_reservation = (budget.named_reservations.get('services-snapshot')
+                           if budget is not None else None)
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, 'wb') as stream:
                 fd = -1
+
+                def flush_batch():
+                    nonlocal total
+                    if not buffer:
+                        return
+                    next_total = total + len(buffer)
+                    if budget is not None:
+                        budget.replace_reservation(
+                            'services-snapshot', next_total + reserve_bytes,
+                        )
+                        budget.check_storage(len(buffer) + reserve_bytes)
+                    stream.write(buffer)
+                    stream.flush()
+                    if budget is not None:
+                        # Re-read physical margins after writing; concurrent
+                        # consumers may have reduced free space during the batch.
+                        budget.check_storage(reserve_bytes)
+                    digest.update(buffer)
+                    total = next_total
+                    buffer.clear()
+
                 for chunk in chunks:
                     if not isinstance(chunk, bytes):
                         raise ExportError('Invalid streamed output chunk')
-                    if budget is not None:
-                        # Already-written candidate bytes are included in
-                        # tree_size; reserve only the next chunk and metadata.
-                        budget.check(len(chunk) + reserve_bytes)
-                    stream.write(chunk)
-                    if budget is not None and hasattr(budget, 'consume'):
-                        budget.consume(len(chunk))
-                    digest.update(chunk)
-                    total += len(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        take = min(batch_limit - len(buffer), len(view))
+                        buffer.extend(view[:take])
+                        view = view[take:]
+                        if len(buffer) == batch_limit:
+                            flush_batch()
+                flush_batch()
                 stream.flush()
                 os.fsync(stream.fileno())
             os.fsync(self.fd)
@@ -297,6 +321,8 @@ class Dir:
                 os.unlink(temp, dir_fd=self.fd)
             except FileNotFoundError:
                 pass
+            if budget is not None:
+                budget.restore_reservation('services-snapshot', old_reservation)
             raise
 
     def publish_private_temp(self, temp, name):
@@ -386,6 +412,7 @@ class Budget:
     def __init__(self, root, cfg):
         self.root, self.cfg = root, cfg
         self.reserved_bytes = 0
+        self.named_reservations = {}
 
     def available_bytes(self):
         fs = os.fstatvfs(self.root.fd)
@@ -403,6 +430,25 @@ class Budget:
             raise ExportError('Invalid storage reservation')
         self.reserved_bytes += amount * PIPELINE_MEDIA_COPIES
 
+    def replace_reservation(self, key, amount):
+        if not isinstance(key, str) or type(amount) is not int or amount < 0:
+            raise ExportError('Invalid storage reservation')
+        old = self.named_reservations.get(key, 0)
+        new = amount * PIPELINE_MEDIA_COPIES
+        aggregate = self.cfg.get('aggregate_available_bytes')
+        if (type(aggregate) is int
+                and aggregate - (self.reserved_bytes - old) < new):
+            raise ExportError('Storage budget exhausted')
+        self.reserved_bytes = self.reserved_bytes - old + new
+        self.named_reservations[key] = new
+
+    def restore_reservation(self, key, value):
+        old = self.named_reservations.pop(key, 0)
+        self.reserved_bytes -= old
+        if value is not None:
+            self.named_reservations[key] = value
+            self.reserved_bytes += value
+
     def check_pipeline(self, amount):
         if type(amount) is not int or amount < 0:
             raise ExportError('Storage budget exhausted')
@@ -413,16 +459,21 @@ class Budget:
     def check(self, extra=0):
         if type(extra) is not int or extra < 0:
             raise ExportError('Storage budget exhausted')
-        fs = os.fstatvfs(self.root.fd)
-        storage_margin = self.cfg['storage_limit_bytes'] - tree_size(self.root)
-        disk_margin = fs.f_bavail * fs.f_frsize - self.cfg['min_free_bytes']
-        if storage_margin < extra or disk_margin < extra:
-            raise ExportError('Storage budget exhausted')
+        self.check_storage(extra)
         aggregate = self.cfg.get('aggregate_available_bytes')
         if type(aggregate) is int:
             pipeline_margin = aggregate - self.reserved_bytes
             if pipeline_margin < extra * PIPELINE_MEDIA_COPIES:
                 raise ExportError('Storage budget exhausted')
+
+    def check_storage(self, extra=0):
+        if type(extra) is not int or extra < 0:
+            raise ExportError('Storage budget exhausted')
+        fs = os.fstatvfs(self.root.fd)
+        storage_margin = self.cfg['storage_limit_bytes'] - tree_size(self.root)
+        disk_margin = fs.f_bavail * fs.f_frsize - self.cfg['min_free_bytes']
+        if storage_margin < extra or disk_margin < extra:
+            raise ExportError('Storage budget exhausted')
 
 
 class MediaLimitExceeded(ExportError):
@@ -658,14 +709,26 @@ def _message_matches_basic_group(message, chat):
 def belongs(message, topic, forum=False):
     if topic is None:
         return True
-    reply = (message.get('full') or {}).get('replyTo') or {}
+    full = message.get('full')
+    reply_header = full.get('replyTo') if isinstance(full, dict) else None
+    reply = reply_header if isinstance(reply_header, dict) else {}
     top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id') if isinstance(reply, dict) else None
-    if top is not None:
-        return top == topic
     if topic == 1:
         forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
-        reply_id = _first(reply, 'replyToMsgId', 'reply_to_msg_id') if isinstance(reply, dict) else None
-        return forum_topic is not True or reply_id == 1
+        # Telegram's forumTopic flag distinguishes non-General forum messages.
+        # General replies can still carry a topMsgId; that does not make them
+        # members of the topic identified by that message.
+        return forum_topic is not True
+    forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
+    if forum and reply_header is not None and forum_topic is not True:
+        return False
+    if top is not None:
+        return top == topic
+    if forum and forum_topic is True:
+        # A topic-scoped GetReplies result may omit reply_to_top_id. Its
+        # explicit forumTopic marker still identifies a forum reply; the API
+        # request itself supplies the requested topic scope.
+        return True
     # GetReplies itself scopes ordinary topics; explicit conflicting metadata is rejected above.
     return True
 
@@ -681,14 +744,8 @@ def record(message, topic, forum=False):
     if topic is None:
         reply = (message.get('full') or {}).get('replyTo') or {}
         top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id') if isinstance(reply, dict) else None
-        full = message.get('full')
-        if top is None and isinstance(full, dict):
-            top = full.get('topicId', full.get('topic_id'))
-        if top is None:
-            top = message.get('topicId', message.get('topic_id'))
         forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
-        reply_id = _first(reply, 'replyToMsgId', 'reply_to_msg_id') if isinstance(reply, dict) else None
-        if type(top) is int and top > 0:
+        if forum and forum_topic is True and type(top) is int and top > 0:
             actual_topic = top
             topic_status = 'known'
         elif forum and forum_topic is True:
@@ -697,11 +754,12 @@ def record(message, topic, forum=False):
             # message belongs to a forum topic but its identity is unresolved.
             # Never silently assign it to General (topic ID 1).
             topic_status = 'unknown'
-        elif forum and (forum_topic is False or reply_id == 1):
+        elif forum:
+            # forumTopic is an optional true flag. Its absence/false value is
+            # the Telegram representation of General, even for replies whose
+            # topMsgId points at an ordinary message.
             actual_topic = 1
             topic_status = 'known'
-        elif forum:
-            topic_status = 'unknown'
     reply = (message.get('full') or {}).get('replyTo') or {}
     reply_to_message_id = _first(message, 'replyToMsgId', 'reply_to_msg_id')
     if reply_to_message_id is None and isinstance(reply, dict):
@@ -768,7 +826,7 @@ def _event_date(value):
     return None
 
 
-def service_event(message, topic):
+def service_event(message, topic, forum=False):
     """Normalize one raw Telegram service message without retaining its text."""
     if not isinstance(message, dict) or not message.get('action'):
         return None, set()
@@ -903,15 +961,25 @@ def service_event(message, topic):
     if (target_id is not None or isinstance(new_value, dict) and new_value.get('target_ids')) and target_name is None:
         limits.add('target_name_unavailable')
     actual_topic = topic
+    topic_status = 'known' if topic is not None else 'not_applicable'
     if topic is None:
         reply = _first(message, 'replyTo', 'reply_to') or {}
         top = _first(reply, 'topMsgId', 'top_msg_id') if isinstance(reply, dict) else None
-        if type(top) is int and top > 0:
+        forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
+        if forum and forum_topic is True and type(top) is int and top > 0:
             actual_topic = top
+            topic_status = 'known'
+        elif forum and forum_topic is True:
+            topic_status = 'unknown'
         elif action_name == 'message_action_topic_create':
             # Telegram assigns each non-General topic the ID of its create event.
             actual_topic = event_id
-    return ({'event_id': event_id, 'topic_id': actual_topic, 'date': date, 'type': action_type,
+            topic_status = 'known'
+        elif forum and forum_topic is not True:
+            actual_topic = 1
+            topic_status = 'known'
+    return ({'event_id': event_id, 'topic_id': actual_topic,
+             'topic_id_status': topic_status, 'date': date, 'type': action_type,
              'actor_id': actor_id, 'actor_name': actor_name, 'target_id': target_id,
              'target_name': target_name, 'message_id': message_id, 'old_value': old_value,
              'new_value': new_value, 'raw_action': action_name}, limits)
@@ -984,21 +1052,25 @@ def _unsupported_service_event(message_id, topic, error_code):
     }
 
 
-def service_belongs(message, topic):
+def service_belongs(message, topic, forum=False):
     if topic is None:
         return True
     if message.get('id') == topic and _action_name(message.get('action')) == 'message_action_topic_create':
         return True
-    reply = _first(message, 'replyTo', 'reply_to') or {}
-    if not isinstance(reply, dict):
-        return topic == 1
+    reply_header = _first(message, 'replyTo', 'reply_to')
+    if reply_header is not None and not isinstance(reply_header, dict):
+        return False
+    reply = reply_header if isinstance(reply_header, dict) else {}
     top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id')
+    if topic == 1:
+        return forum and _first(reply, 'forumTopic', 'forum_topic') is not True
+    forum_topic = _first(reply, 'forumTopic', 'forum_topic')
+    if forum and reply_header is not None and forum_topic is not True:
+        return False
     if top is not None:
         return top == topic
-    if topic == 1:
-        forum_topic = bool(_first(reply, 'forumTopic', 'forum_topic'))
-        reply_id = _first(reply, 'replyToMsgId', 'reply_to_msg_id')
-        return not forum_topic or reply_id == 1
+    if forum and forum_topic is True:
+        return True
     # messages.GetReplies is already restricted to the requested topic.
     return True
 
@@ -1156,33 +1228,27 @@ def _publish_services(destination, meta, records, cursor, exhausted, budget, rec
         (json.dumps(item, ensure_ascii=False, sort_keys=True) + '\n').encode()
         for item in records.iter_records()
     )
+    old_reservation = budget.named_reservations.get('services-snapshot')
     temp, _data_size, digest = destination.private_stream_temp(chunks, budget=budget)
-    manifest = {**meta, 'exported_at': now(), 'event_count': count,
-                'first_event_id': first_id,
-                'last_event_id': last_id,
-                'next_before': cursor, 'services_sha256': digest,
-                'complete': bool(exhausted and meta['scope_before'] is None and error is None),
-                'range_complete': bool(exhausted and error is None),
-                'active': not exhausted and error is None,
-                'service_messages_included': True,
-                'limitations': _service_limitations(record_limits),
-                'errors': [error] if error else [],
-                'unsupported_ranges': list(unsupported_ranges)}
     try:
-        # private_stream_temp checked every chunk while it was added to the
-        # tree. Here only the publication metadata remains to be reserved.
+        manifest = {**meta, 'exported_at': now(), 'event_count': count,
+                    'first_event_id': first_id,
+                    'last_event_id': last_id,
+                    'next_before': cursor, 'services_sha256': digest,
+                    'complete': bool(exhausted and meta['scope_before'] is None and error is None),
+                    'range_complete': bool(exhausted and error is None),
+                    'active': not exhausted and error is None,
+                    'service_messages_included': True,
+                    'limitations': _service_limitations(record_limits),
+                    'errors': [error] if error else [],
+                    'unsupported_ranges': list(unsupported_ranges)}
+        # private_stream_temp checked each bounded batch while writing. Here
+        # only the publication metadata remains to be reserved.
         budget.check(len(json.dumps(manifest).encode()) + 65536)
         previous = _read_services_manifest(destination)
         if previous and 'pending_publish' in previous:
             raise ExportError('Pending service publication requires recovery')
         pending = {'previous': previous, 'next': manifest}
-    except BaseException:
-        try:
-            os.unlink(temp, dir_fd=destination.fd)
-        except FileNotFoundError:
-            pass
-        raise
-    try:
         destination.atomic_private(
             'services_manifest.json',
             (json.dumps({**manifest, 'pending_publish': pending}, ensure_ascii=False, sort_keys=True) + '\n').encode(),
@@ -1192,12 +1258,51 @@ def _publish_services(destination, meta, records, cursor, exhausted, budget, rec
             'services_manifest.json',
             (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + '\n').encode(),
         )
+    except BaseException:
+        # A candidate may already have replaced services.jsonl when a later
+        # fsync or manifest publication fails. Keep its reservation only when
+        # the committed file's digest proves the replacement became visible.
+        try:
+            current_digest = _service_snapshot_sha256(destination)
+        except (OSError, ExportError):
+            current_digest = _UNKNOWN_SERVICE_SNAPSHOT
+        if current_digest is not _UNKNOWN_SERVICE_SNAPSHOT and current_digest != digest:
+            budget.restore_reservation('services-snapshot', old_reservation)
+        raise
     finally:
         try:
             os.unlink(temp, dir_fd=destination.fd)
         except FileNotFoundError:
             pass
     return manifest, digest
+
+
+_UNKNOWN_SERVICE_SNAPSHOT = object()
+
+
+def _service_snapshot_sha256(directory):
+    try:
+        fd = os.open('services.jsonl', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=directory.fd)
+    except FileNotFoundError:
+        return None
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600):
+            raise ExportError('Unsafe service output')
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(fd)
+        def token(item):
+            return (item.st_dev, item.st_ino, item.st_size,
+                    item.st_mtime_ns, item.st_ctime_ns)
+        if token(before) != token(after):
+            raise ExportError('Service output changed during verification')
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def _recover_service_publication(destination, manifest, records, digest):
@@ -1289,11 +1394,13 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
                 scope_before = before
                 meta = {'source_id': source_id, 'chat_id': int(canonical),
                         'topic_id': topic, 'scope': 'chat' if topic is None else 'topic',
+                        'forum': info.get('forum') is True,
                         'scope_before': scope_before, 'started_at': now()}
                 manifest, digest = _publish_services(destination, meta, records, cursor, False,
                                                      Budget(root, cfg), error=None)
             meta = {'source_id': source_id, 'chat_id': int(canonical),
                     'topic_id': topic, 'scope': 'chat' if topic is None else 'topic',
+                    'forum': info.get('forum') is True,
                     'scope_before': scope_before,
                     'started_at': manifest.get('started_at') if manifest else now()}
             budget = Budget(root, cfg)
@@ -1357,9 +1464,11 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
                         raise ExportError('Service pagination made no progress')
                     next_cursor = min(item['id'] for item in valid)
                     for item in valid:
-                        if not service_belongs(item, topic):
+                        if not service_belongs(item, topic, forum=info.get('forum') is True):
                             continue
-                        normalized, limitations = service_event(item, topic)
+                        normalized, limitations = service_event(
+                            item, topic, forum=info.get('forum') is True,
+                        )
                         if normalized is None:
                             continue
                         all_limits.update(limitations)
@@ -1850,7 +1959,10 @@ def _resume_checkpoint(directory, hashes, source_id, message_rows):
         if not records.keys() <= expected:
             raise ExportError('RESUME_CHECKPOINT_INVALID')
         return checkpoint, True
-    if checkpoint.get('version') != 1 or checkpoint.get('inputs') != hashes:
+    legacy_hashes = {key: value for key, value in hashes.items()
+                     if key != 'services_manifest.json'}
+    if (checkpoint.get('version') != 1
+            or checkpoint.get('inputs') != legacy_hashes):
         raise ExportError('RESUME_CHECKPOINT_MISMATCH')
     expected_legacy = {mid for mid, row in message_rows.items()
                        if isinstance(row.get('media'), dict) and not row['media'].get('path')}
@@ -1957,11 +2069,7 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
         source_id, _data, hashes, source_manifest, message_rows = _read_resume_source(
             source, chat, topic,
         )
-        chat_info = client.info(chat)
-        peer_type = chat_info.get('type', 'supergroup') if isinstance(chat_info, dict) else 'supergroup'
-        forum = source_manifest.get('forum')
-        if type(forum) is not bool:
-            forum = bool(chat_info.get('forum')) if isinstance(chat_info, dict) else False
+        peer_type = source_manifest.get('chat_type', 'supergroup')
         stored_limit = DEFAULT_FILE_BYTES
         try:
             existing_repair = source.child('media-resume')
@@ -2016,12 +2124,15 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                         or components[0] not in {'media', 'media-resume'}
                         or components[1] != mid):
                     raise ExportError('RESUME_CHECKPOINT_INVALID')
+                old_limit = row.get('max_file_bytes', requested_limit)
+                if type(old_limit) is not int or not 0 < old_limit <= MAX_FILE_BYTES:
+                    raise ExportError('RESUME_CHECKPOINT_INVALID')
                 media_root = source.child(components[0])
                 try:
                     media_item = media_root.child(mid)
                     try:
                         receipt = _media_receipt(
-                            media_item, row.get('size_bytes'), requested_limit,
+                            media_item, row.get('size_bytes'), old_limit,
                         )
                         if (receipt['name'] != components[2]
                                 or receipt['sha256'] != row.get('sha256')):
@@ -2030,6 +2141,8 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                         media_item.close()
                 finally:
                     media_root.close()
+                if row['size_bytes'] <= requested_limit:
+                    row['max_file_bytes'] = requested_limit
             if checkpoint.get('legacy_checkpoint_imported'):
                 checkpoint = {
                     'version': 2, 'source_id': source_id, 'inputs': hashes,
@@ -2078,34 +2191,82 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                     item['media'], None, max_file_bytes,
                 )
                 if _reconcile_resume_stage(
-                    repair, mid, media_meta.get('size_bytes'), max_file_bytes,
+                    repair, mid, None, max_file_bytes,
                 ):
                     continue
-            if not pending and 'manifest.json' in repair.names():
-                existing_status = repair.json('manifest.json')
+            unresolved = [mid for mid in missing if mid not in records]
+            if not pending:
+                # A completed resume can update its selected limit using only
+                # verified local receipts. It does not need a Telegram RPC or
+                # additional free space, and it never rewrites media bytes.
+                unchanged_checkpoint = (
+                    checkpoint.get('version') == 2
+                    and checkpoint.get('inputs') == hashes
+                    and checkpoint.get('requested_max_file_bytes') == requested_limit
+                )
+                if unchanged_checkpoint:
+                    try:
+                        old_status = repair.json('manifest.json')
+                        saved_checkpoint = repair.read('status.json', 64 * 1024**2)
+                    except FileNotFoundError:
+                        old_status = None
+                    if (isinstance(old_status, dict)
+                            and old_status.get('source_id') == source_id
+                            and old_status.get('inputs') == hashes
+                            and old_status.get('checkpoint_sha256') == hashlib.sha256(saved_checkpoint).hexdigest()
+                            and old_status.get('requested_max_file_bytes') == requested_limit):
+                        counts = _resume_counts(records)
+                        return {
+                            'source_id': source_id,
+                            'status': 'complete' if old_status.get('complete') is True else 'partial',
+                            'requested_max_file_bytes': requested_limit,
+                            'effective_max_file_bytes': old_status.get(
+                                'effective_max_file_bytes', requested_limit,
+                            ),
+                            'max_file_bytes_ceiling': MAX_FILE_BYTES,
+                            'max_file_size_unit': 'bytes',
+                            'media_count': len(missing),
+                            'remaining': old_status.get('remaining', len(unresolved)),
+                            **counts,
+                        }
+                checkpoint.update({
+                    'version': 2, 'source_id': source_id, 'inputs': hashes,
+                    'records': records, 'requested_max_file_bytes': requested_limit,
+                    'max_file_size_unit': 'bytes', 'media_count': len(missing),
+                    'updated_at': now(),
+                })
+                repair.atomic_private(
+                    'status.json', (json.dumps(checkpoint, sort_keys=True) + '\n').encode(),
+                )
+                counts = _resume_counts(records)
+                unresolved = [mid for mid in missing if mid not in records]
+                complete = not unresolved and counts['download_errors'] == 0
+                current_limits = [item.get('max_file_bytes', requested_limit)
+                                  for item in records.values()
+                                  if item.get('export_status') == 'downloaded']
+                effective_max = min([requested_limit, *current_limits]) if current_limits else requested_limit
                 checkpoint_bytes = repair.read('status.json', 64 * 1024**2)
-                checkpoint_sha = hashlib.sha256(checkpoint_bytes).hexdigest()
-                same_input = (existing_status.get('source_id') == source_id
-                              and existing_status.get('inputs') == hashes)
-                if not same_input:
-                    raise ExportError('RESUME_CHECKPOINT_MANIFEST_MISMATCH')
-                if (existing_status.get('checkpoint_sha256') == checkpoint_sha
-                        and existing_status.get('requested_max_file_bytes')
-                        == checkpoint.get('requested_max_file_bytes')
-                        and existing_status.get('complete') is True):
-                    return {
-                        'source_id': source_id, 'status': 'complete',
-                        'requested_max_file_bytes': existing_status['requested_max_file_bytes'],
-                        'effective_max_file_bytes': existing_status['effective_max_file_bytes'],
-                        'max_file_bytes_ceiling': MAX_FILE_BYTES,
-                        'max_file_size_unit': 'bytes',
-                        'media_count': existing_status['media_count'],
-                        'remaining': existing_status['remaining'],
-                        **{key: existing_status[key] for key in (
-                            'downloaded', 'skipped', 'download_errors', 'already_present',
-                            'skipped_by_reason',
-                        )},
-                    }
+                status = {
+                    'version': 1, 'source_id': source_id, 'inputs': hashes,
+                    'checkpoint_sha256': hashlib.sha256(checkpoint_bytes).hexdigest(),
+                    'requested_max_file_bytes': requested_limit,
+                    'effective_max_file_bytes': effective_max,
+                    'max_file_bytes_ceiling': MAX_FILE_BYTES,
+                    'max_file_size_unit': 'bytes', 'media_count': len(missing),
+                    'complete': complete, 'remaining': len(unresolved),
+                    'download_errors': counts['download_errors'], **counts,
+                    'updated_at': checkpoint['updated_at'],
+                }
+                repair.atomic_private('manifest.json',
+                                      (json.dumps(status, sort_keys=True) + '\n').encode())
+                return {
+                    'source_id': source_id, 'status': 'complete' if complete else 'partial',
+                    'requested_max_file_bytes': requested_limit,
+                    'effective_max_file_bytes': effective_max,
+                    'max_file_bytes_ceiling': MAX_FILE_BYTES,
+                    'max_file_size_unit': 'bytes', 'media_count': len(missing),
+                    'remaining': len(unresolved), **counts,
+                }
             # Reconcile incomplete .part files before measuring the storage
             # budget, so killed downloads cannot permanently consume quota.
             # A verified completed rerun above is read-only and needs no new
@@ -2123,6 +2284,9 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                     finally:
                         original_media.close()
                 lookup = [int(mid) for mid in pending if mid not in existing_ids]
+                if lookup:
+                    chat_info = client.info(chat)
+                    peer_type = chat_info.get('type', peer_type) if isinstance(chat_info, dict) else peer_type
                 try:
                     raw = client.media_metadata(chat, lookup, peer_type=peer_type) if lookup else {}
                     metadata_error = None
@@ -2444,8 +2608,8 @@ def export(root, cfg, args, client=None):
                         item = record(message, topic, forum=forum)
                         if item['media']:
                             raw_attachment = raw_media.get(mid)
-                            metadata_unavailable = metadata_error is not None or (
-                                mid in lookup_ids and mid not in raw_media
+                            metadata_unavailable = mid in lookup_ids and (
+                                metadata_error is not None or mid not in raw_media
                             )
                             if media:
                                 attached = attachment(

@@ -47,6 +47,7 @@ class TelegramExport:
     message_sha256: str
     service_sha256: str
     manifest_sha256: str
+    services_manifest_sha256: str
     messages_size: int
     services_size: int
     manifest_size: int
@@ -398,6 +399,7 @@ def inspect_export(
         message_sha256=message_sha,
         service_sha256=service_sha,
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        services_manifest_sha256=hashlib.sha256(service_manifest_bytes).hexdigest(),
         messages_size=messages_size,
         services_size=service_size,
         manifest_size=len(manifest_bytes),
@@ -442,8 +444,9 @@ def _media_info(
     if not isinstance(relative, str):
         raise LoadError("Telegram message media path is invalid")
     parsed = PurePosixPath(relative)
+    allowed_roots = {"media", "media-resume"} if resumed else {"media"}
     if (parsed.is_absolute() or not parsed.parts
-            or parsed.parts[0] != ("media-resume" if resumed else "media")
+            or parsed.parts[0] not in allowed_roots
             or ".." in parsed.parts or "\\" in relative or "\x00" in relative):
         raise LoadError("Telegram media path contains traversal")
     if len(parsed.parts) != 3 or parsed.parts[1] != str(message_id):
@@ -462,7 +465,7 @@ def _media_info(
     except ValueError:
         raise LoadError("Telegram media size limit is invalid") from None
     limit_ceiling = export.max_file_bytes if selected_limit is None else selected_limit
-    if limit > limit_ceiling:
+    if not resumed and limit > limit_ceiling:
         raise LoadError("Telegram media size limit exceeds its manifest")
     if type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES or size > limit:
         raise LoadError("Telegram media size is outside the supported limit")
@@ -565,12 +568,23 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
     export = inspect_export(source, root=root)
     recovered = {}
     media_limit_bytes = export.max_file_bytes
-    resume = export.path / "media-resume"
-    if resume.exists() or resume.is_symlink():
-        info = resume.lstat()
-        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+    resume_dirs = [export.path / name for name in ("media-resume", "media")]
+    resume_candidates = [directory / "status.json" for directory in resume_dirs
+                         if (directory / "status.json").exists()
+                         or (directory / "status.json").is_symlink()]
+    if len(resume_candidates) > 1:
+        raise LoadError("Telegram export has ambiguous media resume checkpoints")
+    if resume_candidates:
+        checkpoint_path = resume_candidates[0]
+        resume = checkpoint_path.parent
+        try:
+            info = resume.lstat()
+        except OSError:
+            raise LoadError("Media resume directory is unsafe") from None
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o700):
             raise LoadError("Media resume directory is unsafe")
-        with _open_private(resume / "status.json") as stream:
+        with _open_private(checkpoint_path) as stream:
             checkpoint = stream.read(4 * 1024**2 + 1)
         if len(checkpoint) > 4 * 1024**2:
             raise LoadError("Media resume checkpoint is too large")
@@ -578,6 +592,7 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
             "messages.jsonl": export.message_sha256,
             "services.jsonl": export.service_sha256,
             "manifest.json": export.manifest_sha256,
+            "services_manifest.json": export.services_manifest_sha256,
         }, (row for _, row in _iter_jsonl(export.path / "messages.jsonl")))
         try:
             resume_data = json.loads(checkpoint)

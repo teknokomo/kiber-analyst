@@ -45,7 +45,7 @@ class _PartialMediaClient:
                 "sender": "Synthetic author",
                 "senderId": 9,
                 "text": f"Synthetic item {mid}",
-                "full": {"replyTo": {"topMsgId": self.topic}},
+                "full": {"replyTo": {"forumTopic": True, "topMsgId": self.topic}},
                 "media": {
                     "kind": "document", "size": size,
                     "size_source": "document.size", "file_name": f"item-{mid}.bin",

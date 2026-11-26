@@ -388,3 +388,14 @@ def test_large_asr_workspace_is_streamed_and_reopens_with_the_same_limit(asr_set
     assert plan["files_eligible"] == message_count
     assert plan["files_total"] == message_count
     assert peak < 64 * 1024**2
+
+
+def test_asr_workspace_writer_and_reader_share_the_same_plan_limit(asr_setup, monkeypatch):
+    app, source_dir, _jobs, _argv, _overview, _original = asr_setup
+    monkeypatch.setattr(broker, "ASR_PLAN_MAX_BYTES", 64)
+
+    with pytest.raises(broker.Refused, match="ASR_PLAN_TOO_LARGE"):
+        app.asr_workspace(SOURCE, app.sources[SOURCE], source_dir, "e" * 64, "")
+
+    assert not list(source_dir.glob("asr-input-*"))
+    assert not list(source_dir.glob(".asr-*"))

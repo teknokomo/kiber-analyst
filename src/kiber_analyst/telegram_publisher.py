@@ -383,7 +383,8 @@ def _write_init_intent(parent: int, name: str, *, uid: int, gid: int,
         "source_hashes": source_hashes,
         "media_manifest_sha256": media_manifest_sha,
     }, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    fd = os.open(name + ".json", os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    temporary = ".publisher-init-write-" + uuid.uuid4().hex + ".tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                  | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
     try:
         os.fchown(fd, uid, gid)
@@ -393,17 +394,46 @@ def _write_init_intent(parent: int, name: str, *, uid: int, gid: int,
             written = os.write(fd, view)
             view = view[written:]
         os.fsync(fd)
-    finally:
         os.close(fd)
-    os.fsync(parent)
+        fd = -1
+        _rename_noreplace(parent, temporary, parent, name + ".json")
+        os.fsync(parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent)
+
+
+def _cleanup_init_intent_temporaries(parent: int, *, uid: int, gid: int) -> bool:
+    """Remove only private, singly-linked scratch files from the exact writer namespace."""
+    removed = False
+    pattern = re.compile(r"\.publisher-init-write-[0-9a-f]{32}\.tmp\Z")
+    for name in sorted(os.listdir(parent)):
+        if not pattern.fullmatch(name):
+            continue
+        try:
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != uid or info.st_gid != gid
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > MAX_METADATA_BYTES):
+            _fail("TRANSFER_RECOVERY_REQUIRED")
+        os.unlink(name, dir_fd=parent)
+        removed = True
+    if removed:
+        os.fsync(parent)
+    return removed
 
 
 def _recover_initialization_directories(parent: int, *, uid: int, source_id: str,
                                         source_hashes: dict,
                                         media_manifest_sha: str | None,
-                                        temp_name: str) -> None:
+                                        temp_name: str, gid: int) -> None:
     """Recover only scratch paths proven by a durable, matching intent file."""
-    removed = False
+    removed = _cleanup_init_intent_temporaries(parent, uid=uid, gid=gid)
     names = set(os.listdir(parent))
     init_re = re.compile(r"\.publisher-init-[0-9a-f]{32}\Z")
     for name in sorted(names):
@@ -1303,6 +1333,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                 ).hexdigest()[:32]
                 _recover_initialization_directories(
                     destination_chat, uid=config["destination_uid"],
+                    gid=config["destination_gid"],
                     source_id=source_id, source_hashes=hashes,
                     media_manifest_sha=desired_media_sha,
                     temp_name=temp_name,
@@ -1397,6 +1428,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                         _fail("DESTINATION_CONFLICT")
                     if transfer.get("media_manifest_sha256") == desired_media_sha:
                         final_status["status"] = "already_ready"
+                        os.fsync(destination_chat)
                         return final_status
 
                 def transform(row):

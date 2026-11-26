@@ -82,6 +82,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - name: Expose pinned Node on the Telegram service PATH
+        run: |
+          node_path="$(command -v node)"
+          node_version="$(node --version)"
+          case "$node_version" in
+            v20.*) ;;
+            *) echo "Expected Node 20 from setup-node" >&2; exit 1 ;;
+          esac
+          sudo ln -sfn "$node_path" /usr/bin/node
+          test "$(PATH=/usr/bin:/bin /usr/bin/node --version)" = "$node_version"
       - name: Install package and test dependencies
         run: |
           python -m pip install -e .

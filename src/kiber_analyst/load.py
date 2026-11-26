@@ -207,6 +207,43 @@ def _assert_telegram_refs_project(
     check_batch()
 
 
+def _assert_telegram_service_refs_project(
+    cursor: Any, path: Path, project_slug: str, chat_id: str,
+) -> None:
+    """Prevent service-event identity from being reused across projects."""
+    from kiber_analyst.telegram_ingest import _iter_jsonl
+
+    references: list[str] = []
+
+    def check_batch() -> None:
+        if not references:
+            return
+        cursor.execute(
+            """SELECT 1
+               FROM telegram_service_events event
+               JOIN sources src ON src.id = event.source_id
+               JOIN projects project ON project.id = src.project_id
+               WHERE event.external_ref = ANY(%s)
+                 AND project.slug IS DISTINCT FROM %s
+               LIMIT 1""",
+            (references, project_slug),
+        )
+        if cursor.fetchone() is not None:
+            raise TelegramProjectConflict(
+                "Telegram service event is already assigned to another project"
+            )
+        references.clear()
+
+    for _raw, event in _iter_jsonl(path):
+        event_id = event.get("event_id")
+        if type(event_id) is not int or event_id <= 0:
+            raise LoadError("Telegram service event identity is invalid")
+        references.append(f"tg:{chat_id}:service:{event_id}")
+        if len(references) == 500:
+            check_batch()
+    check_batch()
+
+
 def _assert_snapshot_scope(
     cursor: Any, source_id: str, sha256: str, scope: str, topic_id: str | None,
 ) -> None:
@@ -438,7 +475,7 @@ def _upsert_service_event(
         key: event.get(key)
         for key in (
             "actor_id", "actor_name", "target_id", "target_name", "message_id",
-            "old_value", "new_value", "raw_action", "error_code",
+            "old_value", "new_value", "raw_action", "error_code", "topic_id_status",
         )
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -510,6 +547,7 @@ def _service_file_info(path: Path, service_manifest: dict[str, Any]) -> tuple[st
     for raw, event in _iter_jsonl(path):
         event_id = event.get("event_id")
         topic_id = event.get("topic_id")
+        topic_status = event.get("topic_id_status")
         if type(event_id) is not int or event_id <= 0 or event_id in seen:
             raise LoadError("Telegram service event IDs are invalid or duplicated")
         valid_topic = (
@@ -517,7 +555,13 @@ def _service_file_info(path: Path, service_manifest: dict[str, Any]) -> tuple[st
             if scope == "topic"
             else topic_id is None or (type(topic_id) is int and topic_id > 0)
         )
-        if event.get("type") not in _EVENT_TYPES or not valid_topic:
+        if (event.get("type") not in _EVENT_TYPES or not valid_topic
+                or (topic_status is not None and topic_status not in {
+                    "known", "unknown", "not_applicable",
+                })
+                or (scope == "topic" and topic_status not in {None, "known"})
+                or (scope == "chat" and topic_id is None and topic_status == "unknown"
+                    and service_manifest.get("forum") is not True)):
             raise LoadError("Telegram service event fields are invalid")
         seen.add(event_id)
         digest.update(raw)
@@ -801,6 +845,10 @@ def load_job(
                 _assert_telegram_refs_project(
                     cursor, paths["messages"], project_slug, chat_id, scope, scope_topic_id,
                 )
+                if service_events_path is not None:
+                    _assert_telegram_service_refs_project(
+                        cursor, service_events_path, project_slug, chat_id,
+                    )
                 project_id = _project_id(cursor, project_slug)
                 source_id = _source_id(cursor, project_id, manifest)
                 snapshot_sha256, scope_qualified = _snapshot_identity(

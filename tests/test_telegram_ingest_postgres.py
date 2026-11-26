@@ -452,6 +452,69 @@ def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
             )
 
 
+def test_service_event_identity_cannot_move_between_projects(
+    tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
+) -> None:
+    from kiber_analyst.errors import LoadError
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    project_a = f"service-iso-a-{uuid.uuid4().hex[:10]}"
+    project_b = f"service-iso-b-{uuid.uuid4().hex[:10]}"
+    with _connect(disposable_postgres_credentials) as conn:
+        conn.execute(
+            "INSERT INTO projects (slug, title) VALUES (%s, %s), (%s, %s)",
+            (project_a, "Service isolation A", project_b, "Service isolation B"),
+        )
+
+    export_root = tmp_path / "telegram"
+    chat_id = f"-100{uuid.uuid4().int % 10**15 + 1}"
+    source = _scope_fixture(export_root, chat_id=chat_id, scope="chat", topic_id=None)
+    _write_private(source / "messages.jsonl", b"")
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(message_count=0, messages_sha256=hashlib.sha256(b"").hexdigest())
+    _write_private(manifest_path, _json_bytes(manifest))
+    artifacts = tmp_path / "artifacts"
+
+    loaded = load_telegram_export(
+        source, artifacts / "a", env_path=Path(TEST_ENV), project_slug=project_a,
+        root=export_root,
+    )
+    assert loaded["service_events_inserted"] == 1
+
+    def event_snapshot(conn, slug):
+        return conn.execute(
+            """SELECT event.external_ref, event.topic_id, event.event_type,
+                      event.payload, event.provenance, event.event_sha256
+                 FROM telegram_service_events event
+                 JOIN sources source ON source.id=event.source_id
+                 JOIN projects project ON project.id=source.project_id
+                 WHERE project.slug=%s ORDER BY event.external_ref""",
+            (slug,),
+        ).fetchall()
+
+    with _connect(disposable_postgres_credentials) as conn:
+        before_a = event_snapshot(conn, project_a)
+        assert len(before_a) == 1
+        assert event_snapshot(conn, project_b) == []
+
+    with pytest.raises(LoadError, match="TELEGRAM_PROJECT_CONFLICT"):
+        load_telegram_export(
+            source, artifacts / "b", env_path=Path(TEST_ENV), project_slug=project_b,
+            dry_run=True, root=export_root,
+        )
+
+    with _connect(disposable_postgres_credentials) as conn:
+        assert event_snapshot(conn, project_a) == before_a
+        assert event_snapshot(conn, project_b) == []
+        assert conn.execute(
+            "SELECT count(*) FROM telegram_service_events WHERE external_ref=%s",
+            (f"tg:{chat_id}:service:700",),
+        ).fetchone()[0] == 1
+
+
 def test_concurrent_same_chat_import_keeps_project_a_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     disposable_postgres_credentials: dict[str, str],

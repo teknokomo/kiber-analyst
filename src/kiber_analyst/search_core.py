@@ -123,7 +123,7 @@ base AS (
     AND (%(author)s::text IS NULL OR u.author ILIKE '%%' || %(author)s::text || '%%')
     AND (%(topic)s::text IS NULL OR u.meta->>'topic_id' = %(topic)s::text)
     AND (%(source_id)s::text IS NULL OR u.source_id = %(source_id)s::text OR
-         (%(source_id)s::text ~ '^telegram:-[1-9][0-9]{0,18}:group$'
+         (%(source_id)s::text ~ '^telegram:-?[1-9][0-9]{0,18}:group$'
           AND u.source_kind = 'telegram'
           AND u.chat_id = split_part(%(source_id)s::text, ':', 2)))
 ),

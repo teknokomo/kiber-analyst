@@ -342,7 +342,11 @@ def test_media_record_cannot_exceed_manifest_selected_limit(tmp_path: Path) -> N
         prepare_export(topic, tmp_path / "artifacts" / "too-large-media-limit", root=root)
 
 
-def test_resumed_media_uses_checkpoint_limit_and_preserves_voice_type(tmp_path: Path) -> None:
+@pytest.mark.parametrize("media_root", ["media-resume", "media"])
+@pytest.mark.parametrize("version", [1, 2])
+def test_resumed_media_uses_checkpoint_limit_and_preserves_voice_type(
+    tmp_path: Path, media_root: str, version: int,
+) -> None:
     root = tmp_path / "telegram"
     topic = _make_export(root)
     message_path = topic / "messages.jsonl"
@@ -362,23 +366,29 @@ def test_resumed_media_uses_checkpoint_limit_and_preserves_voice_type(tmp_path: 
     manifest_bytes = _json_bytes(manifest)
     _write_private(manifest_path, manifest_bytes)
 
-    resume_dir = topic / "media-resume"
+    resume_dir = topic / media_root
     resume_dir.mkdir(mode=0o700)
     media_dir = resume_dir / "101"
     media_dir.mkdir(mode=0o700)
     payload = b"x" * 101
     _write_private(media_dir / "audio.ogg", payload)
+    checkpoint_inputs = {
+        "messages.jsonl": hashlib.sha256(messages).hexdigest(),
+        "services.jsonl": hashlib.sha256((topic / "services.jsonl").read_bytes()).hexdigest(),
+        "manifest.json": hashlib.sha256(manifest_bytes).hexdigest(),
+        "services_manifest.json": hashlib.sha256(
+            (topic / "services_manifest.json").read_bytes()
+        ).hexdigest(),
+    }
+    if version == 1:
+        checkpoint_inputs.pop("services_manifest.json")
     checkpoint = {
-        "version": 2,
+        "version": version,
         "source_id": SOURCE_ID,
-        "inputs": {
-            "messages.jsonl": hashlib.sha256(messages).hexdigest(),
-            "services.jsonl": hashlib.sha256((topic / "services.jsonl").read_bytes()).hexdigest(),
-            "manifest.json": hashlib.sha256(manifest_bytes).hexdigest(),
-        },
+        "inputs": checkpoint_inputs,
         "requested_max_file_bytes": 101,
         "records": {"101": {
-            "export_status": "downloaded", "path": "media-resume/101/audio.ogg",
+            "export_status": "downloaded", "path": f"{media_root}/101/audio.ogg",
             "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
             "max_file_bytes": 101,
         }},
@@ -395,7 +405,7 @@ def test_resumed_media_uses_checkpoint_limit_and_preserves_voice_type(tmp_path: 
 
     assert media_missing == 0
     assert normalized["media_type"] == "voice_message"
-    assert normalized["media_path"] == "media-resume/101/audio.ogg"
+    assert normalized["media_path"] == f"{media_root}/101/audio.ogg"
     assert normalized["meta"]["media_export"]["max_file_bytes"] == 101
 
 

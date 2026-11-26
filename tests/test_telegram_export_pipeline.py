@@ -51,7 +51,7 @@ class _FakeTelegram:
             "sender": "Synthetic author",
             "senderId": 9,
             "text": "A synthetic video larger than the ASR local limit",
-            "full": {"replyTo": {"topMsgId": TOPIC}},
+            "full": {"replyTo": {"forumTopic": True, "topMsgId": TOPIC}},
             "media": {
                 "kind": "video", "size": self.size, "size_source": "document.size",
                 "file_name": "synthetic-video.bin",
@@ -121,7 +121,7 @@ class _InterruptedTelegram:
             "sender": "Synthetic author",
             "senderId": 9,
             "text": f"Synthetic item {mid}",
-            "full": {"replyTo": {"topMsgId": TOPIC}},
+            "full": {"replyTo": {"forumTopic": True, "topMsgId": TOPIC}},
             "media": {"kind": "document", "size": len(payload), "file_name": f"{mid}.bin"},
         } for mid, payload in self.payloads.items()]
 
@@ -270,6 +270,50 @@ def test_basic_group_photo_metadata_is_preserved_with_or_without_download(
         assert client.download_calls == 0
         assert message["media"]["export_status"] == "not_requested"
         assert "path" not in message["media"]
+
+
+def test_metadata_failure_marks_only_attachments_whose_metadata_was_requested(
+    tmp_path: Path,
+) -> None:
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    export_root.chmod(0o700)
+    client = _BasicGroupPhotoTelegram("-12345")
+    client.pages = 0
+
+    def two_media_page(_chat, _topic, _limit, _before):
+        client.pages += 1
+        if client.pages > 1:
+            return []
+        return [
+            {"id": 43, "date": "2026-01-01T00:00:00Z", "sender": "Synthetic",
+             "senderId": 7, "text": "photo", "media": {"kind": "photo"}},
+            {"id": 42, "date": "2026-01-01T00:00:00Z", "sender": "Synthetic",
+             "senderId": 7, "text": "document", "media": {"kind": "document", "size": 51}},
+        ]
+
+    def unavailable_metadata(_chat, _ids, peer_type="group"):
+        raise ExportError("metadata unavailable", error_code="TEST_METADATA_OFFLINE")
+
+    client.page = two_media_page
+    client.media_metadata = unavailable_metadata
+    root = Dir.root(str(export_root))
+    try:
+        manifest = export(
+            root, {"storage_limit_bytes": 1024**2, "min_free_bytes": 0},
+            ["export", "-12345", "GROUP", "10"], client=client,
+        )
+    finally:
+        root.close()
+
+    rows = [json.loads(line) for line in
+            (export_root / "-12345" / "group" / "messages.jsonl").read_text().splitlines()]
+    by_id = {row["message_id"]: row["media"] for row in rows}
+    assert manifest["complete"] is True
+    assert manifest["media_metadata_unavailable_count"] == 1
+    assert by_id[43]["metadata_status"] == "unavailable"
+    assert by_id[42]["size_bytes"] == 51
+    assert by_id[42].get("metadata_status") is None
 
 
 def test_telegram_file_limit_uses_decimal_mb_and_default_mib() -> None:
@@ -721,11 +765,111 @@ def test_export_resume_complete_noop_does_not_require_new_storage_headroom(
             raise exporter.ExportError("STORAGE_BUDGET_EXHAUSTED")
 
         monkeypatch.setattr(exporter.Budget, "check", no_headroom)
+        client.info = lambda _chat: (_ for _ in ()).throw(AssertionError("no Telegram info RPC expected"))
         repeated = exporter.export_resume(root, config, CHAT, TOPIC, 100, None, client)
 
         assert repeated["status"] == "complete"
         assert (resume_dir / "status.json").read_bytes() == checkpoint_before
         assert (resume_dir / "manifest.json").read_bytes() == manifest_before
+    finally:
+        root.close()
+
+
+def test_export_resume_limit_change_reuses_verified_files_without_telegram_rpc(
+    tmp_path: Path,
+) -> None:
+    import kiber_analyst.telegram_exporter as exporter
+
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    export_root.chmod(0o700)
+    client = _FakeTelegram(32_768)
+    root = Dir.root(str(export_root))
+    try:
+        export(root, {"storage_limit_bytes": 1024**3, "min_free_bytes": 0},
+               ["export", CHAT, str(TOPIC), "100"], client=client)
+        export_services(root, {"storage_limit_bytes": 1024**3, "min_free_bytes": 0},
+                        CHAT, TOPIC, 100, None, client=client)
+        initial = exporter.export_resume(
+            root, {"storage_limit_bytes": 1024**3, "min_free_bytes": 0},
+            CHAT, TOPIC, 100, 4_000_000_000, client,
+        )
+        assert initial["status"] == "complete"
+        media_path = export_root / CHAT / str(TOPIC) / "media-resume" / "501" / "synthetic-video.bin"
+        original_bytes = media_path.read_bytes()
+        checkpoint_path = media_path.parents[1] / "status.json"
+
+        def no_telegram(_chat):
+            raise AssertionError("completed media limit update must remain offline")
+
+        client.info = no_telegram
+        changed = exporter.export_resume(
+            root, {"storage_limit_bytes": 1024**3, "min_free_bytes": 0},
+            CHAT, TOPIC, 100, 104_857_600, client,
+        )
+        checkpoint = json.loads(checkpoint_path.read_text())
+        receipt = checkpoint["records"]["501"]
+        assert changed["requested_max_file_bytes"] == 104_857_600
+        assert receipt["max_file_bytes"] == 104_857_600
+        assert media_path.read_bytes() == original_bytes
+    finally:
+        root.close()
+
+
+def test_export_resume_reconciles_valid_receipt_when_provisional_photo_size_was_stale(
+    tmp_path: Path,
+) -> None:
+    class ChangingPhotoMetadata(_BasicGroupPhotoTelegram):
+        def __init__(self):
+            super().__init__("-12345")
+            self.metadata_reads = 0
+
+        def media_metadata(self, _chat, _ids, peer_type="group"):
+            self.metadata_reads += 1
+            sizes = [17] if self.metadata_reads == 1 else [17, 51]
+            return {42: {"_": "messageMediaPhoto", "photo": {
+                "_": "photo", "sizes": [{"_": "photoSize", "size": n} for n in sizes],
+            }}}
+
+        def page(self, _chat, _topic, _limit, _before):
+            self.pages += 1
+            if self.pages > 1:
+                return []
+            return [{
+                "id": 42, "date": "2026-01-01T00:00:00Z", "sender": "Synthetic",
+                "senderId": 7, "text": "photo", "media": {"kind": "photo", "size": 17},
+            }]
+
+        def download(self, *_args):
+            raise AssertionError("a valid completed part receipt must be reused")
+
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    export_root.chmod(0o700)
+    client = ChangingPhotoMetadata()
+    config = {"storage_limit_bytes": 1024**3, "min_free_bytes": 0}
+    root = Dir.root(str(export_root))
+    try:
+        export(root, config, ["export", "-12345", "GROUP", "10"], client=client)
+        export_services(root, config, "-12345", None, 10, None, client=client)
+        topic = export_root / "-12345" / "group"
+        resume = topic / "media-resume"
+        resume.mkdir(mode=0o700)
+        part = resume / ".part-42"
+        part.mkdir(mode=0o700)
+        payload = b"p" * 51
+        (part / "photo.jpg").write_bytes(payload)
+        (part / "photo.jpg").chmod(0o600)
+        receipt = {"name": "photo.jpg", "size": len(payload),
+                   "sha256": hashlib.sha256(payload).hexdigest()}
+        (part / "receipt.json").write_text(json.dumps(receipt) + "\n")
+        (part / "receipt.json").chmod(0o600)
+
+        result = export(root, config, ["export-resume", "-12345", "GROUP"], client=client)
+        assert result["status"] == "complete"
+        assert client.metadata_reads == 2
+        assert (resume / "42" / "photo.jpg").read_bytes() == payload
+        assert not part.exists()
     finally:
         root.close()
 
@@ -776,14 +920,14 @@ def test_pinned_better_tg_cli_mock_download_uses_only_local_write_exception(
     home.chmod(0o700)
     client = Client({"telegram_cli": cli, "telegram_home": str(home)})
     assert client.env["PATH"] == "/usr/bin:/bin"
-    node = shutil.which("node")
+    node = shutil.which("node", path=client.env["PATH"])
     if not node:
-        pytest.skip("Node.js is required to run the pinned Better-TG-CLI")
-    # GitHub setup-node exposes Node from its tool cache, while the service
-    # intentionally fixes PATH to /usr/bin:/bin. Keep the production default
-    # assertion above and add the CI-managed Node directory only for this
-    # isolated CLI integration test.
-    client.env["PATH"] = f"{Path(node).resolve().parent}:/usr/bin:/bin"
+        pytest.skip("Node.js must be installed under the fixed service PATH")
+    node_version = subprocess.run(
+        [node, "--version"], cwd=home, env=client.env,
+        capture_output=True, timeout=15, check=True,
+    ).stdout.decode("ascii").strip()
+    assert node_version.startswith("v") and int(node_version[1:].split(".", 1)[0]) >= 20
     client.env["TG_MOCK"] = "1"
     client.env["TG_NO_UPDATE_CHECK"] = "1"
     with pytest.raises(ExportError, match="Unsafe Telegram CLI permission override"):

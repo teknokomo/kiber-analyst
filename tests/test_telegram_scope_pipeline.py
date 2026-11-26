@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tracemalloc
 import uuid
 from pathlib import Path
@@ -10,7 +11,16 @@ from pathlib import Path
 import pytest
 
 from kiber_analyst import broker, telegram_publisher
-from kiber_analyst.telegram_exporter import Dir, export, export_services
+from kiber_analyst.telegram_exporter import (
+    Budget,
+    Dir,
+    _publish_services,
+    _ServiceRecordStore,
+    belongs,
+    export,
+    export_services,
+    service_belongs,
+)
 from kiber_analyst.telegram_ingest import inspect_export, prepare_export
 
 PROJECT = "telegram-scope-fixture"
@@ -44,6 +54,10 @@ class _ScopeTelegram:
             return []
         if self.topic_provenance:
             cases = [
+                # Telegram encodes forumTopic as an optional true flag. If it
+                # is absent, a topMsgId alone does not make this a topic reply.
+                (1006, {"topMsgId": 17}),
+                (1005, {"forumTopic": False, "topMsgId": 17}),
                 (1004, {"forumTopic": False}),
                 (1003, {"forumTopic": True, "topMsgId": 17}),
                 (1002, {"forumTopic": True, "replyToMsgId": 1003}),
@@ -61,7 +75,7 @@ class _ScopeTelegram:
         for index in range(self.count):
             message_id = 1000 - index
             actual_topic = 17 + index if self.forum and self.scope == "group" else 17
-            full = {"replyTo": {"topMsgId": actual_topic}} if self.forum else {}
+            full = {"replyTo": {"forumTopic": True, "topMsgId": actual_topic}} if self.forum else {}
             if topic is not None and actual_topic != topic:
                 continue
             rows.append({
@@ -106,7 +120,7 @@ class _ScopeTelegram:
                 "action": action,
             }
             if topic_id is not None:
-                event["replyTo"] = {"topMsgId": topic_id}
+                event["replyTo"] = {"forumTopic": True, "topMsgId": topic_id}
             events.append(event)
         return events[:limit]
 
@@ -202,12 +216,13 @@ def _run_scope_pipeline(
     if topic_provenance:
         assert [(row["message_id"], row["topic_id"], row["topic_id_status"])
                 for row in message_rows] == [
-                    (1004, 1, "known"), (1003, 17, "known"),
-                    (1002, 17, "known"), (1001, None, "unknown"),
-                    (1000, 17, "known"),
+                    (1006, 1, "known"),
+                    (1005, 1, "known"), (1004, 1, "known"),
+                    (1003, 17, "known"), (1002, None, "unknown"),
+                    (1001, None, "unknown"), (1000, 17, "known"),
                 ]
         assert export_manifest["topic_assignment_complete"] is False
-        assert export_manifest["topic_assignment_unknown_count"] == 1
+        assert export_manifest["topic_assignment_unknown_count"] == 2
     assert len(event_rows) == inspected.service_event_count
     assert all(
         row.get("media") is None or (stage / row["media"]["path"]).is_file()
@@ -300,13 +315,13 @@ def test_forum_topic_provenance_is_explicit_and_survives_ingest(
 ):
     project = f"forum-provenance-{uuid.uuid4().hex[:10]}"
     result = _run_scope_pipeline(
-        tmp_path, scope="group", forum=True, count=5, monkeypatch=monkeypatch,
+        tmp_path, scope="group", forum=True, count=7, monkeypatch=monkeypatch,
         topic_provenance=True, project_slug=project,
     )
     normalized = result["normalized"]
     assert [(item["topic_id"], item["meta"]["topic_id_status"]) for item in normalized] == [
-        ("1", "known"), ("17", "known"), ("17", "known"),
-        (None, "unknown"), ("17", "known"),
+        ("1", "known"), ("1", "known"), ("1", "known"), ("17", "known"),
+        (None, "unknown"), (None, "unknown"), ("17", "known"),
     ]
     if optional_disposable_postgres_credentials is None:
         return
@@ -326,10 +341,175 @@ def test_forum_topic_provenance_is_explicit_and_survives_ingest(
             (project,),
         ).fetchall()
     assert rows == [
-        ("1", "known", "chat"), ("17", "known", "chat"),
+        ("1", "known", "chat"), ("1", "known", "chat"), ("1", "known", "chat"),
         ("17", "known", "chat"), (None, "unknown", "chat"),
-        ("17", "known", "chat"),
+        (None, "unknown", "chat"), ("17", "known", "chat"),
     ]
+
+
+def test_forum_general_provenance_precedes_reply_root_for_messages_and_services():
+    general_reply = {"full": {"replyTo": {"forumTopic": False, "topMsgId": 420}}}
+    general_reply_without_flag = {"full": {"replyTo": {"topMsgId": 420}}}
+    topic_reply = {"full": {"replyTo": {"forumTopic": True, "topMsgId": 420}}}
+    topic_root_without_reply_header = {}
+    unresolved_topic_reply = {
+        "full": {"replyTo": {"forumTopic": True, "replyToMsgId": 421}},
+        "topicId": 420,
+    }
+
+    assert belongs(general_reply, 1, forum=True)
+    assert not belongs(general_reply, 420, forum=True)
+    assert belongs(general_reply_without_flag, 1, forum=True)
+    assert not belongs(general_reply_without_flag, 420, forum=True)
+    assert belongs(topic_reply, 420, forum=True)
+    assert not belongs(topic_reply, 1, forum=True)
+    assert belongs(topic_root_without_reply_header, 420, forum=True)
+    assert not belongs(unresolved_topic_reply, 1, forum=True)
+
+    general_event = {"id": 900, "replyTo": {"forumTopic": False, "topMsgId": 420}}
+    topic_event = {"id": 901, "replyTo": {"forumTopic": True, "topMsgId": 420}}
+    assert service_belongs(general_event, 1, forum=True)
+    assert not service_belongs(general_event, 420, forum=True)
+    general_event_without_flag = {"id": 902, "replyTo": {"topMsgId": 420}}
+    assert service_belongs(general_event_without_flag, 1, forum=True)
+    assert not service_belongs(general_event_without_flag, 420, forum=True)
+    assert service_belongs(topic_event, 420, forum=True)
+    assert not service_belongs(topic_event, 1, forum=True)
+
+
+def test_service_snapshot_budget_replaces_prior_revision_reservation(tmp_path: Path):
+    root_path = tmp_path / "export"
+    root_path.mkdir(mode=0o700)
+    root_path.chmod(0o700)
+    root = Dir.root(str(root_path))
+    try:
+        budget = Budget(root, {
+            "storage_limit_bytes": 128 * 1024**2,
+            "min_free_bytes": 0,
+            "aggregate_available_bytes": 30 * 1024**2,
+        })
+        first = root.private_stream_temp(
+            (b"a" * (256 * 1024) for _ in range(16)), budget=budget,
+        )
+        root.publish_private_temp(first[0], "services.jsonl")
+        first_reserved = budget.reserved_bytes
+        second = root.private_stream_temp(
+            (b"b" * (256 * 1024) for _ in range(32)), budget=budget,
+        )
+        root.publish_private_temp(second[0], "services.jsonl")
+        assert first[1] == 4 * 1024**2
+        assert second[1] == 8 * 1024**2
+        assert budget.reserved_bytes == budget.named_reservations["services-snapshot"]
+        assert budget.reserved_bytes > first_reserved
+        assert budget.reserved_bytes < budget.cfg["aggregate_available_bytes"]
+        assert first_reserved + budget.reserved_bytes > budget.cfg["aggregate_available_bytes"]
+    finally:
+        root.close()
+
+
+def test_service_snapshot_failure_restores_previous_budget_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    root_path = tmp_path / "export"
+    root_path.mkdir(mode=0o700)
+    root_path.chmod(0o700)
+    root = Dir.root(str(root_path))
+    records = _ServiceRecordStore()
+    replacement = _ServiceRecordStore()
+    chat_dir = None
+    destination = None
+    try:
+        chat_dir = root.child(CHAT, True)
+        destination = chat_dir.child("group", True)
+        budget = Budget(root, {
+            "storage_limit_bytes": 128 * 1024**2,
+            "min_free_bytes": 0,
+            "aggregate_available_bytes": 64 * 1024**2,
+        })
+        records[1] = {"event_id": 1, "type": "title_changed", "new_value": "old"}
+        _publish_services(
+            destination, {"source_id": f"telegram:{CHAT}:group", "scope_before": None},
+            records, None, True, budget,
+        )
+        previous_bytes = destination.read("services.jsonl", 1024**2)
+        previous_reservation = budget.reserved_bytes
+        replacement[1] = {
+            "event_id": 1, "type": "title_changed", "new_value": "new" * 1000,
+        }
+
+        def fail_manifest(*_args, **_kwargs):
+            raise OSError("synthetic manifest publication failure")
+
+        monkeypatch.setattr(destination, "atomic_private", fail_manifest)
+        with pytest.raises(OSError, match="synthetic manifest publication failure"):
+            _publish_services(
+                destination, {"source_id": f"telegram:{CHAT}:group", "scope_before": None},
+                replacement, None, True, budget,
+            )
+
+        assert destination.read("services.jsonl", 1024**2) == previous_bytes
+        assert budget.reserved_bytes == previous_reservation
+        assert budget.named_reservations["services-snapshot"] == previous_reservation
+        assert not [name for name in destination.names() if name.startswith(".tmp-services-")]
+    finally:
+        records.close()
+        replacement.close()
+        if destination is not None:
+            destination.close()
+        if chat_dir is not None:
+            chat_dir.close()
+        root.close()
+
+
+def test_broker_stage_checks_control_space_before_copying_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    # This case exercises the broker's preflight boundary only; keep the
+    # shared export fixture from loading data into the optional PG database.
+    monkeypatch.delenv("KIBER_ANALYST_INGEST_TEST_ENV", raising=False)
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    source = result["stage"]
+    inspected = inspect_export(source, root=result["imports_root"])
+    entry = {"hashes": {
+        "messages.jsonl": inspected.message_sha256,
+        "services.jsonl": inspected.service_sha256,
+        "manifest.json": inspected.manifest_sha256,
+    }}
+    app_root = result["imports_root"].parent
+    broker_stage_root = result["imports_root"] / ".broker"
+    existing_stages = set(broker_stage_root.iterdir())
+    broker_app = broker.Broker(app_root, {})
+    copies = []
+    original_copy = broker._copy_input
+    monkeypatch.setattr(
+        broker, "_copy_input",
+        lambda *args, **kwargs: (copies.append(args[1]), original_copy(*args, **kwargs))[1],
+    )
+    real_os = broker.os
+
+    class NoFreeSpace:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def fstatvfs(_fd):
+            return SimpleNamespace(f_bavail=0, f_frsize=1)
+
+    monkeypatch.setattr(broker, "os", NoFreeSpace())
+    monkeypatch.setattr(broker, "RESERVE", 0)
+    try:
+        with pytest.raises(broker.Refused, match="INSUFFICIENT_SPACE"):
+            broker_app.stage(
+                result["source_id"], entry, "c" * 64, result["chat"], "group",
+            )
+        assert copies == []
+        assert set(broker_stage_root.iterdir()) == existing_stages
+    finally:
+        broker_app.db.close()
 
 
 def test_publisher_refuses_messages_changed_between_validation_passes(
@@ -426,19 +606,31 @@ def test_publisher_fsyncs_chat_directory_after_final_rename(
             final_renamed = True
         return result_value
 
+    fail_final_parent_sync = True
+
     def record_fsync(fd):
+        nonlocal fail_final_parent_sync
         info = os.fstat(fd)
         if (final_renamed
                 and (info.st_dev, info.st_ino) == (parent_info.st_dev, parent_info.st_ino)):
             events.append("chat_directory_fsync_after_final")
+            if fail_final_parent_sync:
+                fail_final_parent_sync = False
+                raise OSError("simulated parent fsync failure")
         return original_fsync(fd)
 
     monkeypatch.setattr(telegram_publisher, "_rename_noreplace", record_rename)
     monkeypatch.setattr(telegram_publisher.os, "fsync", record_fsync)
+    with pytest.raises(OSError, match="simulated parent fsync failure"):
+        telegram_publisher.handle(
+            "copy", result["source_id"], config_path=str(result["publisher_config"]),
+        )
+    assert stage.is_dir() and previous_stage.is_dir()
     published = telegram_publisher.handle(
         "copy", result["source_id"], config_path=str(result["publisher_config"]),
     )
-    assert published["status"] == "ready"
+    assert published["status"] == "already_ready"
+    assert events.count("chat_directory_fsync_after_final") >= 2
     assert events.index("final_rename") < events.index("chat_directory_fsync_after_final")
     assert stage.is_dir() and previous_stage.is_dir()
 
@@ -474,6 +666,28 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
         }
 
     before = snapshot()
+    unmarked_write_temp = ".publisher-init-write-" + uuid.uuid4().hex + ".tmp"
+    (parent / unmarked_write_temp).write_bytes(b'{"partial":')
+    (parent / unmarked_write_temp).chmod(0o600)
+    parent_info = os.stat(parent)
+    original_fsync_for_temp = os.fsync
+    temp_recovery_syncs = []
+
+    def record_temp_recovery_sync(fd):
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode) and info.st_ino == parent_info.st_ino:
+            temp_recovery_syncs.append(not (parent / unmarked_write_temp).exists())
+        return original_fsync_for_temp(fd)
+
+    monkeypatch.setattr(telegram_publisher.os, "fsync", record_temp_recovery_sync)
+    recovered_temp = telegram_publisher.handle(
+        "copy", result["source_id"], config_path=str(result["publisher_config"]),
+    )
+    assert recovered_temp["status"] == "already_ready"
+    assert not (parent / unmarked_write_temp).exists()
+    assert any(temp_recovery_syncs)
+    monkeypatch.setattr(telegram_publisher.os, "fsync", original_fsync_for_temp)
+
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         init_name = ".publisher-init-" + uuid.uuid4().hex
@@ -537,8 +751,6 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
         if stat.S_ISDIR(info.st_mode) and info.st_ino == parent_info.st_ino:
             synced_parent_after_removal.append(not temp_dir.exists())
         return real_fsync(fd)
-
-    import stat
 
     monkeypatch.setattr(telegram_publisher.os, "fsync", record_directory_fsync)
     recovered = telegram_publisher.handle(

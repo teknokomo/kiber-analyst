@@ -23,7 +23,17 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
         data = json.loads(checkpoint)
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise LoadError("Media resume checkpoint is invalid JSON") from None
-    if not isinstance(data, dict) or data.get("inputs") != hashes:
+    if not isinstance(data, dict):
+        raise LoadError("Media resume checkpoint does not match the export")
+    checkpoint_version = data.get("version", 1)
+    expected_inputs = hashes
+    if checkpoint_version == 1:
+        # Legacy checkpoints predate services_manifest.json in the input set.
+        expected_inputs = {key: value for key, value in hashes.items()
+                           if key != "services_manifest.json"}
+    elif checkpoint_version != 2:
+        raise LoadError("Media resume checkpoint version is unsupported")
+    if data.get("inputs") != expected_inputs:
         raise LoadError("Media resume checkpoint does not match the export")
     requested_limit = data.get("requested_max_file_bytes", DEFAULT_TELEGRAM_MEDIA_BYTES)
     try:
@@ -74,16 +84,21 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
         filename = receipt.get("path")
         size, digest = receipt.get("size"), receipt.get("sha256")
         limit = receipt.get("max_file_bytes", requested_limit)
+        # A receipt from a later/higher-limit pass may be reused only within
+        # the limit recorded for this checkpoint.  The actual file size must
+        # still fit both limits; expose the effective (lower) limit downstream.
+        if type(limit) is int and type(requested_limit) is int:
+            limit = min(limit, requested_limit)
         receipt_type = _media_type(receipt, allow_missing=True)
         media_type = receipt_type or source_type
         if (
             status != "downloaded"
             or not isinstance(filename, str)
-            or not re.fullmatch(rf"media-resume/{re.escape(mid)}/[^/\\\x00]+", filename)
+            or not re.fullmatch(rf"(?:media|media-resume)/{re.escape(mid)}/[^/\\\x00]+", filename)
             or filename.rsplit("/", 1)[1] in {".", ".."}
             or type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES
             or type(limit) is not int or not 0 < limit <= MAX_TELEGRAM_MEDIA_BYTES
-            or limit > requested_limit or size > limit
+            or size > limit
             or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
             or (media_type is not None and (not isinstance(media_type, str)
                 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", media_type)))

@@ -43,6 +43,7 @@ CONTROLS = ('messages.jsonl', 'services.jsonl', 'manifest.json')
 # Bound control files by the product storage ceiling, not the former 32 MiB
 # in-memory IPC limit. JSONL is streamed below this bound.
 CONTROL_FILE_MAX_BYTES = MAX_TELEGRAM_EXPORT_BYTES
+ASR_PLAN_MAX_BYTES = 8 * 1024**2
 SERVICES_MANIFEST_MAX_BYTES = 1024**2
 TERMINAL = {'done', 'failed', 'timed_out', 'cancelled'}
 ACTIVE = {'queued', 'running', 'waiting_retry', 'waiting_quota', 'submitting'}
@@ -973,8 +974,9 @@ class Broker:
             stack.callback(os.close, fd)
             private(os.fstat(fd), directory=True)
             source = stack.enter_context(descend(fd, ['imports', chat, topic]))
+            control_sizes = {}
             for name in CONTROLS:
-                _size, digest = _hash_input(source, name, CONTROL_FILE_MAX_BYTES)
+                control_sizes[name], digest = _hash_input(source, name, CONTROL_FILE_MAX_BYTES)
                 if digest != entry['hashes'][name]:
                     raise Refused('HASH_MISMATCH')
             source_path = self.root / 'imports' / chat / topic
@@ -991,6 +993,11 @@ class Broker:
                     or source_export.service_sha256 != entry['hashes']['services.jsonl']
                     or source_export.manifest_sha256 != entry['hashes']['manifest.json']):
                 raise Refused('HASH_MISMATCH')
+            if (source_export.messages_size > CONTROL_FILE_MAX_BYTES
+                    or source_export.services_size > CONTROL_FILE_MAX_BYTES
+                    or source_export.manifest_size > CONTROL_FILE_MAX_BYTES
+                    or source_export.services_manifest_size > SERVICES_MANIFEST_MAX_BYTES):
+                raise Refused('TELEGRAM_EXPORT_TOO_LARGE')
             manifest_bytes = read_input(source, 'manifest.json', 4 * 1024**2)
             services_manifest_bytes = read_input(
                 source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES,
@@ -1002,6 +1009,12 @@ class Broker:
                 raise Refused('DATA_MISMATCH')
             if json.loads(manifest_bytes).get('source_id') != source_id:
                 raise Refused('DATA_MISMATCH')
+            services_manifest_sha = hashlib.sha256(services_manifest_bytes).hexdigest()
+            controls_required = sum(control_sizes.values()) + len(services_manifest_bytes)
+            filesystem = os.fstatvfs(fd)
+            free_before_controls = filesystem.f_bavail * filesystem.f_frsize
+            if free_before_controls < controls_required + RESERVE:
+                raise Refused('INSUFFICIENT_SPACE')
             manifest_limit = _manifest_media_limit(manifest_bytes)
             base = stack.enter_context(descend(fd, ['imports', '.broker']))
 
@@ -1019,8 +1032,11 @@ class Broker:
                     checkpoint = read_input(resumed, 'status.json', 4 * 1024**2)
                     if hashlib.sha256(checkpoint).hexdigest() != revision:
                         raise Refused('RESUME_REVISION_CONFLICT')
-                    records = resumed_photos(checkpoint, entry['hashes'],
-                                            rows_at(final))
+                    resume_hashes = {
+                        **entry['hashes'],
+                        'services_manifest.json': services_manifest_sha,
+                    }
+                    records = resumed_photos(checkpoint, resume_hashes, rows_at(final))
                     publish_resume(resumed, final, checkpoint, records)
 
             destination = self.root / 'imports' / '.broker' / staging_fingerprint / chat / topic
@@ -1071,9 +1087,9 @@ class Broker:
                         raise Refused('HASH_MISMATCH')
                     media_bytes = sum(size for _rel, size, _digest in media_at(final))
                     free = os.fstatvfs(base)
-                    # The control files and service manifest have already
-                    # been copied into `final`; fstatvfs sees those bytes.
-                    # Only media remains to be written at this point.
+                    # Recheck after controls were copied and before media. The
+                    # earlier preflight ensures we never fill staging with
+                    # control files before discovering the shortage.
                     required = media_bytes
                     if free.f_bavail * free.f_frsize < required + RESERVE:
                         raise Refused('INSUFFICIENT_SPACE')
@@ -1105,7 +1121,7 @@ class Broker:
             source_fd = stack.enter_context(descend(root_fd, list(relative)))
             try:
                 workspace_fd = stack.enter_context(descend(source_fd, [workspace_name]))
-                plan_data = read_input(workspace_fd, 'asr-plan.json', 8 * 1024**2)
+                plan_data = read_input(workspace_fd, 'asr-plan.json', ASR_PLAN_MAX_BYTES)
                 plan = _validated_asr_plan(json.loads(plan_data), source_id, input_fingerprint)
                 with descend(workspace_fd, ['normalized']) as normalized_fd:
                     _normalized_size, normalized_sha = _hash_input(
@@ -1247,10 +1263,10 @@ class Broker:
                         'files': eligible,
                     }
                     plan = _validated_asr_plan(plan, source_id, input_fingerprint)
-                    write_file(
-                        temp_fd, 'asr-plan.json',
-                        (json.dumps(plan, sort_keys=True, separators=(',', ':')) + '\n').encode(),
-                    )
+                    plan_data = (json.dumps(plan, sort_keys=True, separators=(',', ':')) + '\n').encode()
+                    if len(plan_data) > ASR_PLAN_MAX_BYTES:
+                        raise Refused('ASR_PLAN_TOO_LARGE')
+                    write_file(temp_fd, 'asr-plan.json', plan_data)
                     os.fsync(temp_fd)
                 os.rename(temporary, workspace_name, src_dir_fd=source_fd, dst_dir_fd=source_fd)
                 os.fsync(source_fd)
