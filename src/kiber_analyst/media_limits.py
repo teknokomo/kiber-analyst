@@ -5,6 +5,7 @@ import re
 
 DEFAULT_TELEGRAM_MEDIA_BYTES = 100 * 1024**2
 MAX_TELEGRAM_MEDIA_BYTES = 4_000_000_000  # 4000 decimal MB
+MAX_TELEGRAM_EXPORT_BYTES = 1024**4  # 1 TiB; also bounded by each deployment's storage quota.
 MIB = 1024**2
 
 

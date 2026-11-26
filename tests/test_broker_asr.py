@@ -22,7 +22,9 @@ def private_write(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 
 @pytest.fixture
-def asr_setup(tmp_path):
+def asr_setup(tmp_path, monkeypatch):
+    # Synthetic ASR tests exercise staging behavior, not the production disk reserve.
+    monkeypatch.setattr(broker, 'RESERVE', 0)
     src = tmp_path / 'imports' / '-1009000' / '1'
     payloads = {message_id: f'voice-{message_id}'.encode() for message_id in range(1, 4)}
     payloads[4] = b'audio-4'

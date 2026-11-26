@@ -6,13 +6,22 @@ import json
 import os
 import re
 import resource
+import selectors
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
+
+from kiber_analyst.media_limits import MAX_TELEGRAM_EXPORT_BYTES
+from kiber_analyst.telegram_source import (
+    format_telegram_source,
+    telegram_scope_directory,
+)
 
 DEFAULT_FILE_BYTES = 100 * 1024**2
 MAX_FILE_BYTES = 4_000_000_000  # 4000 decimal MB
@@ -20,6 +29,11 @@ MAX_FILE = DEFAULT_FILE_BYTES
 PIPELINE_MEDIA_COPIES = 3  # Export, published package, and Kiber worker staging.
 GIB = 1024**3
 DEFAULT_RESUME_BATCH = 25
+MAX_CLI_STDOUT_BYTES = 32 * 1024**2
+MAX_CLI_STDERR_BYTES = 256 * 1024
+MAX_JSONL_LINE_BYTES = 4 * 1024**2
+MAX_EXPORT_BYTES = MAX_TELEGRAM_EXPORT_BYTES
+MAX_SKIPPED_MEDIA_SAMPLE = 100
 
 
 class ExportError(ValueError):
@@ -67,14 +81,14 @@ def parse(args):
         raise ExportError('Use export CHAT TOPIC [MEDIA] [LIMIT] [BEFORE] [MAX_FILE_SIZE], export-resume CHAT TOPIC [MAX_FILE_SIZE] [BATCH], export-services CHAT TOPIC [LIMIT] [BEFORE], export-status CHAT TOPIC, or export-transfer[ -status] CHAT TOPIC')
     cmd, chat, topic, *rest = args
     chat_arg(chat)
-    topic = numeric(topic)
+    topic = None if topic.upper() == 'GROUP' else numeric(topic)
     if cmd in {'export-transfer', 'export-transfer-status'}:
         if rest or not re.fullmatch(r'-?[1-9][0-9]{0,18}', chat):
-            raise ExportError('Transfer requires a numeric chat ID and topic ID')
+            raise ExportError('Transfer requires a numeric chat ID and topic or GROUP')
         return cmd, chat, topic, False, 0, None, MAX_FILE
     if cmd == 'export-resume':
         if not re.fullmatch(r'-?[1-9][0-9]{0,18}', chat) or len(rest) > 2:
-            raise ExportError('Use export-resume NUMERIC_CHAT TOPIC [MAX_FILE_SIZE] [BATCH]')
+            raise ExportError('Use export-resume NUMERIC_CHAT TOPIC|GROUP [MAX_FILE_SIZE] [BATCH]')
         max_file_bytes = _file_limit_bytes(rest[0] if rest else None)
         batch = numeric(rest[1], 100) if len(rest) > 1 else DEFAULT_RESUME_BATCH
         return cmd, chat, topic, False, batch, None, max_file_bytes
@@ -85,7 +99,7 @@ def parse(args):
     if cmd == 'export-services':
         if len(rest) > 2:
             raise ExportError('Unexpected export-services argument')
-        limit = numeric(rest[0], 100) if rest else 100
+        limit = numeric(rest[0], maximum=1000) if rest else 100
         before = numeric(rest[1]) if len(rest) == 2 else None
         return cmd, chat, topic, False, limit, before, MAX_FILE
     media = bool(rest and rest[0] == 'MEDIA')
@@ -98,7 +112,7 @@ def parse(args):
     if len(rest) == 1 and _is_explicit_size(rest[0]):
         limit, max_file_value = 100, rest[0]
     else:
-        limit = numeric(rest[0], 100) if rest else 100
+        limit = numeric(rest[0], maximum=1000) if rest else 100
         tail = rest[1:]
         if tail and _is_explicit_size(tail[0]):
             if len(tail) != 1:
@@ -247,6 +261,51 @@ class Dir:
             except FileNotFoundError:
                 pass
 
+    def private_stream_temp(self, chunks):
+        """Write a private streamed candidate and return its name, size, and SHA-256."""
+        temp = '.tmp-services-' + uuid.uuid4().hex
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=self.fd)
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, 'wb') as stream:
+                fd = -1
+                for chunk in chunks:
+                    if not isinstance(chunk, bytes):
+                        raise ExportError('Invalid streamed output chunk')
+                    stream.write(chunk)
+                    digest.update(chunk)
+                    total += len(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.fsync(self.fd)
+            return temp, total, digest.hexdigest()
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temp, dir_fd=self.fd)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def publish_private_temp(self, temp, name):
+        self.filename(name)
+        if not re.fullmatch(r'\.tmp-services-[0-9a-f]{32}', temp):
+            raise ExportError('Unsafe streamed output temporary')
+        info = os.stat(temp, dir_fd=self.fd, follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+            raise ExportError('Unsafe streamed output temporary')
+        if name in self.names():
+            existing = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+                raise ExportError('Unsafe service output')
+        os.rename(temp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        os.fsync(self.fd)
+
     def write_json(self, name, obj):
         self.atomic(name, (json.dumps(obj, ensure_ascii=False, sort_keys=True) + '\n').encode())
 
@@ -337,8 +396,18 @@ class Budget:
         self.reserved_bytes += amount * PIPELINE_MEDIA_COPIES
 
     def check(self, extra=0):
-        if type(extra) is not int or extra < 0 or extra > self.available_bytes():
+        if type(extra) is not int or extra < 0:
             raise ExportError('Storage budget exhausted')
+        fs = os.fstatvfs(self.root.fd)
+        storage_margin = self.cfg['storage_limit_bytes'] - tree_size(self.root)
+        disk_margin = fs.f_bavail * fs.f_frsize - self.cfg['min_free_bytes']
+        if storage_margin < extra or disk_margin < extra:
+            raise ExportError('Storage budget exhausted')
+        aggregate = self.cfg.get('aggregate_available_bytes')
+        if type(aggregate) is int:
+            pipeline_margin = aggregate - self.reserved_bytes
+            if pipeline_margin < extra * PIPELINE_MEDIA_COPIES:
+                raise ExportError('Storage budget exhausted')
 
 
 class MediaLimitExceeded(ExportError):
@@ -364,27 +433,93 @@ class Client:
     def call(self, argv, output=None, file_limit=MAX_FILE, timeout=300):
         def limits():
             resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+        process = None
+
+        def stop_child():
+            if process is None:
+                return
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+            # The direct child may already have exited while a descendant still
+            # holds stdout/stderr open. Kill the process group even in that case.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if process.poll() is None:
+                process.wait()
+
         try:
-            result = subprocess.run([self.cli, *argv], capture_output=True,
-                                    env=self.env, cwd=self.home, timeout=timeout, check=False,
-                                    pass_fds=(output.fd,) if output else (), preexec_fn=limits)
+            process = subprocess.Popen(
+                [self.cli, *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=self.env, cwd=self.home, close_fds=True,
+                pass_fds=(output.fd,) if output else (), preexec_fn=limits,
+                start_new_session=True,
+            )
+            buffers = {process.stdout: bytearray(), process.stderr: bytearray()}
+            caps = {process.stdout: MAX_CLI_STDOUT_BYTES,
+                    process.stderr: MAX_CLI_STDERR_BYTES}
+            selector = selectors.DefaultSelector()
+            try:
+                for pipe in buffers:
+                    os.set_blocking(pipe.fileno(), False)
+                    selector.register(pipe, selectors.EVENT_READ)
+                deadline = time.monotonic() + timeout
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        stop_child()
+                        raise ExportError('Telegram CLI timed out')
+                    for key, _ in selector.select(min(remaining, 0.25)):
+                        pipe = key.fileobj
+                        chunk = os.read(pipe.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(pipe)
+                            pipe.close()
+                            continue
+                        buffer = buffers[pipe]
+                        if len(buffer) + len(chunk) > caps[pipe]:
+                            stop_child()
+                            raise ExportError('Telegram CLI output limit exceeded')
+                        buffer.extend(chunk)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    stop_child()
+                    raise ExportError('Telegram CLI timed out')
+                return_code = process.wait(timeout=remaining)
+            finally:
+                selector.close()
+                for pipe in buffers:
+                    if not pipe.closed:
+                        pipe.close()
+            stdout = bytes(buffers[process.stdout])
+            stderr = bytes(buffers[process.stderr])
+        except ExportError:
+            stop_child()
+            raise
         except (OSError, subprocess.SubprocessError):
+            stop_child()
             raise ExportError('Telegram CLI unavailable or timed out') from None
-        if result.returncode:
+        if return_code:
             if output is not None and (
-                result.returncode == -signal.SIGXFSZ
-                or re.search(rb"\bEFBIG\b|file too large", result.stderr[:16384], re.IGNORECASE)
+                return_code == -signal.SIGXFSZ
+                or re.search(rb"\bEFBIG\b|file too large", stderr[:16384], re.IGNORECASE)
             ):
                 raise MediaLimitExceeded('Media exceeds the file size limit')
-            error_code = _safe_cli_error_code(result.stdout, result.stderr, result.returncode)
+            error_code = _safe_cli_error_code(stdout, stderr, return_code)
             raise ExportError(
-                f'Telegram CLI failed (exit {result.returncode}); raw diagnostics withheld',
+                f'Telegram CLI failed (exit {return_code}); raw diagnostics withheld',
                 error_code=error_code,
             )
-        if len(result.stdout) > 32*1024**2:
-            raise ExportError('Telegram page too large')
         try:
-            return json.loads(result.stdout)
+            return json.loads(stdout)
         except ValueError:
             raise ExportError('Invalid Telegram CLI JSON') from None
 
@@ -392,6 +527,8 @@ class Client:
         return self.call(['info', chat, '--json'])
 
     def title(self, chat, topic):
+        if topic is None:
+            return None
         data = self.call(['messages', 'get-forum-topics-by-id', '--peer', chat, '--topics', str(topic)])
         for item in data['topics']:
             if item['id'] == topic:
@@ -400,7 +537,7 @@ class Client:
 
     def page(self, chat, topic, limit, before):
         args = ['read', chat, '--limit', str(limit), '--full', '--json']
-        if topic != 1:
+        if topic not in (None, 1):
             args += ['--topic', str(topic)]
         if before:
             args += ['--before', str(before)]
@@ -413,8 +550,8 @@ class Client:
             # The pinned read command can stop on service-only raw batches.
             params = {'peer': {'_chat': chat}, 'offsetId': before or 0, 'offsetDate': 0,
                       'addOffset': 0, 'limit': limit, 'maxId': 0, 'minId': 0, 'hash': '0'}
-            method = 'messages.GetHistory' if topic == 1 else 'messages.GetReplies'
-            if topic != 1:
+            method = 'messages.GetHistory' if topic in (None, 1) else 'messages.GetReplies'
+            if topic not in (None, 1):
                 params['msgId'] = topic
             raw = self.call(['api', method, '--params', json.dumps(params)])['messages']
             if not raw:
@@ -426,14 +563,14 @@ class Client:
                 raise ExportError('Raw pagination made no progress')
             before = cursor
             args = ['read', chat, '--limit', str(limit), '--full', '--json', '--before', str(cursor)]
-            if topic != 1:
+            if topic not in (None, 1):
                 args += ['--topic', str(topic)]
 
     def service_page(self, chat, topic, limit, before):
         params = {'peer': {'_chat': chat}, 'offsetId': before or 0, 'offsetDate': 0,
                   'addOffset': 0, 'limit': limit, 'maxId': 0, 'minId': 0, 'hash': '0'}
-        method = 'messages.GetHistory' if topic == 1 else 'messages.GetReplies'
-        if topic != 1:
+        method = 'messages.GetHistory' if topic in (None, 1) else 'messages.GetReplies'
+        if topic not in (None, 1):
             params['msgId'] = topic
         result = self.call(['api', method, '--params', json.dumps(params)])
         messages = result.get('messages')
@@ -463,6 +600,8 @@ class Client:
 
 
 def belongs(message, topic):
+    if topic is None:
+        return True
     reply = (message.get('full') or {}).get('replyTo') or {}
     top = reply.get('topMsgId')
     if top is not None:
@@ -479,7 +618,20 @@ def record(message, topic):
     for name in ['date', 'text', 'sender']:
         if not isinstance(message.get(name), str):
             raise ExportError('Missing or invalid message field: '+name)
-    return {'message_id': message['id'], 'topic_id': topic, 'date': message['date'],
+    actual_topic = topic
+    if topic is None:
+        reply = (message.get('full') or {}).get('replyTo') or {}
+        top = reply.get('topMsgId') if isinstance(reply, dict) else None
+        full = message.get('full')
+        if top is None and isinstance(full, dict):
+            top = full.get('topicId', full.get('topic_id'))
+        if top is None:
+            top = message.get('topicId', message.get('topic_id'))
+        if type(top) is int and top > 0:
+            actual_topic = top
+        elif isinstance(reply, dict) and (reply.get('forumTopic') or reply.get('replyToMsgId') == 1):
+            actual_topic = 1
+    return {'message_id': message['id'], 'topic_id': actual_topic, 'date': message['date'],
             'sender_id': message.get('senderId'), 'sender_name': message['sender'],
             'text': message['text'], 'reply_to_message_id': message.get('replyToMsgId'),
             'media': message.get('media')}
@@ -674,7 +826,15 @@ def service_event(message, topic):
         limits.add('unknown_service_action_seen')
     if (target_id is not None or isinstance(new_value, dict) and new_value.get('target_ids')) and target_name is None:
         limits.add('target_name_unavailable')
-    return ({'event_id': event_id, 'topic_id': topic, 'date': date, 'type': action_type,
+    actual_topic = topic
+    if topic is None:
+        reply = _first(message, 'replyTo', 'reply_to') or {}
+        top = _first(reply, 'topMsgId', 'top_msg_id') if isinstance(reply, dict) else None
+        if type(top) is int and top > 0:
+            actual_topic = top
+        elif event_id == 1 and action_name == 'message_action_topic_create':
+            actual_topic = 1
+    return ({'event_id': event_id, 'topic_id': actual_topic, 'date': date, 'type': action_type,
              'actor_id': actor_id, 'actor_name': actor_name, 'target_id': target_id,
              'target_name': target_name, 'message_id': message_id, 'old_value': old_value,
              'new_value': new_value, 'raw_action': action_name}, limits)
@@ -748,6 +908,8 @@ def _unsupported_service_event(message_id, topic, error_code):
 
 
 def service_belongs(message, topic):
+    if topic is None:
+        return True
     if message.get('id') == topic and _action_name(message.get('action')) == 'message_action_topic_create':
         return True
     reply = _first(message, 'replyTo', 'reply_to') or {}
@@ -764,30 +926,110 @@ def service_belongs(message, topic):
     return True
 
 
-def _service_records_bytes(records):
-    return b''.join((json.dumps(item, ensure_ascii=False, sort_keys=True) + '\n').encode() for item in records)
+class _ServiceRecordStore:
+    """Disk-backed event index; large service histories do not accumulate in RAM."""
+
+    def __init__(self):
+        self._temporary = tempfile.TemporaryDirectory(prefix='kiber-telegram-services-')
+        os.chmod(self._temporary.name, 0o700)
+        self._path = Path(self._temporary.name) / 'events.sqlite3'
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        os.chmod(self._path, 0o600)
+        self._db = sqlite3.connect(self._path)
+        self._db.execute('PRAGMA journal_mode=OFF')
+        self._db.execute('PRAGMA synchronous=OFF')
+        self._db.execute(
+            'CREATE TABLE events(event_id INTEGER PRIMARY KEY, payload TEXT NOT NULL) WITHOUT ROWID'
+        )
+
+    def __len__(self):
+        return self._db.execute('SELECT count(*) FROM events').fetchone()[0]
+
+    def get(self, event_id):
+        row = self._db.execute(
+            'SELECT payload FROM events WHERE event_id=?', (event_id,),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def __setitem__(self, event_id, record):
+        payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        self._db.execute(
+            'INSERT INTO events(event_id,payload) VALUES(?,?) '
+            'ON CONFLICT(event_id) DO UPDATE SET payload=excluded.payload',
+            (event_id, payload),
+        )
+
+    def setdefault(self, event_id, record):
+        existing = self.get(event_id)
+        if existing is not None:
+            return existing
+        self[event_id] = record
+        return record
+
+    def iter_records(self):
+        cursor = self._db.execute('SELECT payload FROM events ORDER BY event_id')
+        for (payload,) in cursor:
+            yield json.loads(payload)
+
+    def first_last(self):
+        return self._db.execute(
+            'SELECT min(event_id), max(event_id) FROM events'
+        ).fetchone()
+
+    def close(self):
+        if self._db is not None:
+            self._db.close()
+            self._db = None
+            self._temporary.cleanup()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _load_service_records(destination):
+    records = _ServiceRecordStore()
     if 'services.jsonl' not in destination.names():
-        return {}, hashlib.sha256(b'').hexdigest()
-    data = destination.read('services.jsonl', MAX_FILE)
-    info = os.stat('services.jsonl', dir_fd=destination.fd, follow_symlinks=False)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
+        return records, hashlib.sha256(b'').hexdigest()
+    fd = os.open('services.jsonl', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 dir_fd=destination.fd)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > MAX_EXPORT_BYTES):
+        os.close(fd)
         raise ExportError('Unsafe services.jsonl permissions or file type')
-    records = {}
-    for line in data.splitlines():
-        try:
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise TypeError
-            event_id = record['event_id']
-        except (ValueError, KeyError, TypeError):
-            raise ExportError('Invalid existing services.jsonl') from None
-        if type(event_id) is not int or event_id <= 0 or event_id in records:
-            raise ExportError('Duplicate or invalid service event ID')
-        records[event_id] = record
-    return records, hashlib.sha256(data).hexdigest()
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(fd, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            while line := stream.readline(MAX_JSONL_LINE_BYTES + 1):
+                total += len(line)
+                if len(line) > MAX_JSONL_LINE_BYTES or total > before.st_size:
+                    raise ExportError('Existing services.jsonl contains an oversized line')
+                try:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise TypeError
+                    event_id = record['event_id']
+                except (ValueError, KeyError, TypeError, UnicodeError):
+                    raise ExportError('Invalid existing services.jsonl') from None
+                if type(event_id) is not int or event_id <= 0 or records.get(event_id) is not None:
+                    raise ExportError('Duplicate or invalid service event ID')
+                records[event_id] = record
+                digest.update(line)
+            after = os.fstat(stream.fileno())
+            if (total != before.st_size
+                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                        before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size,
+                                                after.st_mtime_ns, after.st_ctime_ns)):
+                raise ExportError('services.jsonl changed while being read')
+    except BaseException:
+        raise
+    return records, digest.hexdigest()
 
 
 def _read_services_manifest(destination):
@@ -831,13 +1073,15 @@ def _service_limitations(record_limits=()):
 
 def _publish_services(destination, meta, records, cursor, exhausted, budget, record_limits=(), error=None,
                       unsupported_ranges=()):
-    ordered = [records[key] for key in sorted(records)]
-    data = _service_records_bytes(ordered)
-    digest = hashlib.sha256(data).hexdigest()
-    ids = list(records)
-    manifest = {**meta, 'exported_at': now(), 'event_count': len(ordered),
-                'first_event_id': min(ids) if ids else None,
-                'last_event_id': max(ids) if ids else None,
+    count = len(records)
+    first_id, last_id = records.first_last()
+    temp, data_size, digest = destination.private_stream_temp(
+        (json.dumps(item, ensure_ascii=False, sort_keys=True) + '\n').encode()
+        for item in records.iter_records()
+    )
+    manifest = {**meta, 'exported_at': now(), 'event_count': count,
+                'first_event_id': first_id,
+                'last_event_id': last_id,
                 'next_before': cursor, 'services_sha256': digest,
                 'complete': bool(exhausted and meta['scope_before'] is None and error is None),
                 'range_complete': bool(exhausted and error is None),
@@ -846,17 +1090,33 @@ def _publish_services(destination, meta, records, cursor, exhausted, budget, rec
                 'limitations': _service_limitations(record_limits),
                 'errors': [error] if error else [],
                 'unsupported_ranges': list(unsupported_ranges)}
-    budget.check(len(data) + len(json.dumps(manifest).encode()) + 65536)
-    previous = _read_services_manifest(destination)
-    if previous and 'pending_publish' in previous:
-        raise ExportError('Pending service publication requires recovery')
-    pending = {'previous': previous, 'next': manifest}
-    destination.atomic_private(
-        'services_manifest.json',
-        (json.dumps({**manifest, 'pending_publish': pending}, ensure_ascii=False, sort_keys=True) + '\n').encode(),
-    )
-    destination.atomic_private('services.jsonl', data)
-    destination.atomic_private('services_manifest.json', (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + '\n').encode())
+    try:
+        budget.check(data_size + len(json.dumps(manifest).encode()) + 65536)
+        previous = _read_services_manifest(destination)
+        if previous and 'pending_publish' in previous:
+            raise ExportError('Pending service publication requires recovery')
+        pending = {'previous': previous, 'next': manifest}
+    except BaseException:
+        try:
+            os.unlink(temp, dir_fd=destination.fd)
+        except FileNotFoundError:
+            pass
+        raise
+    try:
+        destination.atomic_private(
+            'services_manifest.json',
+            (json.dumps({**manifest, 'pending_publish': pending}, ensure_ascii=False, sort_keys=True) + '\n').encode(),
+        )
+        destination.publish_private_temp(temp, 'services.jsonl')
+        destination.atomic_private(
+            'services_manifest.json',
+            (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + '\n').encode(),
+        )
+    finally:
+        try:
+            os.unlink(temp, dir_fd=destination.fd)
+        except FileNotFoundError:
+            pass
     return manifest, digest
 
 
@@ -905,11 +1165,14 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
     client = client or Client(cfg)
     info = client.info(supplied_chat)
     canonical = str(info.get('id'))
-    if not re.fullmatch(r'-?[1-9][0-9]{0,18}', canonical) or not info.get('forum'):
-        raise ExportError('Service export requires a forum supergroup')
+    if not re.fullmatch(r'-?[1-9][0-9]{0,18}', canonical):
+        raise ExportError('Service export requires a numeric group ID')
     chat_dir = root.child(canonical)
     try:
-        destination = chat_dir.child(str(topic))
+        scope_dir = telegram_scope_directory(topic)
+        source_id = format_telegram_source(canonical, topic)
+        destination = chat_dir.child(scope_dir)
+        records = None
         try:
             if stat.S_IMODE(os.fstat(destination.fd).st_mode) != 0o700:
                 raise ExportError('Topic directory must have mode 0700')
@@ -917,10 +1180,11 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
             ordinary = destination.json('manifest.json')
             if not isinstance(ordinary, dict):
                 raise ExportError('Invalid topic export manifest')
-            expected_source = f'telegram:{canonical}:topic:{topic}'
+            expected_source = source_id
             if (ordinary.get('export_version') != 1 or ordinary.get('source_id') != expected_source
-                    or str(ordinary.get('chat_id')) != canonical or ordinary.get('topic_id') != topic):
-                raise ExportError('Topic directory does not match its export manifest')
+                    or str(ordinary.get('chat_id')) != canonical or ordinary.get('topic_id') != topic
+                    or ordinary.get('scope') != ('chat' if topic is None else 'topic')):
+                raise ExportError('Group/topic directory does not match its export manifest')
             manifest = _read_services_manifest(destination)
             records, digest = _load_service_records(destination)
             manifest = _recover_service_publication(destination, manifest, records, digest)
@@ -929,8 +1193,8 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
             if manifest:
                 if manifest.get('services_sha256') != digest or manifest.get('event_count') != len(records):
                     raise ExportError('Service output integrity mismatch')
-                if manifest.get('source_id') != f'telegram:{canonical}:topic:{topic}':
-                    raise ExportError('Existing service export belongs to another topic')
+                if manifest.get('source_id') != source_id:
+                    raise ExportError('Existing service export belongs to another group/topic scope')
                 stored_before = manifest.get('scope_before')
                 if before is not None and before != stored_before:
                     raise ExportError('Existing service export scope differs; no data overwritten')
@@ -943,12 +1207,14 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
                     raise ExportError('Existing service data has no manifest')
                 cursor = before
                 scope_before = before
-                meta = {'source_id': f'telegram:{canonical}:topic:{topic}', 'chat_id': int(canonical),
-                        'topic_id': topic, 'scope_before': scope_before, 'started_at': now()}
+                meta = {'source_id': source_id, 'chat_id': int(canonical),
+                        'topic_id': topic, 'scope': 'chat' if topic is None else 'topic',
+                        'scope_before': scope_before, 'started_at': now()}
                 manifest, digest = _publish_services(destination, meta, records, cursor, False,
                                                      Budget(root, cfg), error=None)
-            meta = {'source_id': f'telegram:{canonical}:topic:{topic}', 'chat_id': int(canonical),
-                    'topic_id': topic, 'scope_before': scope_before,
+            meta = {'source_id': source_id, 'chat_id': int(canonical),
+                    'topic_id': topic, 'scope': 'chat' if topic is None else 'topic',
+                    'scope_before': scope_before,
                     'started_at': manifest.get('started_at') if manifest else now()}
             budget = Budget(root, cfg)
             all_limits = set()
@@ -977,7 +1243,7 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
                             unsupported_ranges.append(diagnostic)
                             records.setdefault(
                                 cursor,
-                                _unsupported_service_event(cursor, topic, diagnostic["error_code"]),
+        _unsupported_service_event(cursor, topic, diagnostic["error_code"]),
                             )
                             all_limits.add("service_event_unavailable_at_message_id")
                             if cursor <= 1:
@@ -987,7 +1253,9 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
                                     all_limits, unsupported_ranges=unsupported_ranges,
                                 )
                                 return result
-                            cursor -= 1
+                            # The next request uses exclusive before/offsetId.
+                            # Keep this ID as the boundary so the preceding
+                            # service event is not skipped.
                             _publish_services(
                                 destination, meta, records, cursor, False, budget,
                                 all_limits, unsupported_ranges=unsupported_ranges,
@@ -1038,6 +1306,8 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
                     raise exc from None
                 raise
         finally:
+            if records is not None:
+                records.close()
             destination.close()
     finally:
         chat_dir.close()
@@ -1155,27 +1425,39 @@ def attachment(client, chat, item, media_dir, budget, raw=None, file_limit=None)
             receipt = _media_receipt(saved, size, file_limit)
         finally:
             saved.close()
+        effective_limit = file_limit
     else:
         requested_limit = file_limit
-        has_live_budget = budget is not None and hasattr(budget, 'available_bytes')
-        available = budget.available_bytes() if has_live_budget else file_limit
-        overhead = 65536 if has_live_budget else 0
-        effective_limit = min(file_limit, max(0, available - overhead))
-        if effective_limit <= 0 or (size is not None and size > effective_limit):
-            return {**metadata, 'export_status': 'skipped',
-                    'reason': 'storage_budget_exhausted',
-                    'requested_max_file_bytes': requested_limit,
-                    'max_file_bytes': effective_limit}
-        if budget is not None:
-            budget.check(effective_limit + 65536)
         stage_name = '.part-'+mid
-        stage = media_dir.child(stage_name, True)
+        stage = None
         promoted = False
+        complete_stage = False
         try:
-            if 'receipt.json' in stage.names():
+            if stage_name in media_dir.names():
+                stage = media_dir.child(stage_name)
+            if stage is not None and 'receipt.json' in stage.names():
                 receipt = _media_receipt(stage, size, file_limit)
+                complete_stage = True
+                effective_limit = file_limit
             else:
-                _clear_media_stage(stage)
+                if stage is not None:
+                    _clear_media_stage(stage)
+                    stage.close()
+                    stage = None
+                    os.rmdir(stage_name, dir_fd=media_dir.fd)
+                    os.fsync(media_dir.fd)
+                has_live_budget = budget is not None and hasattr(budget, 'available_bytes')
+                available = budget.available_bytes() if has_live_budget else file_limit
+                overhead = 65536 if has_live_budget else 0
+                effective_limit = min(file_limit, max(0, available - overhead))
+                if effective_limit <= 0 or (size is not None and size > effective_limit):
+                    return {**metadata, 'export_status': 'skipped',
+                            'reason': 'storage_budget_exhausted',
+                            'requested_max_file_bytes': requested_limit,
+                            'max_file_bytes': effective_limit}
+                if budget is not None:
+                    budget.check(effective_limit + 65536)
+                stage = media_dir.child(stage_name, True)
                 download_limit = size if size is not None else effective_limit
                 client.download(chat, item['message_id'], stage, download_limit)
                 names = stage.names()
@@ -1190,10 +1472,11 @@ def attachment(client, chat, item, media_dir, budget, raw=None, file_limit=None)
                 with os.fdopen(fd, 'rb') as stream:
                     os.fsync(stream.fileno())
                 stage.write_json('receipt.json', receipt)
+                complete_stage = True
             if budget is not None:
-                # The temporary file is included in this check. If either the
-                # shared quota or filesystem reserve was consumed concurrently,
-                # cleanup below removes it before it can be published.
+                # Check raw signed margins after the download. A zero public
+                # available count can hide a quota deficit, so check(0) must
+                # reject negative storage, filesystem, and shared-budget margins.
                 budget.check(0)
             os.rename(stage_name, mid, src_dir_fd=media_dir.fd, dst_dir_fd=media_dir.fd)
             promoted = True
@@ -1208,11 +1491,12 @@ def attachment(client, chat, item, media_dir, budget, raw=None, file_limit=None)
                     'max_file_bytes': effective_limit}
         finally:
             try:
-                if not promoted:
+                if stage is not None and not promoted and not complete_stage:
                     _clear_media_stage(stage)
                     os.rmdir(stage_name, dir_fd=media_dir.fd)
             finally:
-                stage.close()
+                if stage is not None:
+                    stage.close()
     return {**metadata, 'size': receipt['size'], 'size_bytes': receipt['size'],
             'size_source': metadata['size_source'] if size is not None else 'downloaded_bytes',
             'export_status': 'downloaded', 'path': 'media/'+mid+'/'+receipt['name'],
@@ -1226,11 +1510,13 @@ def now():
 
 def publish(destination, pages, meta, budget, error=None, active=False):
     count = 0
-    seen = set()
+    previous_message_id = None
     first = last = cursor = None
     cursor = meta['scope_before']
     exhausted = False
     skipped = []
+    skipped_count = 0
+    skipped_by_reason = {}
     temp = '.tmp-messages.jsonl'
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=destination.fd)
     st = os.fstat(fd)
@@ -1252,9 +1538,11 @@ def publish(destination, pages, meta, budget, error=None, active=False):
                 raise ExportError('Broken checkpoint chain')
             for item in p['records']:
                 mid = item['message_id']
-                if mid in seen:
-                    raise ExportError('Duplicate ID in checkpoints')
-                seen.add(mid)
+                if type(mid) is not int or mid <= 0 or (
+                    previous_message_id is not None and mid >= previous_message_id
+                ):
+                    raise ExportError('Duplicate or out-of-order ID in checkpoints')
+                previous_message_id = mid
                 raw = (json.dumps(item, ensure_ascii=False, sort_keys=True)+'\n').encode()
                 f.write(raw)
                 digest.update(raw)
@@ -1263,7 +1551,17 @@ def publish(destination, pages, meta, budget, error=None, active=False):
                 last = mid if last is None else max(last, mid)
                 m = item.get('media')
                 if m and m.get('export_status') == 'skipped':
-                    skipped.append({'message_id': mid, 'metadata': m})
+                    skipped_count += 1
+                    reason = m.get('reason') if isinstance(m.get('reason'), str) else 'unknown'
+                    skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+                    if len(skipped) < MAX_SKIPPED_MEDIA_SAMPLE:
+                        sample = {
+                            key: m[key] for key in (
+                                'kind', 'size_bytes', 'size_source', 'reason', 'error_code',
+                                'requested_max_file_bytes', 'max_file_bytes',
+                            ) if key in m and isinstance(m[key], (str, int))
+                        }
+                        skipped.append({'message_id': mid, 'metadata': sample})
             cursor = p['next_before']
             exhausted = p['exhausted']
         f.flush()
@@ -1276,10 +1574,13 @@ def publish(destination, pages, meta, budget, error=None, active=False):
                 'messages_sha256': digest.hexdigest(), 'complete': exhausted and meta['scope_before'] is None and not error,
                 'range_complete': exhausted and not error, 'active': active, 'errors': [error] if error else [],
                 'completeness_scope': 'ordinary_messages_exposed_by_better-tg-cli', 'service_messages_included': False,
-                'skipped_media': skipped, 'page_count': len(page_names)}
+                'skipped_media': skipped, 'skipped_media_count': skipped_count,
+                'skipped_media_by_reason': dict(sorted(skipped_by_reason.items())),
+                'skipped_media_sample_truncated': skipped_count > len(skipped),
+                'page_count': len(page_names)}
     budget.check(len(json.dumps(manifest).encode()))
     destination.write_json('manifest.json', manifest)
-    return manifest, seen
+    return manifest, count
 
 
 def _private_resume_dir(directory):
@@ -1297,60 +1598,120 @@ def _private_topic_file(directory, name, maximum):
     return directory.read(name, maximum)
 
 
+def _scan_resume_jsonl(source, name, maximum, validate):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source.fd)
+    digest = hashlib.sha256()
+    count = scanned = 0
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size > maximum):
+            raise ExportError('RESUME_PRIVATE_INPUT_REQUIRED')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = -1
+            while line := stream.readline(MAX_JSONL_LINE_BYTES + 1):
+                scanned += len(line)
+                if len(line) > MAX_JSONL_LINE_BYTES or scanned > before.st_size or not line.endswith(b'\n'):
+                    raise ExportError('RESUME_MESSAGES_INVALID')
+                try:
+                    value = json.loads(line)
+                except (ValueError, UnicodeError):
+                    raise ExportError('RESUME_MESSAGES_INVALID') from None
+                if not isinstance(value, dict):
+                    raise ExportError('RESUME_MESSAGES_INVALID')
+                validate(value)
+                digest.update(line)
+                count += 1
+            after = os.fstat(stream.fileno())
+            if (scanned != before.st_size
+                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                        before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size,
+                                                after.st_mtime_ns, after.st_ctime_ns)):
+                raise ExportError('RESUME_SOURCE_CHANGED')
+        return digest.hexdigest(), count
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _read_resume_source(source, chat, topic):
-    source_id = f'telegram:{chat}:topic:{topic}'
-    names = {
-        'messages.jsonl': 1024**3,
-        'services.jsonl': 256 * 1024**2,
-        'manifest.json': 1024**2,
-        'services_manifest.json': 1024**2,
+    source_id = format_telegram_source(chat, topic)
+    message_limit = MAX_EXPORT_BYTES
+    service_limit = MAX_EXPORT_BYTES
+    data = {
+        'manifest.json': _private_topic_file(source, 'manifest.json', 1024**2),
+        'services_manifest.json': _private_topic_file(source, 'services_manifest.json', 1024**2),
     }
-    data = {name: _private_topic_file(source, name, maximum)
-            for name, maximum in names.items()}
-    hashes = {name: hashlib.sha256(payload).hexdigest() for name, payload in data.items()}
     manifest = json.loads(data['manifest.json'])
     service_manifest = json.loads(data['services_manifest.json'])
+    message_rows = {}
+    previous_id = None
+
+    def validate_message(row):
+        nonlocal previous_id
+        message_id = row.get('message_id')
+        row_topic = row.get('topic_id')
+        if (type(message_id) is not int or message_id <= 0
+                or (previous_id is not None and message_id >= previous_id)
+                or (topic is not None and row_topic != topic)
+                or (topic is None and row_topic is not None
+                    and (type(row_topic) is not int or row_topic <= 0))
+                or ('chat_id' in row and str(row['chat_id']) != chat)):
+            raise ExportError('RESUME_MESSAGES_INVALID')
+        previous_id = message_id
+        media = row.get('media')
+        if media is not None and not isinstance(media, dict):
+            raise ExportError('RESUME_MEDIA_METADATA_INVALID')
+        if isinstance(media, dict) and not media.get('path'):
+            message_rows[str(message_id)] = row
+
+    message_sha, message_count = _scan_resume_jsonl(
+        source, 'messages.jsonl', message_limit, validate_message,
+    )
+    hashes = {
+        'messages.jsonl': message_sha,
+        'services.jsonl': None,
+        'manifest.json': hashlib.sha256(data['manifest.json']).hexdigest(),
+    }
+    scope = 'chat' if topic is None else 'topic'
     if (not isinstance(manifest, dict) or manifest.get('source_id') != source_id
-            or manifest.get('chat_id') != chat or manifest.get('topic_id') != topic
-            or manifest.get('complete') is not True or manifest.get('range_complete') is not True
-            or manifest.get('scope_before') is not None or manifest.get('errors') not in ([], None)
-            or manifest.get('messages_sha256') != hashes['messages.jsonl']):
+            or str(manifest.get('chat_id')) != chat or manifest.get('topic_id') != topic
+            or manifest.get('scope') != scope or manifest.get('complete') is not True
+            or manifest.get('range_complete') is not True or manifest.get('scope_before') is not None
+            or manifest.get('errors') not in ([], None)
+            or manifest.get('messages_sha256') != message_sha
+            or manifest.get('message_count') != message_count):
         raise ExportError('RESUME_EXPORT_INCOMPLETE')
+
+    service_count = 0
+
+    def validate_event(event):
+        nonlocal service_count
+        topic_value = event.get('topic_id')
+        if (type(event.get('event_id')) is not int or event['event_id'] <= 0
+                or (topic is not None and topic_value != topic)
+                or (topic is None and topic_value is not None
+                    and (type(topic_value) is not int or topic_value <= 0))):
+            raise ExportError('RESUME_SERVICES_INVALID')
+        service_count += 1
+
+    service_sha, service_count = _scan_resume_jsonl(
+        source, 'services.jsonl', service_limit, validate_event,
+    )
+    hashes['services.jsonl'] = service_sha
+    hashes['services_manifest.json'] = hashlib.sha256(data['services_manifest.json']).hexdigest()
     if (not isinstance(service_manifest, dict) or service_manifest.get('source_id') != source_id
+            or service_manifest.get('chat_id') != int(chat)
+            or service_manifest.get('topic_id') != topic
+            or service_manifest.get('scope', scope) != scope
             or service_manifest.get('complete') is not True
             or service_manifest.get('range_complete') is not True
             or service_manifest.get('scope_before') is not None
             or service_manifest.get('errors') not in ([], None)
-            or service_manifest.get('services_sha256') != hashes['services.jsonl']):
+            or service_manifest.get('services_sha256') != service_sha
+            or service_manifest.get('event_count') != service_count):
         raise ExportError('RESUME_SERVICES_INCOMPLETE')
-    message_rows = {}
-    for line in data['messages.jsonl'].splitlines():
-        try:
-            row = json.loads(line)
-        except (ValueError, UnicodeError):
-            raise ExportError('RESUME_MESSAGES_INVALID') from None
-        if (not isinstance(row, dict) or type(row.get('message_id')) is not int
-                or row['message_id'] <= 0 or row.get('topic_id') != topic
-                or str(row['message_id']) in message_rows):
-            raise ExportError('RESUME_MESSAGES_INVALID')
-        media = row.get('media')
-        if media is not None and not isinstance(media, dict):
-            raise ExportError('RESUME_MEDIA_METADATA_INVALID')
-        message_rows[str(row['message_id'])] = row
-    if len(message_rows) != manifest.get('message_count'):
-        raise ExportError('RESUME_MESSAGE_COUNT_MISMATCH')
-    service_count = 0
-    for line in data['services.jsonl'].splitlines():
-        try:
-            event = json.loads(line)
-        except (ValueError, UnicodeError):
-            raise ExportError('RESUME_SERVICES_INVALID') from None
-        if (not isinstance(event, dict) or type(event.get('event_id')) is not int
-                or event['event_id'] <= 0 or event.get('topic_id') != topic):
-            raise ExportError('RESUME_SERVICES_INVALID')
-        service_count += 1
-    if service_count != service_manifest.get('event_count'):
-        raise ExportError('RESUME_SERVICE_COUNT_MISMATCH')
     return source_id, data, hashes, manifest, message_rows
 
 
@@ -1410,10 +1771,44 @@ def _resume_counts(records):
     return result
 
 
+def _count_jsonl_media(directory, name, expected_sha256):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory.fd)
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ExportError('Unsafe messages file')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = -1
+            scanned = 0
+            while line := stream.readline(MAX_JSONL_LINE_BYTES + 1):
+                scanned += len(line)
+                if len(line) > MAX_JSONL_LINE_BYTES or scanned > before.st_size or not line.endswith(b'\n'):
+                    raise ExportError('Invalid or oversized message line')
+                try:
+                    row = json.loads(line)
+                except (ValueError, UnicodeError):
+                    raise ExportError('Invalid messages JSONL') from None
+                if isinstance(row, dict) and isinstance(row.get('media'), dict):
+                    count += 1
+                digest.update(line)
+            after = os.fstat(stream.fileno())
+            if (scanned != before.st_size or digest.hexdigest() != expected_sha256
+                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                        before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size,
+                                                after.st_mtime_ns, after.st_ctime_ns)):
+                raise ExportError('Output/checkpoint mismatch after interruption; repeat export to recover')
+        return count
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def transfer_helper_call(cfg, action, source_id):
-    if action not in {'budget', 'copy', 'status'} or not re.fullmatch(
-        r'telegram:-?[1-9][0-9]{0,18}:topic:[1-9][0-9]{0,9}', source_id,
-    ):
+    from kiber_analyst.telegram_source import parse_telegram_source
+
+    if action not in {'budget', 'copy', 'status'} or parse_telegram_source(source_id) is None:
         raise ExportError('Invalid transfer helper request')
     try:
         timeout = 12 * 60 * 60 if action == 'copy' else 30
@@ -1440,7 +1835,7 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
     """Add bounded media to an existing complete export without rewriting it."""
     chat_dir = root.child(chat)
     try:
-        source = chat_dir.child(str(topic))
+        source = chat_dir.child(telegram_scope_directory(topic))
     finally:
         chat_dir.close()
     try:
@@ -1450,6 +1845,15 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
         )
         missing = {mid: row for mid, row in message_rows.items()
                    if isinstance(row.get('media'), dict) and not row['media'].get('path')}
+        if not missing:
+            return {
+                'source_id': source_id, 'status': 'complete',
+                'requested_max_file_bytes': max_file_bytes,
+                'effective_max_file_bytes': max_file_bytes,
+                'max_file_bytes_ceiling': MAX_FILE_BYTES,
+                'max_file_size_unit': 'bytes', 'media_count': 0, 'remaining': 0,
+                **_resume_counts({}),
+            }
         budget = Budget(root, cfg)
         budget.check(65536)
         repair = source.child('media-resume', True)
@@ -1474,14 +1878,46 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                     max(0, fs.f_bavail * fs.f_frsize - cfg['min_free_bytes']),
                 )
             retryable = {'download_error', 'metadata_unavailable', 'storage_budget_exhausted', 'size_unknown'}
-            pending = []
-            for mid in missing:
-                old = records.get(mid)
-                if (old is None or _resume_reason(old) in retryable
-                        or (_resume_reason(old) in {'over_100_MiB', 'over_limit'}
-                            and max_file_bytes > old.get('max_file_bytes', MAX_FILE))):
-                    pending.append(mid)
-            pending = pending[:limit]
+            unattempted = [mid for mid in missing if mid not in records]
+            retry_pending = []
+            for mid, old in records.items():
+                if mid not in missing:
+                    continue
+                reason = _resume_reason(old)
+                recorded_limit = old.get('max_file_bytes', MAX_FILE)
+                if (reason in retryable
+                        or (reason in {'over_100_MiB', 'over_limit',
+                                       'photo_variant_selection_unsupported'}
+                            and type(recorded_limit) is int
+                            and max_file_bytes > recorded_limit)):
+                    retry_pending.append(mid)
+            # A persistent failure must not starve later not-yet-attempted files
+            # when a small batch is used.
+            pending = (unattempted + retry_pending)[:limit]
+            if not pending and 'manifest.json' in repair.names():
+                existing_status = repair.json('manifest.json')
+                checkpoint_bytes = repair.read('status.json', 64 * 1024**2)
+                checkpoint_sha = hashlib.sha256(checkpoint_bytes).hexdigest()
+                if (existing_status.get('source_id') != source_id
+                        or existing_status.get('inputs') != hashes
+                        or existing_status.get('checkpoint_sha256') != checkpoint_sha
+                        or existing_status.get('requested_max_file_bytes')
+                        != checkpoint.get('requested_max_file_bytes')
+                        or existing_status.get('complete') is not True):
+                    raise ExportError('RESUME_CHECKPOINT_MANIFEST_MISMATCH')
+                return {
+                    'source_id': source_id, 'status': 'complete',
+                    'requested_max_file_bytes': existing_status['requested_max_file_bytes'],
+                    'effective_max_file_bytes': existing_status['effective_max_file_bytes'],
+                    'max_file_bytes_ceiling': MAX_FILE_BYTES,
+                    'max_file_size_unit': 'bytes',
+                    'media_count': existing_status['media_count'],
+                    'remaining': existing_status['remaining'],
+                    **{key: existing_status[key] for key in (
+                        'downloaded', 'skipped', 'download_errors', 'already_present',
+                        'skipped_by_reason',
+                    )},
+                }
             existing_ids = set()
             if pending:
                 try:
@@ -1578,12 +2014,15 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
             unresolved = [mid for mid in missing if mid not in records]
             errors = counts['download_errors']
             complete = not unresolved and errors == 0
-            current_limits = [r.get('max_file_bytes', max_file_bytes) for r in records.values()
+            requested_limit = (max_file_bytes if pending else checkpoint.get(
+                'requested_max_file_bytes', max_file_bytes,
+            ))
+            current_limits = [r.get('max_file_bytes', requested_limit) for r in records.values()
                               if r.get('export_status') == 'downloaded']
-            effective_max = min([max_file_bytes, *current_limits]) if current_limits else max_file_bytes
+            effective_max = min([requested_limit, *current_limits]) if current_limits else requested_limit
             status = {
                 'version': 1, 'source_id': source_id, 'inputs': hashes,
-                'checkpoint_sha256': None, 'requested_max_file_bytes': max_file_bytes,
+                'checkpoint_sha256': None, 'requested_max_file_bytes': requested_limit,
                 'effective_max_file_bytes': effective_max, 'max_file_bytes_ceiling': MAX_FILE_BYTES,
                 'max_file_size_unit': 'bytes',
                 'media_count': len(missing), 'complete': complete,
@@ -1597,7 +2036,7 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                                       (json.dumps(status, sort_keys=True) + '\n').encode())
             result = {
                 'source_id': source_id, 'status': 'complete' if complete else 'partial',
-                'requested_max_file_bytes': max_file_bytes,
+                'requested_max_file_bytes': requested_limit,
                 'effective_max_file_bytes': effective_max,
                 'max_file_bytes_ceiling': MAX_FILE_BYTES, 'max_file_size_unit': 'bytes',
                 'media_count': len(missing), 'remaining': len(unresolved),
@@ -1613,7 +2052,7 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
 def export(root, cfg, args, client=None):
     command, supplied_chat, topic, media, limit, before, max_file_bytes = parse(args)
     if command in {'export-transfer', 'export-transfer-status'}:
-        source_id = f'telegram:{supplied_chat}:topic:{topic}'
+        source_id = format_telegram_source(supplied_chat, topic)
         return transfer_helper_call(
             cfg, 'copy' if command == 'export-transfer' else 'status', source_id,
         )
@@ -1636,11 +2075,12 @@ def export(root, cfg, args, client=None):
     else:
         info = client.info(supplied_chat)
         canonical = str(info['id'])
-        if not re.fullmatch(r'-?[1-9][0-9]{0,18}', canonical) or not info.get('forum'):
-            raise ExportError('Export requires a forum supergroup')
+        if not re.fullmatch(r'-?[1-9][0-9]{0,18}', canonical):
+            raise ExportError('Export requires a numeric group ID')
     cdir = root.child(canonical, command == 'export')
     try:
-        dest = cdir.child(str(topic), command == 'export')
+        scope_dir = telegram_scope_directory(topic)
+        dest = cdir.child(scope_dir, command == 'export')
         try:
             if command == 'export-status':
                 manifest = dest.json('manifest.json')
@@ -1663,19 +2103,23 @@ def export(root, cfg, args, client=None):
                 if has_service_manifest:
                     service_manifest = _read_services_manifest(dest)
                     service_records, service_digest = _load_service_records(dest)
-                    service_manifest = _service_manifest_view(
-                        service_manifest, service_records, service_digest,
-                        has_service_data,
-                    )
+                    try:
+                        service_manifest = _service_manifest_view(
+                            service_manifest, service_records, service_digest,
+                            has_service_data,
+                        )
+                        service_count = len(service_records)
+                    finally:
+                        service_records.close()
                     # A pending first publication with no data has no committed
                     # service snapshot yet. Other missing halves are corruption.
                     if service_manifest is None and not has_service_data:
                         return {**manifest, **status, 'messages_integrity': 'ok', 'size_bytes': tree_size(dest)}
                     if service_manifest is None or not has_service_data:
                         raise ExportError('Service output is missing a committed file')
-                    if service_manifest.get('services_sha256') != service_digest or service_manifest.get('event_count') != len(service_records):
+                    if service_manifest.get('services_sha256') != service_digest or service_manifest.get('event_count') != service_count:
                         raise ExportError('Service output integrity mismatch')
-                    status = {'service_event_count': len(service_records),
+                    status = {'service_event_count': service_count,
                               'services_complete': bool(service_manifest.get('complete')),
                               'services_sha256': service_digest}
                 media_status = {
@@ -1683,8 +2127,9 @@ def export(root, cfg, args, client=None):
                     'requested_max_file_bytes': manifest.get('max_file_bytes', MAX_FILE),
                     'max_file_bytes_ceiling': MAX_FILE_BYTES,
                     'max_file_size_unit': 'bytes',
-                    'media_count': sum(1 for line in dest.read('messages.jsonl', 1024**3).splitlines()
-                                       if isinstance(json.loads(line).get('media'), dict)),
+                    'media_count': _count_jsonl_media(
+                        dest, 'messages.jsonl', manifest.get('messages_sha256'),
+                    ),
                 }
                 if 'media-resume' in names:
                     resume_dir = dest.child('media-resume')
@@ -1723,13 +2168,21 @@ def export(root, cfg, args, client=None):
                 stored_file_limit = meta.get('max_file_bytes', MAX_FILE)
                 if stored_file_limit != max_file_bytes:
                     raise ExportError('Existing export file limit differs; no data overwritten')
-                meta = {k: meta[k] for k in ['export_version','source_id','chat_id','topic_id','topic_title','scope_before','media_requested','started_at','snapshot_newest_id']}
+                meta = {k: meta[k] for k in [
+                    'export_version', 'source_id', 'chat_id', 'topic_id', 'scope',
+                    'chat_title', 'topic_title', 'scope_before', 'media_requested',
+                    'started_at', 'snapshot_newest_id',
+                ] if k in meta}
                 meta['max_file_bytes'] = stored_file_limit
             else:
                 if set(dest.names()) - {'.tmp-manifest.json'}:
                     raise ExportError('Nonempty destination without an export manifest')
-                meta = {'export_version': 1, 'source_id': 'telegram:'+canonical+':topic:'+str(topic),
-                        'chat_id': canonical, 'topic_id': topic, 'topic_title': client.title(canonical, topic),
+                meta = {'export_version': 1,
+                        'source_id': format_telegram_source(canonical, topic),
+                        'chat_id': canonical, 'topic_id': topic,
+                        'scope': 'chat' if topic is None else 'topic',
+                        'chat_title': info.get('title') if isinstance(info.get('title'), str) else None,
+                        'topic_title': client.title(canonical, topic),
                         'scope_before': before, 'media_requested': media,
                         'max_file_bytes': max_file_bytes,
                         'max_file_size_unit': 'bytes',
@@ -1742,7 +2195,7 @@ def export(root, cfg, args, client=None):
             pages = dest.child('.pages', True)
             media_dir = dest.child('media', True)
             try:
-                manifest, seen = publish(dest, pages, meta, budget, active=True)
+                manifest, _count = publish(dest, pages, meta, budget, active=True)
                 if manifest['range_complete']:
                     manifest, _ = publish(dest, pages, meta, budget)
                     return manifest
@@ -1759,17 +2212,17 @@ def export(root, cfg, args, client=None):
                     next_cursor = min(ids) if ids else cursor
                     if cursor is not None and ids:
                         next_cursor = min(m['id'] for m in valid)
-                    lookup_ids = [
-                        m['id'] for m in valid if m['id'] not in seen and belongs(m, topic)
+                    lookup_ids = sorted({
+                        m['id'] for m in valid if belongs(m, topic)
                         and m.get('media') and (m['media'].get('kind') == 'photo'
                                                 or not _positive_size(m['media'].get('size')))
-                    ]
+                    })
                     raw_media = client.media_metadata(canonical, lookup_ids) if lookup_ids else {}
                     records = []
                     page_seen = set()
                     for message in sorted(valid, key=lambda m: m['id'], reverse=True):
                         mid = message['id']
-                        if mid in page_seen or mid in seen:
+                        if mid in page_seen:
                             continue
                         page_seen.add(mid)
                         if not belongs(message, topic):
@@ -1794,7 +2247,7 @@ def export(root, cfg, args, client=None):
                     encoded = (json.dumps(page, ensure_ascii=False)+'\n').encode()
                     budget.check(len(encoded)*2+65536)
                     pages.atomic(f"{manifest['page_count']:08d}.json", encoded)
-                    manifest, seen = publish(dest, pages, meta, budget, active=bool(raw))
+                    manifest, _count = publish(dest, pages, meta, budget, active=bool(raw))
                     if not raw:
                         return manifest
                     cursor = next_cursor
@@ -1844,7 +2297,7 @@ def handle(args, *, config_path=None):
     cfg = config(config_path)
     _check_storage_mount(cfg)
     if command == 'export-resume' or (command == 'export' and media):
-        budget = transfer_helper_call(cfg, 'budget', f'telegram:{chat}:topic:{topic}')
+        budget = transfer_helper_call(cfg, 'budget', format_telegram_source(chat, topic))
         available = budget.get('available_bytes')
         if budget.get('status') != 'budget' or type(available) is not int or available < 0:
             raise ExportError('TRANSFER_BUDGET_UNAVAILABLE')

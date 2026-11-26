@@ -212,3 +212,23 @@ def disposable_postgres_credentials(
     for module in (load, external_embed, external_load):
         monkeypatch.setattr(module, "_required_env", test_env)
     return credentials
+
+
+@pytest.fixture
+def optional_disposable_postgres_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, str] | None:
+    """Enable full load checks when a guarded scratch PostgreSQL is configured."""
+    configured_path = os.environ.get(TEST_ENV_NAME)
+    if not configured_path:
+        return None
+    credentials = load_disposable_postgres_env(configured_path)
+
+    def test_env(path: Path) -> dict[str, str]:
+        return load_disposable_postgres_env(path, expected_path=configured_path)
+
+    from kiber_analyst import external_embed, external_load, load
+
+    for module in (load, external_embed, external_load):
+        monkeypatch.setattr(module, "_required_env", test_env)
+    return credentials

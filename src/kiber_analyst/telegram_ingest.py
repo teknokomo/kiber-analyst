@@ -13,12 +13,14 @@ from kiber_analyst.config_paths import data_path
 from kiber_analyst.errors import LoadError
 from kiber_analyst.media_limits import (
     DEFAULT_TELEGRAM_MEDIA_BYTES,
+    MAX_TELEGRAM_EXPORT_BYTES,
     MAX_TELEGRAM_MEDIA_BYTES,
     validate_telegram_media_limit,
 )
 from kiber_analyst.media_resume import resumed_media
 from kiber_analyst.parse import _make_url, normalized_content_hash
 from kiber_analyst.paths import job_paths, write_json_atomic
+from kiber_analyst.telegram_source import format_telegram_source, telegram_scope_directory
 
 TELEGRAM_ROOT = Path(
     os.environ.get("KIBER_ANALYST_TELEGRAM_ROOT", str(data_path("imports")))
@@ -37,7 +39,8 @@ _EVENT_TYPES = {
 class TelegramExport:
     path: Path
     chat_id: str
-    topic_id: int
+    topic_id: int | None
+    scope: str
     topic_title: str | None
     message_count: int
     service_event_count: int
@@ -57,6 +60,7 @@ class TelegramExport:
         payload = {
             "chat_id": self.chat_id,
             "topic_id": self.topic_id,
+            "scope": self.scope,
             "messages_sha256": self.message_sha256,
             "services_sha256": self.service_sha256,
         }
@@ -214,18 +218,25 @@ def _chat_id(value: Any) -> str:
     return result
 
 
-def _topic_id(value: Any) -> int:
+def _topic_id(value: Any, scope: str = "topic") -> int | None:
+    if scope == "chat" and value is None:
+        return None
     if type(value) is not int or value <= 0:
         raise LoadError("Telegram export has an invalid topic ID")
     return value
 
 
-def _validate_message(value: dict[str, Any], chat_id: str, topic_id: int) -> None:
+def _validate_message(
+    value: dict[str, Any], chat_id: str, topic_id: int | None, scope: str = "topic",
+) -> None:
     message_id = value.get("message_id")
     if type(message_id) is not int or message_id <= 0:
         raise LoadError("Telegram export contains an invalid message ID")
-    if value.get("topic_id") != topic_id:
+    row_topic = value.get("topic_id")
+    if scope == "topic" and row_topic != topic_id:
         raise LoadError("Telegram message is outside the exported topic")
+    if scope == "chat" and row_topic is not None and (type(row_topic) is not int or row_topic <= 0):
+        raise LoadError("Telegram message has an invalid forum topic ID")
     if not isinstance(value.get("date"), str) or not isinstance(value.get("text"), str):
         raise LoadError("Telegram message is missing its date or text")
     if "sender_name" in value and value["sender_name"] is not None and not isinstance(value["sender_name"], str):
@@ -277,6 +288,8 @@ def inspect_export(
     root: Path = TELEGRAM_ROOT,
     max_jsonl_bytes: int | None = None,
 ) -> TelegramExport:
+    if max_jsonl_bytes is None:
+        max_jsonl_bytes = MAX_TELEGRAM_EXPORT_BYTES
     if max_jsonl_bytes is not None and (
         type(max_jsonl_bytes) is not int or max_jsonl_bytes <= 0
     ):
@@ -289,11 +302,17 @@ def inspect_export(
     if manifest.get("scope_before") is not None:
         raise LoadError("Telegram ingestion requires a complete, unbounded topic export")
     chat_id = _chat_id(manifest.get("chat_id"))
-    topic_id = _topic_id(manifest.get("topic_id"))
-    expected_source = f"telegram:{chat_id}:topic:{topic_id}"
+    scope = manifest.get("scope", "topic")
+    if scope not in {"topic", "chat"}:
+        raise LoadError("Telegram export has an invalid scope")
+    topic_id = _topic_id(manifest.get("topic_id"), scope)
+    if scope == "chat" and topic_id is not None:
+        raise LoadError("Whole-group Telegram export cannot declare one topic ID")
+    expected_source = format_telegram_source(chat_id, topic_id)
     if manifest.get("source_id") != expected_source:
         raise LoadError("Telegram export source identity does not match its directory")
-    if str(export_dir.parent.name) != chat_id or export_dir.name != str(topic_id):
+    expected_dir = telegram_scope_directory(topic_id)
+    if str(export_dir.parent.name) != chat_id or export_dir.name != expected_dir:
         raise LoadError("Telegram export directory does not match its manifest")
     expected_messages_sha = manifest.get("messages_sha256")
     if not isinstance(expected_messages_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_messages_sha):
@@ -306,7 +325,7 @@ def inspect_export(
         raise LoadError("Telegram manifest has an invalid media size limit") from None
     message_sha, message_count, messages_size = _scan_file(
         export_dir / "messages.jsonl",
-        lambda item: _validate_message(item, chat_id, topic_id),
+        lambda item: _validate_message(item, chat_id, topic_id, scope),
         max_bytes=max_jsonl_bytes,
     )
     if message_sha != expected_messages_sha:
@@ -317,6 +336,7 @@ def inspect_export(
         services.get("source_id") != expected_source
         or services.get("chat_id") != int(chat_id)
         or services.get("topic_id") != topic_id
+        or services.get("scope", scope) != scope
         or services.get("complete") is not True
         or services.get("range_complete") is not True
         or services.get("scope_before") is not None
@@ -329,7 +349,11 @@ def inspect_export(
 
     def validate_event(item: dict[str, Any]) -> None:
         event_id = item.get("event_id")
-        if type(event_id) is not int or event_id <= 0 or item.get("topic_id") != topic_id:
+        event_topic = item.get("topic_id")
+        if (type(event_id) is not int or event_id <= 0
+                or (scope == "topic" and event_topic != topic_id)
+                or (scope == "chat" and event_topic is not None
+                    and (type(event_topic) is not int or event_topic <= 0))):
             raise LoadError("Telegram service export contains an invalid event identity")
         if item.get("type") not in _EVENT_TYPES:
             raise LoadError("Telegram service export contains an unsupported event type")
@@ -345,6 +369,7 @@ def inspect_export(
         path=export_dir,
         chat_id=chat_id,
         topic_id=topic_id,
+        scope=scope,
         topic_title=manifest.get("topic_title") if isinstance(manifest.get("topic_title"), str) else None,
         message_count=message_count,
         service_event_count=service_count,
@@ -464,12 +489,21 @@ def _normalize_message(
     if resumed_media is not None and media_missing:
         raise LoadError("Media resume file is missing")
     text = value["text"]
-    topic_id = str(export.topic_id)
+    source_topic = value.get("topic_id") if export.scope == "chat" else export.topic_id
+    topic_id = str(source_topic) if source_topic is not None else None
+    internal_chat_id = export.chat_id.removeprefix("-100").removeprefix("-")
+    message_url = (
+        _make_url(export.chat_id, topic_id, str(message_id))
+        if topic_id is not None
+        else f"https://t.me/c/{internal_chat_id}/{message_id}"
+    )
     return {
         "chat_id": export.chat_id,
         "message_id": str(message_id),
         "topic_id": topic_id,
         "topic_title": export.topic_title,
+        # Preserve the legacy attribution contract; scope is carried explicitly
+        # in metadata and in the manifest.
         "attribution": "scope",
         "date": value["date"],
         "date_raw": value["date"],
@@ -482,8 +516,8 @@ def _normalize_message(
         "media_path": media_path,
         "edited_at": None,
         "content_hash": normalized_content_hash(text),
-        "url": _make_url(export.chat_id, topic_id, str(message_id)),
-        "meta": {"media_export": media_meta} if media_meta else {},
+        "url": message_url,
+        "meta": {"export_scope": export.scope, **({"media_export": media_meta} if media_meta else {})},
         "_media_missing": media_missing,
     }, media_missing
 
@@ -545,15 +579,27 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
             raise LoadError("Telegram messages changed while preparing the ingest job")
         os.replace(temporary, paths["messages"])
         os.chmod(paths["messages"], 0o600)
-        uri = f"telegram-export://{export.chat_id}/{export.topic_id}/{export.message_sha256}"
+        scope_dir = telegram_scope_directory(export.topic_id)
+        source_id = format_telegram_source(export.chat_id, export.topic_id)
+        uri = f"telegram-export://{export.chat_id}/{scope_dir}/{export.message_sha256}"
+        archive_scope = export.scope
+        archive_topic = str(export.topic_id) if export.topic_id is not None else None
+        topic_titles: dict[str, str | None] = {}
+        if export.scope == "chat":
+            for _raw, item in _iter_jsonl(export.path / "messages.jsonl"):
+                if item.get("topic_id") is not None:
+                    topic_titles.setdefault(str(item["topic_id"]),
+                                            item.get("topic_title") if isinstance(item.get("topic_title"), str) else None)
+        else:
+            topic_titles[archive_topic] = export.topic_title
         normalized_manifest = {
-            "source_id": f"telegram:{export.chat_id}:topic:{export.topic_id}",
+            "source_id": source_id,
             "snapshot_sha256": export.message_sha256,
             "archive_size_bytes": export.messages_size,
             "archive_uri": uri,
-            "archive_name": f"telegram-{export.chat_id}-{export.topic_id}-{export.message_sha256[:12]}",
-            "scope": "topic",
-            "scope_topic_id": str(export.topic_id),
+            "archive_name": f"telegram-{export.chat_id}-{scope_dir}-{export.message_sha256[:12]}",
+            "scope": archive_scope,
+            "scope_topic_id": archive_topic,
             "chat_id": export.chat_id,
             "telegram_import_key": export.import_key,
             "service_events_sha256": export.service_sha256,
@@ -563,7 +609,10 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
             "media_size_unit": "bytes",
             "parse": {
                 "chat_title": export.chat_title,
-                "topics": [{"topic_id": str(export.topic_id), "topic_title": export.topic_title}],
+                "topics": [
+                    {"topic_id": topic_id, "topic_title": title}
+                    for topic_id, title in sorted(topic_titles.items(), key=lambda pair: int(pair[0]))
+                ],
             },
         }
         write_json_atomic(paths["manifest"], normalized_manifest)

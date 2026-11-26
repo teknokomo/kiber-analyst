@@ -2,9 +2,22 @@
 
 Kiber-analyst включает ограниченный по интерфейсу экспортёр Telegram и
 издатель готовых экспортов. Они устанавливаются из того же пакета, что и
-импортёр. Экспортёр использует уже установленный совместимый Telegram CLI и
-локально авторизованный профиль; пакет не переносит Telegram-сессию,
-credentials или историю между серверами.
+импортёр. Проверенный CLI-интерфейс — **Better-TG-CLI v0.41.2**
+([release](https://github.com/TheVilfer/better-tg-cli/releases/tag/v0.41.2));
+требуется Node.js 20 или новее. Установите зафиксированную совместимую версию:
+
+```bash
+npm install --global better-tg-cli@0.41.2
+telegram --version
+```
+
+Проверенный релиз предоставляет используемые команды `info`, `read --limit
+--full --json`, `--before`, `--topic`, raw `api`, `messages
+get-forum-topics-by-id` и `download --output --json`. Kiber-analyst запускает
+их фиксированным argv, ограничивает время, stdout/stderr и размер каждого
+файла. Другие версии CLI не считаются совместимыми, пока оператор не сверит
+эти интерфейсы. Экспортёр использует локально авторизованный профиль; пакет не
+переносит Telegram-сессию, credentials или историю между серверами.
 
 ## Установка
 
@@ -18,9 +31,7 @@ kiber-analyst-telegram-publish --help
 ```
 
 Команды работают в Linux, используют стандартную библиотеку и не требуют
-новой Python-зависимости. Перед запуском установите отдельный Telegram CLI,
-совместимый с используемым интерфейсом команд (`info`, `read`, `api`,
-`messages`, `download`), и войдите в Telegram от имени выделенного Unix
+новой Python-зависимости. Войдите в Telegram от имени выделенного Unix
 пользователя. Доступные группы, темы и история ограничены членством и правами
 этого Telegram-аккаунта. Не копируйте его каталог авторизации.
 
@@ -34,30 +45,45 @@ kiber-analyst-telegram-publish --help
 Скопируйте примеры из [`config/`](../config/telegram-export.example.json) в
 локальный конфигурационный каталог и замените значения путей, UID/GID и
 квоты для своей системы. Файлы конфигурации не содержат Telegram-сессию или
-секреты. Рекомендуемые права: exporter config `0600` или `0640` для общей
-группы, publisher config `0600`; родительские каталоги не должны быть доступны
-на запись посторонним. Пример publisher config ссылается на фактический
+секреты. Если exporter и publisher работают разными пользователями, exporter
+config должен быть `0600` для общего владельца либо `0640` с владельцем
+`source_uid` и группой `source_gid`, заданными publisher; `0600` для другого
+пользователя publisher недостаточен. Publisher config имеет режим `0600`;
+родительские каталоги не должны быть доступны на запись посторонним. Пример
+publisher config ссылается на фактический
 exporter config, поэтому `storage_limit_bytes` и `min_free_bytes` в обоих
 файлах должны совпадать. `expected_data_uuid=null` и `require_mount=false`
 подходят только для тестового локального дерева. Для отдельного тома задайте
 UUID и включите проверку монтирования.
 
-## Экспорт темы
+## Экспорт группы или темы
 
 ```bash
 export KIBER_TELEGRAM_EXPORT_CONFIG=/absolute/path/telegram-export.json
+kiber-analyst-telegram-export export CHAT_ID GROUP MEDIA 100
+kiber-analyst-telegram-export export-services CHAT_ID GROUP
+kiber-analyst-telegram-export export-status CHAT_ID GROUP
+kiber-analyst-telegram-export export-transfer CHAT_ID GROUP
+kiber-analyst-telegram-export export-transfer-status CHAT_ID GROUP
+```
+
+`GROUP` экспортирует всю доступную историю обычной группы или форумной
+супергруппы со всеми её темами. Для отдельной темы форумной группы передайте
+числовой ID вместо `GROUP`:
+
+```bash
 kiber-analyst-telegram-export export CHAT_ID TOPIC_ID MEDIA 100
 kiber-analyst-telegram-export export-services CHAT_ID TOPIC_ID
 kiber-analyst-telegram-export export-status CHAT_ID TOPIC_ID
 kiber-analyst-telegram-export export-transfer CHAT_ID TOPIC_ID
-kiber-analyst-telegram-export export-transfer-status CHAT_ID TOPIC_ID
 ```
 
-Указывайте numeric chat ID, доступный авторизованному аккаунту, и ID темы
-группы-форума. Успешный завершённый экспорт включает доступные сообщения и
-служебные события; недоступные события отражаются в `limitations`, а не
-объявляются полученными. Обычные сообщения и сервисные события — две отдельные
-операции, каждая со своим manifest и SHA-256.
+Это разные scope и source ID: `telegram:<chat_id>:group` и
+`telegram:<chat_id>:topic:<topic_id>`. Экспорт сохраняет scope и происхождение
+каждого сообщения и события. Успешный экспорт включает доступную аккаунту
+историю; недоступные события отражаются в `limitations`. Сообщения и служебные
+события экспортируются отдельно, каждый файл имеет собственный manifest и
+SHA-256.
 
 Аргументы `export` после `MEDIA`:
 
@@ -75,6 +101,14 @@ manifest/status. Поддерживаются только вложения, к�
 выдать через свою download-команду; необнаруженный или нескачиваемый объект
 отдельно отмечается причиной.
 
+Для длинной истории manifest хранит точный `skipped_media_count`, сводку
+`skipped_media_by_reason` и не более 100 безопасных примеров в
+`skipped_media`; `skipped_media_sample_truncated` показывает, когда список
+примеров ограничен. Причина и размер каждого вложения остаются в его строке
+`messages.jsonl`, поэтому manifest не растёт вместе с числом пропусков. Вывод
+Telegram CLI ограничен 32 MiB для stdout и 256 KiB для stderr; превышение
+завершает весь дочерний процесс и не сохраняет неограниченный вывод.
+
 Экспорт потоковый: файл не целиком загружается в память. Перед загрузкой
 проверяются доступное место, общий лимит хранилища и оставленный резерв;
 поток ограничивается выбранным лимитом и системным `RLIMIT_FSIZE`. При
@@ -86,9 +120,9 @@ manifest/status. Поддерживаются только вложения, к�
 Для возобновления/позднего повышения лимита используйте:
 
 ```bash
-kiber-analyst-telegram-export export-resume CHAT_ID TOPIC_ID 4000MB
-kiber-analyst-telegram-export export-status CHAT_ID TOPIC_ID
-kiber-analyst-telegram-export export-transfer CHAT_ID TOPIC_ID
+kiber-analyst-telegram-export export-resume CHAT_ID GROUP 4000MB
+kiber-analyst-telegram-export export-status CHAT_ID GROUP
+kiber-analyst-telegram-export export-transfer CHAT_ID GROUP
 ```
 
 `export-resume` принимает новый лимит от `100MiB` по умолчанию до `4000MB`.
@@ -114,11 +148,20 @@ Publisher размещает готовый topic package по настроен�
 и разрешённый project grant:
 
 ```text
-source-add telegram:<CHAT_ID>:topic:<TOPIC_ID> <PROJECT>
-ingest-dry-run telegram:<CHAT_ID>:topic:<TOPIC_ID> <PROJECT> 2000-01-01
-ingest telegram:<CHAT_ID>:topic:<TOPIC_ID> <PROJECT>
+source-add telegram:<CHAT_ID>:group <PROJECT>
+ingest-dry-run telegram:<CHAT_ID>:group <PROJECT> 2000-01-01
+ingest telegram:<CHAT_ID>:group <PROJECT>
 job-status <REQUEST_ID>
 ```
+
+Для отдельной темы замените source ID на
+`telegram:<CHAT_ID>:topic:<TOPIC_ID>`. В БД внешний ID сообщения имеет вид
+`tg:<chat_id>:<message_id>`, поэтому пересекающиеся scope (например, вся группа
+и входящая в неё тема) нельзя импортировать в один проект; то же сообщение
+нельзя перепривязать к другому проекту. Система не перемещает и не объединяет
+уже загруженные данные. Разделение overlapping scope потребует отдельной
+миграции модели идентичности сегментов. Несовпадающие темы могут храниться
+отдельно, когда их external references не пересекаются.
 
 До первого реального ingest проверьте `source_id`, source/project grants,
 завершённость обоих manifest, SHA-256 и отчёт dry-run с

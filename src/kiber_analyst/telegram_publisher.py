@@ -18,13 +18,19 @@ import sys
 import uuid
 from pathlib import PurePosixPath
 
+from kiber_analyst.media_limits import MAX_TELEGRAM_EXPORT_BYTES
+from kiber_analyst.telegram_source import parse_telegram_source, telegram_scope_directory
+
 GIB = 1024**3
 DEFAULT_FILE_BYTES = 100 * 1024**2
 MAX_FILE_BYTES = 4_000_000_000  # 4000 decimal MB; separate from ASR limits.
 MAX_STORAGE_BYTES = 1024 * GIB
 MAX_METADATA_BYTES = 4 * 1024**2
 MAX_CHECKPOINT_BYTES = 64 * 1024**2
-MAX_CONTROL_BYTES = 32 * 1024**2
+# JSONL histories are streamed and bounded by the configured storage ceiling,
+# not by an unrelated in-memory control-message limit.
+MAX_CONTROL_BYTES = MAX_TELEGRAM_EXPORT_BYTES
+MAX_JSONL_LINE_BYTES = 4 * 1024**2
 MAX_SERVICES_MANIFEST_BYTES = 1024**2
 ALLOWED_SKIP_REASONS = {
     "over_100_MiB", "over_limit", "unsupported_media",
@@ -51,10 +57,11 @@ def _fail(code: str):
 
 
 def _source_parts(source_id: str) -> tuple[str, str]:
-    match = re.fullmatch(r"telegram:(-?[1-9][0-9]{0,18}):topic:([1-9][0-9]{0,9})", source_id)
-    if not match:
+    parsed = parse_telegram_source(source_id)
+    if parsed is None:
         _fail("INVALID_SOURCE_ID")
-    return match.group(1), match.group(2)
+    chat, topic = parsed
+    return chat, telegram_scope_directory(topic)
 
 
 def _component(value: str) -> str:
@@ -224,6 +231,52 @@ def _write_file(parent: int, name: str, data: bytes, *, uid: int, gid: int):
             os.unlink(temporary, dir_fd=parent)
 
 
+def _copy_control(source_parent: int, name: str, destination_parent: int, *,
+                  source_uid: int, dest_uid: int, dest_gid: int,
+                  expected_size: int, expected_sha: str, maximum: int) -> tuple[int, str]:
+    """Stream a control file into a private candidate and verify source stability."""
+    source_fd = _open_regular(source_parent, name, uid=source_uid, maximum=maximum)
+    before = os.fstat(source_fd)
+    if before.st_size != expected_size:
+        os.close(source_fd)
+        _fail("CONTROL_FILE_CHANGED")
+    temporary = ".tmp-control-" + uuid.uuid4().hex
+    output_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        0o600, dir_fd=destination_parent)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        os.fchown(output_fd, dest_uid, dest_gid)
+        os.fchmod(output_fd, 0o600)
+        while chunk := os.read(source_fd, 1024 * 1024):
+            total += len(chunk)
+            if total > maximum:
+                _fail("CONTROL_FILE_TOO_LARGE")
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_fd, view)
+                view = view[written:]
+        after = os.fstat(source_fd)
+        actual = digest.hexdigest()
+        if (_file_token(before) != _file_token(after) or total != expected_size
+                or actual != expected_sha):
+            _fail("CONTROL_FILE_HASH_MISMATCH")
+        os.fsync(output_fd)
+        os.close(output_fd)
+        output_fd = -1
+        os.rename(temporary, _component(name), src_dir_fd=destination_parent,
+                  dst_dir_fd=destination_parent)
+        os.fsync(destination_parent)
+        return total, actual
+    finally:
+        os.close(source_fd)
+        if output_fd >= 0:
+            os.close(output_fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=destination_parent)
+
+
 def _rename_noreplace(source_parent: int, source_name: str,
                       destination_parent: int, destination_name: str) -> None:
     """Atomically publish a new name without replacing an existing entry."""
@@ -300,10 +353,29 @@ def _temp_marker_matches(parent: int, name: str, *, uid: int, source_id: str,
             "source_id": source_id, "source_hashes": source_hashes,
             "media_manifest_sha256": media_manifest_sha,
         }
-    except (TransferError, ValueError, UnicodeError):
+    except (TransferError, OSError, ValueError, UnicodeError):
         return False
     finally:
         os.close(directory)
+
+
+def _recover_initialization_directories(parent: int, *, uid: int, source_id: str,
+                                        source_hashes: dict,
+                                        media_manifest_sha: str | None) -> None:
+    """Remove only marked, identity-matching pre-publication scratch trees."""
+    removed = False
+    for name in os.listdir(parent):
+        if not re.fullmatch(r"\.publisher-init-[0-9a-f]{32}", name):
+            continue
+        if not _temp_marker_matches(
+            parent, name, uid=uid, source_id=source_id,
+            source_hashes=source_hashes, media_manifest_sha=media_manifest_sha,
+        ):
+            _fail("TRANSFER_RECOVERY_REQUIRED")
+        _remove_tree(parent, name, expected_uid=uid)
+        removed = True
+    if removed:
+        os.fsync(parent)
 
 
 def _revision_compatible(previous: dict, candidate: dict, *, source_hashes: dict,
@@ -558,28 +630,64 @@ def _check_pipeline_storage(available: int, required: int) -> None:
         _fail("INSUFFICIENT_SHARED_STORAGE")
 
 
-def _read_message_rows(messages: bytes, *, chat: str, topic: int):
-    rows = []
-    seen = set()
-    for line in messages.splitlines():
-        try:
-            row = json.loads(line)
-        except (ValueError, UnicodeError):
-            _fail("MESSAGES_INVALID")
-        if (not isinstance(row, dict) or type(row.get("message_id")) is not int
-                or row["message_id"] <= 0 or row.get("topic_id") != topic
-                or type(row.get("topic_id")) is not int
+def _iter_jsonl(parent: int, name: str, *, uid: int, maximum: int = MAX_CONTROL_BYTES):
+    """Read a control JSONL one bounded record at a time and verify file stability."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                 dir_fd=parent)
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != uid
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+                or before.st_size > maximum):
+            _fail("CONTROL_FILE_UNSAFE")
+        total = 0
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            while raw := stream.readline(MAX_JSONL_LINE_BYTES + 1):
+                total += len(raw)
+                if len(raw) > MAX_JSONL_LINE_BYTES or total > maximum:
+                    _fail("CONTROL_FILE_TOO_LARGE")
+                try:
+                    value = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    _fail("MESSAGES_INVALID" if name == "messages.jsonl" else "SERVICES_INVALID")
+                if not isinstance(value, dict):
+                    _fail("MESSAGES_INVALID" if name == "messages.jsonl" else "SERVICES_INVALID")
+                yield value
+        after = os.fstat(fd)
+        if (_file_token(before) != _file_token(after) or total != before.st_size):
+            _fail("CONTROL_FILE_CHANGED")
+    finally:
+        os.close(fd)
+
+
+def _file_token(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _validated_message_rows(parent: int, *, chat: str, topic: int | None,
+                            scope: str, uid: int):
+    count = 0
+    previous_id = None
+    for row in _iter_jsonl(parent, "messages.jsonl", uid=uid):
+        message_id = row.get("message_id")
+        row_topic = row.get("topic_id")
+        if (type(message_id) is not int or message_id <= 0
+                or (scope == "topic" and row_topic != topic)
+                or (scope == "chat" and row_topic is not None
+                    and (type(row_topic) is not int or row_topic <= 0))
                 or ("chat_id" in row and str(row.get("chat_id")) != chat)
                 or not isinstance(row.get("date"), str)
                 or not isinstance(row.get("text"), str)
-                or str(row["message_id"]) in seen):
+                or (previous_id is not None and message_id >= previous_id)):
             _fail("MESSAGES_INVALID")
-        seen.add(str(row["message_id"]))
+        previous_id = message_id
         media = row.get("media")
         if media is not None and not isinstance(media, dict):
             _fail("MEDIA_METADATA_INVALID")
-        rows.append(row)
-    return rows
+        count += 1
+        yield row
+    return count
 
 
 def _read_control(source: int, name: str, expected_uid: int, maximum: int) -> bytes:
@@ -674,16 +782,19 @@ def _validate_media_reference(source: int, media: dict, message_id: int, *,
         os.close(media_root)
 
 
-def _media_inputs(source: int, rows: list[dict], checkpoint: dict | None,
+def _media_inputs(source: int, rows, checkpoint: dict | None,
                   media_manifest: dict | None, source_manifest: dict,
                   *, source_uid: int):
     record_map = checkpoint.get("records", {}) if checkpoint else {}
-    expected = {str(row["message_id"]) for row in rows
-                if isinstance(row.get("media"), dict) and not row["media"].get("path")}
+    expected = set()
+    unresolved = False
+    for row in rows:
+        media = row.get("media")
+        if isinstance(media, dict) and not media.get("path"):
+            expected.add(str(row["message_id"]))
+            unresolved = unresolved or media.get("export_status") != "skipped"
     if checkpoint is None:
-        if any(row["media"].get("export_status") != "skipped"
-               for row in rows if isinstance(row.get("media"), dict)
-               and not row["media"].get("path")):
+        if unresolved:
             _fail("MEDIA_EXPORT_NOT_READY")
         # Legacy manifests use the original 100 MiB default. New exports
         # record the selected bound explicitly, up to the storage ceiling.
@@ -728,22 +839,33 @@ def _media_inputs(source: int, rows: list[dict], checkpoint: dict | None,
     return record_map, max_file, media_manifest
 
 
-def _read_transfer_inputs(source: int, source_id: str, chat: str, topic: int,
+def _read_transfer_inputs(source: int, source_id: str, chat: str, scope_dir: str,
                           source_uid: int):
-    controls = {
-        "messages.jsonl": _read_control(source, "messages.jsonl", source_uid, MAX_CONTROL_BYTES),
-        "services.jsonl": _read_control(source, "services.jsonl", source_uid, MAX_CONTROL_BYTES),
-        "manifest.json": _read_control(source, "manifest.json", source_uid, MAX_METADATA_BYTES),
-        "services_manifest.json": _read_control(
-            source, "services_manifest.json", source_uid, MAX_SERVICES_MANIFEST_BYTES,
-        ),
-    }
-    manifest = json.loads(controls["manifest.json"])
-    service_manifest = json.loads(controls["services_manifest.json"])
-    hashes = {name: _sha(value) for name, value in controls.items()}
+    parsed = parse_telegram_source(source_id)
+    if parsed is None:
+        _fail("INVALID_SOURCE_ID")
+    _chat, topic_text = parsed
+    scope = "chat" if topic_text is None else "topic"
+    topic = None if topic_text is None else int(topic_text)
+    manifest_bytes = _read_control(source, "manifest.json", source_uid, MAX_METADATA_BYTES)
+    services_bytes = _read_control(source, "services_manifest.json", source_uid,
+                                   MAX_SERVICES_MANIFEST_BYTES)
+    try:
+        manifest = json.loads(manifest_bytes)
+        service_manifest = json.loads(services_bytes)
+    except (ValueError, UnicodeError):
+        _fail("EXPORT_MANIFEST_INVALID")
+    sizes, hashes = {}, {}
+    for name in ("messages.jsonl", "services.jsonl"):
+        size, digest = _digest_file(source, name, uid=source_uid, maximum=MAX_CONTROL_BYTES)
+        sizes[name] = size
+        hashes[name] = digest
+    hashes["manifest.json"] = _sha(manifest_bytes)
+    hashes["services_manifest.json"] = _sha(services_bytes)
     if (manifest.get("export_version") != 1 or manifest.get("source_id") != source_id
-            or manifest.get("chat_id") != chat or type(manifest.get("topic_id")) is not int
-            or manifest.get("topic_id") != topic or manifest.get("complete") is not True
+            or str(manifest.get("chat_id")) != chat or manifest.get("topic_id") != topic
+            or manifest.get("scope", "topic") != scope
+            or manifest.get("complete") is not True
             or manifest.get("range_complete") is not True or manifest.get("scope_before") is not None
             or manifest.get("errors") not in ([], None)
             or manifest.get("messages_sha256") != hashes["messages.jsonl"]
@@ -751,8 +873,8 @@ def _read_transfer_inputs(source: int, source_id: str, chat: str, topic: int,
         _fail("EXPORT_MANIFEST_MISMATCH")
     if (service_manifest.get("source_id") != source_id
             or service_manifest.get("chat_id") != int(chat)
-            or type(service_manifest.get("topic_id")) is not int
             or service_manifest.get("topic_id") != topic
+            or service_manifest.get("scope", scope) != scope
             or service_manifest.get("complete") is not True
             or service_manifest.get("range_complete") is not True
             or service_manifest.get("scope_before") is not None
@@ -760,24 +882,30 @@ def _read_transfer_inputs(source: int, source_id: str, chat: str, topic: int,
             or service_manifest.get("services_sha256") != hashes["services.jsonl"]
             or type(service_manifest.get("event_count")) is not int):
         _fail("SERVICES_MANIFEST_MISMATCH")
-    rows = _read_message_rows(controls["messages.jsonl"], chat=chat, topic=topic)
-    if len(rows) != manifest["message_count"]:
+    row_count = sum(1 for _row in _validated_message_rows(
+        source, chat=chat, topic=topic, scope=scope, uid=source_uid,
+    ))
+    if row_count != manifest["message_count"]:
         _fail("MESSAGE_COUNT_MISMATCH")
     service_count = 0
-    for line in controls["services.jsonl"].splitlines():
-        try:
-            event = json.loads(line)
-        except (ValueError, UnicodeError):
-            _fail("SERVICES_INVALID")
+    previous_event = set()
+    for event in _iter_jsonl(source, "services.jsonl", uid=source_uid):
         if (not isinstance(event, dict) or type(event.get("event_id")) is not int
-                or event["event_id"] <= 0 or event.get("topic_id") != topic
-                or type(event.get("topic_id")) is not int
+                or event["event_id"] <= 0
+                or (scope == "topic" and event.get("topic_id") != topic)
+                or (scope == "chat" and event.get("topic_id") is not None
+                    and (type(event.get("topic_id")) is not int or event["topic_id"] <= 0))
+                or event["event_id"] in previous_event
                 or event.get("type") not in EVENT_TYPES):
             _fail("SERVICES_INVALID")
+        previous_event.add(event["event_id"])
         service_count += 1
     if service_count != service_manifest["event_count"]:
         _fail("SERVICE_COUNT_MISMATCH")
-    return controls, manifest, service_manifest, hashes, rows
+    if (scope_dir != telegram_scope_directory(topic)
+            or hashes["manifest.json"] != manifest.get("manifest_sha256", hashes["manifest.json"])):
+        _fail("EXPORT_MANIFEST_MISMATCH")
+    return manifest, service_manifest, hashes, sizes, manifest_bytes, services_bytes
 
 
 def _load_resume(source: int, hashes: dict, source_id: str, source_uid: int):
@@ -786,21 +914,16 @@ def _load_resume(source: int, hashes: dict, source_id: str, source_uid: int):
         return None, None
     resume = _open_child(source, "media-resume", uid=source_uid)
     try:
-        checkpoint = json.loads(_read_file(resume, "status.json", uid=source_uid,
-                                           maximum=MAX_CHECKPOINT_BYTES))
+        checkpoint_bytes = _read_file(resume, "status.json", uid=source_uid,
+                                      maximum=MAX_CHECKPOINT_BYTES)
+        checkpoint = json.loads(checkpoint_bytes)
         media_manifest = json.loads(_read_file(resume, "manifest.json", uid=source_uid,
                                                maximum=MAX_METADATA_BYTES))
     except BaseException:
         os.close(resume)
         raise
     os.close(resume)
-    resume_dir = _open_child(source, "media-resume", uid=source_uid)
-    try:
-        current_checkpoint_sha = _sha(_read_file(
-            resume_dir, "status.json", uid=source_uid, maximum=MAX_CHECKPOINT_BYTES,
-        ))
-    finally:
-        os.close(resume_dir)
+    current_checkpoint_sha = _sha(checkpoint_bytes)
     if (checkpoint.get("version") != 2 or checkpoint.get("source_id") != source_id
             or checkpoint.get("inputs") != hashes
             or media_manifest.get("inputs") != hashes
@@ -821,10 +944,10 @@ def _new_topic_dir(parent: int, name: str, *, uid: int, gid: int) -> int:
     return fd
 
 
-def _staged_status(destination_chat: int, topic: str, source_id: str,
+def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
                    *, dest_uid: int) -> dict | None:
     try:
-        final = _open_child(destination_chat, topic, uid=dest_uid)
+        final = _open_child(destination_chat, scope_dir, uid=dest_uid)
     except FileNotFoundError:
         return None
     try:
@@ -884,7 +1007,9 @@ def _staged_status(destination_chat: int, topic: str, source_id: str,
         ))
         if not isinstance(staged_manifest, dict) or not isinstance(staged_services, dict):
             _fail("STAGING_MANIFEST_INVALID")
-        chat, topic_id = _source_parts(source_id)
+        chat, parsed_topic = parse_telegram_source(source_id)
+        scope = "chat" if parsed_topic is None else "topic"
+        topic_id = None if parsed_topic is None else int(parsed_topic)
         source_hashes = transfer.get("source_hashes")
         if (not isinstance(source_hashes, dict)
                 or set(source_hashes) != expected_files
@@ -895,7 +1020,8 @@ def _staged_status(destination_chat: int, topic: str, source_id: str,
         transfer_summary = staged_manifest.get("telegram_transfer")
         if (staged_manifest.get("source_id") != source_id
                 or staged_manifest.get("chat_id") != chat
-                or staged_manifest.get("topic_id") != int(topic_id)
+                or staged_manifest.get("topic_id") != topic_id
+                or staged_manifest.get("scope", "topic") != scope
                 or staged_manifest.get("messages_sha256") != staged_hashes["messages.jsonl"]
                 or staged_manifest.get("message_count") != message_count
                 or not isinstance(transfer_summary, dict)
@@ -904,7 +1030,8 @@ def _staged_status(destination_chat: int, topic: str, source_id: str,
                 or staged_manifest.get("max_file_bytes") != limit
                 or staged_services.get("source_id") != source_id
                 or staged_services.get("chat_id") != int(chat)
-                or staged_services.get("topic_id") != int(topic_id)
+                or staged_services.get("topic_id") != topic_id
+                or staged_services.get("scope", scope) != scope
                 or staged_services.get("services_sha256") != staged_hashes["services.jsonl"]
                 or staged_services.get("event_count") != service_count):
             _fail("STAGING_IDENTITY_MISMATCH")
@@ -987,23 +1114,32 @@ def _exclusive_lock(config: dict):
         os.close(parent)
 
 
-def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
+def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
     source_root, destination_root = _storage_roots(config)
     try:
         source_chat = _open_child(source_root, chat, uid=config["source_uid"])
         try:
-            source = _open_child(source_chat, str(topic), uid=config["source_uid"])
+            source = _open_child(source_chat, scope_dir, uid=config["source_uid"])
         finally:
             os.close(source_chat)
         try:
-            controls, source_manifest, service_manifest, hashes, rows = _read_transfer_inputs(
-                source, source_id, chat, topic, config["source_uid"],
+            source_manifest, service_manifest, hashes, sizes, manifest_bytes, services_bytes = _read_transfer_inputs(
+                source, source_id, chat, scope_dir, config["source_uid"],
             )
+            parsed_source = parse_telegram_source(source_id)
+            if parsed_source is None:
+                _fail("INVALID_SOURCE_ID")
+            _parsed_chat, topic_text = parsed_source
+            scope = "chat" if topic_text is None else "topic"
+            topic_id = None if topic_text is None else int(topic_text)
             checkpoint, media_manifest = _load_resume(
                 source, hashes, source_id, config["source_uid"],
             )
             record_map, max_file, media_manifest = _media_inputs(
-                source, rows, checkpoint, media_manifest, source_manifest,
+                source, _validated_message_rows(
+                    source, chat=chat, topic=topic_id, scope=scope,
+                    uid=config["source_uid"],
+                ), checkpoint, media_manifest, source_manifest,
                 source_uid=config["source_uid"],
             )
             destination_chat = _destination_chat(
@@ -1016,7 +1152,12 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                     (source_id + json.dumps(hashes, sort_keys=True) + (desired_media_sha or "none"))
                     .encode()
                 ).hexdigest()[:32]
-                final_status = _staged_status(destination_chat, str(topic), source_id,
+                _recover_initialization_directories(
+                    destination_chat, uid=config["destination_uid"],
+                    source_id=source_id, source_hashes=hashes,
+                    media_manifest_sha=desired_media_sha,
+                )
+                final_status = _staged_status(destination_chat, scope_dir, source_id,
                                               dest_uid=config["destination_uid"])
                 # Recover the three crash windows around the atomic publish:
                 # a marked partial tree is safe to discard, a complete staged
@@ -1027,7 +1168,7 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                         temp_record, _temp_sha = _transfer_record(
                             destination_chat, temp_name, uid=config["destination_uid"],
                         )
-                    except TransferError:
+                    except (TransferError, OSError):
                         if not _temp_marker_matches(
                             destination_chat, temp_name, uid=config["destination_uid"],
                             source_id=source_id, source_hashes=hashes,
@@ -1036,8 +1177,11 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                             _fail("TRANSFER_RECOVERY_REQUIRED")
                         _remove_tree(destination_chat, temp_name,
                                      expected_uid=config["destination_uid"])
+                        # Persist removal of the discarded partial candidate so
+                        # a crash cannot resurrect a stale directory entry.
+                        os.fsync(destination_chat)
                         final_status = _staged_status(
-                            destination_chat, str(topic), source_id,
+                            destination_chat, scope_dir, source_id,
                             dest_uid=config["destination_uid"],
                         )
                     else:
@@ -1046,32 +1190,34 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                         if temp_record.get("media_manifest_sha256") == desired_media_sha:
                             if final_status:
                                 previous, _ = _transfer_record(
-                                    destination_chat, str(topic), uid=config["destination_uid"],
+                                    destination_chat, scope_dir, uid=config["destination_uid"],
                                 )
                                 _revision_compatible(
                                     previous, temp_record, source_hashes=hashes,
                                     media_manifest_sha=desired_media_sha,
                                 )
-                                _rename_exchange(destination_chat, temp_name, str(topic))
+                                _rename_exchange(destination_chat, temp_name, scope_dir)
                                 _archive_displaced(
                                     destination_chat, temp_name, source_id=source_id,
                                     uid=config["destination_uid"], source_hashes=hashes,
                                     desired_media_sha=desired_media_sha,
                                 )
                                 final_status = _staged_status(
-                                    destination_chat, str(topic), source_id,
+                                    destination_chat, scope_dir, source_id,
                                     dest_uid=config["destination_uid"],
                                 )
+                                os.fsync(destination_chat)
                                 return {**final_status, "status": "ready"}
                             _rename_noreplace(destination_chat, temp_name,
-                                              destination_chat, str(topic))
+                                              destination_chat, scope_dir)
+                            os.fsync(destination_chat)
                             return {**_staged_status(
-                                destination_chat, str(topic), source_id,
+                                destination_chat, scope_dir, source_id,
                                 dest_uid=config["destination_uid"],
                             ), "status": "ready"}
                         if final_status:
                             current, _ = _transfer_record(
-                                destination_chat, str(topic), uid=config["destination_uid"],
+                                destination_chat, scope_dir, uid=config["destination_uid"],
                             )
                             if (current.get("source_hashes") == hashes
                                     and current.get("media_manifest_sha256") == desired_media_sha):
@@ -1081,13 +1227,13 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                                     desired_media_sha=desired_media_sha,
                                 )
                                 final_status = _staged_status(
-                                    destination_chat, str(topic), source_id,
+                                    destination_chat, scope_dir, source_id,
                                     dest_uid=config["destination_uid"],
                                 )
                             else:
                                 _fail("TRANSFER_RECOVERY_REQUIRED")
                 if final_status:
-                    final_dir = _open_child(destination_chat, str(topic), uid=config["destination_uid"])
+                    final_dir = _open_child(destination_chat, scope_dir, uid=config["destination_uid"])
                     try:
                         transfer = json.loads(_read_file(
                             final_dir, "telegram_transfer_manifest.json",
@@ -1101,91 +1247,143 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                         final_status["status"] = "already_ready"
                         return final_status
 
-                output_records = []
-                media_plans = []
-                for row in rows:
+                def transform(row):
                     media = row.get("media")
+                    if media is None:
+                        return dict(row), None, False
                     if not isinstance(media, dict):
-                        output_records.append(dict(row))
-                        continue
+                        _fail("MEDIA_METADATA_INVALID")
                     mid = str(row["message_id"])
-                    source_media = dict(media)
-                    staged_row = dict(row)
-                    staged_media = dict(media)
-                    # A later resume checkpoint may resolve an earlier skip;
-                    # prefer that immutable sidecar revision over stale row metadata.
                     record = media if media.get("path") else record_map.get(mid, media)
                     if not isinstance(record, dict):
                         _fail("MEDIA_EXPORT_INCOMPLETE")
+                    staged_row = dict(row)
+                    staged_media = dict(media)
                     if record.get("export_status") == "downloaded" and record.get("path"):
                         checked = _validate_media_reference(
                             source, record, row["message_id"], source_uid=config["source_uid"],
                             max_file_bytes=max_file,
                         )
-                        staged_path = f"media/{mid}/{checked['name']}"
                         staged_media.update({
-                            "path": staged_path, "size": checked["size"],
-                            "size_bytes": checked["size"], "sha256": checked["sha256"],
-                            "max_file_bytes": checked["limit"], "export_status": "downloaded",
+                            "path": f"media/{mid}/{checked['name']}",
+                            "size": checked["size"], "size_bytes": checked["size"],
+                            "sha256": checked["sha256"], "max_file_bytes": checked["limit"],
+                            "export_status": "downloaded",
                         })
                         staged_media.pop("reason", None)
-                        media_plans.append((record, row["message_id"], staged_path,
-                                            checked["size"], checked["sha256"], checked["limit"]))
-                    elif record.get("export_status") == "skipped":
-                        reason = record.get("reason")
-                        if reason not in ALLOWED_SKIP_REASONS:
-                            _fail("MEDIA_SKIP_REASON_INVALID")
-                        staged_media.pop("path", None)
-                        staged_media.update({
-                            "export_status": "skipped", "reason": reason,
-                            "size_bytes": record.get("size_bytes", source_media.get("size_bytes")),
-                            "size_source": record.get("size_source", source_media.get("size_source")),
-                        })
-                    else:
+                        staged_row["media"] = staged_media
+                        return staged_row, (record, row["message_id"], checked), False
+                    if record.get("export_status") != "skipped":
                         _fail("MEDIA_RECORD_INVALID")
+                    reason = record.get("reason")
+                    if reason not in ALLOWED_SKIP_REASONS:
+                        _fail("MEDIA_SKIP_REASON_INVALID")
+                    staged_media.pop("path", None)
+                    staged_media.update({
+                        "export_status": "skipped", "reason": reason,
+                        "size_bytes": record.get("size_bytes", media.get("size_bytes")),
+                        "size_source": record.get("size_source", media.get("size_source")),
+                    })
                     staged_row["media"] = staged_media
-                    output_records.append(staged_row)
+                    return staged_row, None, True
 
-                copied_media = len(media_plans)
-                skipped_media = sum(1 for row in output_records
-                                    if isinstance(row.get("media"), dict)
-                                    and row["media"].get("export_status") == "skipped")
+                transformed_bytes = 0
+                media_bytes = 0
+                copied_media = 0
+                skipped_media = 0
+                for row in _validated_message_rows(
+                    source, chat=chat, topic=topic_id, scope=scope,
+                    uid=config["source_uid"],
+                ):
+                    staged_row, plan, skipped = transform(row)
+                    transformed_bytes += len(json.dumps(
+                        staged_row, ensure_ascii=False, separators=(",", ":"),
+                    ).encode()) + 1
+                    if plan:
+                        copied_media += 1
+                        media_bytes += plan[2]["size"]
+                    skipped_media += int(skipped)
                 limit_bytes = max_file or MAX_FILE_BYTES
-                staged_messages = b"".join(
-                    json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
-                    for row in output_records
-                )
-                required = (sum(len(v) for v in controls.values()) + len(staged_messages)
-                            + sum(plan[3] for plan in media_plans)
-                            + 16 * 1024 + 4096 * len(media_plans))
+                required = (transformed_bytes + sizes["services.jsonl"] + media_bytes
+                            + len(manifest_bytes) + len(services_bytes) + 16 * 1024
+                            + 4096 * copied_media)
                 available, free, used = _available(config)
                 _check_pipeline_storage(available, required)
                 if temp_name in os.listdir(destination_chat):
                     _fail("TRANSFER_RECOVERY_REQUIRED")
-                temp = _new_topic_dir(destination_chat, temp_name,
+                init_name = ".publisher-init-" + uuid.uuid4().hex
+                init = _new_topic_dir(destination_chat, init_name,
                                       uid=config["destination_uid"], gid=config["destination_gid"])
                 try:
-                    _write_file(temp, ".publisher-temp.json", (json.dumps({
+                    _write_file(init, ".publisher-temp.json", (json.dumps({
                         "source_id": source_id, "source_hashes": hashes,
                         "media_manifest_sha256": desired_media_sha,
                     }, sort_keys=True) + "\n").encode(), uid=config["destination_uid"],
                                 gid=config["destination_gid"])
+                    os.fsync(init)
+                    os.fsync(destination_chat)
+                finally:
+                    os.close(init)
+                _rename_noreplace(destination_chat, init_name, destination_chat, temp_name)
+                os.fsync(destination_chat)
+                temp = _open_child(destination_chat, temp_name, uid=config["destination_uid"])
+                try:
                     staged_media = []
-                    for record, mid, staged_path, expected_size, expected_sha, max_bytes in media_plans:
-                        actual_path, copied_size, copied_digest = _copy_media_reference(
-                            source, temp, record, mid, source_uid=config["source_uid"],
-                            dest_uid=config["destination_uid"], dest_gid=config["destination_gid"],
-                            max_file_bytes=max_bytes,
-                        )
-                        if (actual_path != staged_path or copied_size != expected_size
-                                or copied_digest != expected_sha):
-                            _fail("STAGED_MEDIA_REFERENCE_INVALID")
-                        staged_media.append({"message_id": mid, "path": staged_path,
-                                             "size": copied_size, "sha256": copied_digest})
-                    staged_message_sha = _sha(staged_messages)
+                    message_fd = os.open(
+                        "messages.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=temp,
+                    )
+                    os.fchown(message_fd, config["destination_uid"], config["destination_gid"])
+                    os.fchmod(message_fd, 0o600)
+                    message_digest = hashlib.sha256()
+                    actual_count = 0
+                    try:
+                        for row in _validated_message_rows(
+                            source, chat=chat, topic=topic_id, scope=scope,
+                            uid=config["source_uid"],
+                        ):
+                            staged_row, plan, skipped = transform(row)
+                            encoded = (json.dumps(staged_row, ensure_ascii=False,
+                                                  separators=(",", ":")) + "\n").encode()
+                            view = memoryview(encoded)
+                            while view:
+                                written = os.write(message_fd, view)
+                                view = view[written:]
+                            message_digest.update(encoded)
+                            actual_count += 1
+                            if plan:
+                                record, mid, checked = plan
+                                staged_path, copied_size, copied_digest = _copy_media_reference(
+                                    source, temp, record, mid, source_uid=config["source_uid"],
+                                    dest_uid=config["destination_uid"],
+                                    dest_gid=config["destination_gid"],
+                                    max_file_bytes=checked["limit"],
+                                )
+                                if (staged_path != staged_row["media"]["path"]
+                                        or copied_size != checked["size"]
+                                        or copied_digest != checked["sha256"]):
+                                    _fail("STAGED_MEDIA_REFERENCE_INVALID")
+                                staged_media.append({"message_id": mid, "path": staged_path,
+                                                     "size": copied_size, "sha256": copied_digest})
+                        os.fsync(message_fd)
+                    finally:
+                        os.close(message_fd)
+                    if actual_count != source_manifest["message_count"]:
+                        _fail("MESSAGE_COUNT_MISMATCH")
+                    staged_message_sha = message_digest.hexdigest()
+                    service_size, service_sha = _copy_control(
+                        source, "services.jsonl", temp,
+                        source_uid=config["source_uid"],
+                        dest_uid=config["destination_uid"], dest_gid=config["destination_gid"],
+                        expected_size=sizes["services.jsonl"],
+                        expected_sha=hashes["services.jsonl"], maximum=MAX_CONTROL_BYTES,
+                    )
+                    if service_size != sizes["services.jsonl"] or service_sha != hashes["services.jsonl"]:
+                        _fail("SERVICES_HASH_MISMATCH")
                     staged_manifest = dict(source_manifest)
                     staged_manifest.update({
                         "messages_sha256": staged_message_sha,
+                        "scope": scope,
                         "media_requested": True,
                         "max_file_bytes": limit_bytes,
                         "max_file_size_unit": "bytes",
@@ -1202,25 +1400,19 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                     staged_manifest_bytes = (json.dumps(staged_manifest, ensure_ascii=False,
                                                         sort_keys=True) + "\n").encode()
                     service_count = service_manifest["event_count"]
-                    for filename, payload in (
-                        ("messages.jsonl", staged_messages),
-                        ("services.jsonl", controls["services.jsonl"]),
-                        ("manifest.json", staged_manifest_bytes),
-                        ("services_manifest.json", controls["services_manifest.json"]),
-                    ):
-                        _write_file(temp, filename, payload, uid=config["destination_uid"],
-                                    gid=config["destination_gid"])
+                    _write_file(temp, "manifest.json", staged_manifest_bytes,
+                                uid=config["destination_uid"], gid=config["destination_gid"])
+                    _write_file(temp, "services_manifest.json", services_bytes,
+                                uid=config["destination_uid"], gid=config["destination_gid"])
                     if media_manifest:
                         _write_file(temp, "media_manifest.json",
                                     (json.dumps(media_manifest, sort_keys=True) + "\n").encode(),
                                     uid=config["destination_uid"], gid=config["destination_gid"])
                     staged_hashes = {
-                        name: _sha(payload) for name, payload in (
-                            ("messages.jsonl", staged_messages),
-                            ("services.jsonl", controls["services.jsonl"]),
-                            ("manifest.json", staged_manifest_bytes),
-                            ("services_manifest.json", controls["services_manifest.json"]),
-                        )
+                        "messages.jsonl": staged_message_sha,
+                        "services.jsonl": service_sha,
+                        "manifest.json": _sha(staged_manifest_bytes),
+                        "services_manifest.json": _sha(services_bytes),
                     }
                     transfer = {
                         "version": 1, "source_id": source_id, "source_hashes": hashes,
@@ -1255,7 +1447,7 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                     _fail("STAGING_REVISION_INVALID")
                 if final_status:
                     previous, _ = _transfer_record(
-                        destination_chat, str(topic), uid=config["destination_uid"],
+                        destination_chat, scope_dir, uid=config["destination_uid"],
                     )
                     candidate, _ = _transfer_record(
                         destination_chat, temp_name, uid=config["destination_uid"],
@@ -1264,14 +1456,14 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
                         previous, candidate, source_hashes=hashes,
                         media_manifest_sha=desired_media_sha,
                     )
-                    _rename_exchange(destination_chat, temp_name, str(topic))
+                    _rename_exchange(destination_chat, temp_name, scope_dir)
                     _archive_displaced(
                         destination_chat, temp_name, source_id=source_id,
                         uid=config["destination_uid"], source_hashes=hashes,
                         desired_media_sha=desired_media_sha,
                     )
                 else:
-                    _rename_noreplace(destination_chat, temp_name, destination_chat, str(topic))
+                    _rename_noreplace(destination_chat, temp_name, destination_chat, scope_dir)
                 os.fsync(destination_chat)
                 return {
                     "source_id": source_id, "status": "ready",
@@ -1295,8 +1487,7 @@ def _atomic_publish(source_id: str, chat: str, topic: int, config: dict):
 def handle(action: str, source_id: str, *, config_path: str) -> dict:
     if os.geteuid() == 0:
         _fail("ROOT_EXECUTION_FORBIDDEN")
-    chat, topic_raw = _source_parts(source_id)
-    topic = int(topic_raw)
+    chat, scope_dir = _source_parts(source_id)
     config = _safe_config(config_path)
     _check_mount(config)
     if action == "budget":
@@ -1306,7 +1497,7 @@ def handle(action: str, source_id: str, *, config_path: str) -> dict:
                 "min_free_bytes": config["min_free_bytes"], "free_bytes": free,
                 "used_bytes": used, "max_file_bytes": min(MAX_FILE_BYTES, available)}
     if action == "copy":
-        return _atomic_publish(source_id, chat, topic, config)
+        return _atomic_publish(source_id, chat, scope_dir, config)
     if action == "status":
         source_root, destination_root = _storage_roots(config)
         try:
@@ -1316,7 +1507,7 @@ def handle(action: str, source_id: str, *, config_path: str) -> dict:
             except FileNotFoundError:
                 return {"source_id": source_id, "status": "not_staged"}
             try:
-                status = _staged_status(destination_chat, topic_raw, source_id,
+                status = _staged_status(destination_chat, scope_dir, source_id,
                                         dest_uid=config["destination_uid"])
                 return status or {"source_id": source_id, "status": "not_staged"}
             finally:

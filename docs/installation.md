@@ -64,8 +64,11 @@ Pass an explicit archive URI, chat identifier, and topic scope. The application 
 ## Telegram exporter and publisher
 
 The Python package installs `kiber-analyst-telegram-export` and
-`kiber-analyst-telegram-publish`. They require an operator-installed compatible
-Telegram CLI and an account already authorized on that machine. Configure the
+`kiber-analyst-telegram-publish`. The supported Telegram CLI is Better-TG-CLI
+v0.41.2 (Node.js >=20): `npm install --global better-tg-cli@0.41.2`; verify with
+`telegram --version`. The integration uses its `info`, `read`, `api`, forum
+topic lookup and `download` command interfaces. It requires an account already
+authorized on that machine. Configure the
 private file paths, storage quota, and optional mounted-filesystem UUID from
 [`config/telegram-export.example.json`](../config/telegram-export.example.json)
 and [`config/telegram-publisher.example.json`](../config/telegram-publisher.example.json).

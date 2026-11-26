@@ -439,13 +439,13 @@ def test_revoked_project_hides_status_and_cancels_and_job_list(control):
     assert jobs[request["job_id"]]["state"] == "queued"
 
 
-def test_capabilities_do_not_claim_kiber_controls_telegram_export(control):
+def test_capabilities_report_group_and_topic_export_scopes(control):
     app, *_ = control
     telegram = app.handle("client", "capabilities")["providers"]["telegram"]
     assert telegram["export"]["available_via_separate_interface"] is True
     assert telegram["export"]["invoked_by_kiber_broker"] is False
     assert "register_complete_topic_export" in telegram["operations"]
-    assert telegram["scopes"] == {"topic": True, "group": False}
+    assert telegram["scopes"] == {"topic": True, "group": True}
 
 
 def test_static_source_does_not_grant_project_wide_access(control):

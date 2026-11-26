@@ -20,14 +20,40 @@ def setup(tmp_path, monkeypatch):
     src = tmp_path / 'imports' / '-1009000' / '1'
     payload = b'synthetic audio'
     media = {'path': 'media/1/a.ogg', 'size': len(payload),
-             'sha256': hashlib.sha256(payload).hexdigest()}
-    files = {'messages.jsonl': (json.dumps({'message_id': 1, 'media': media}) + '\n').encode(),
-             'services.jsonl': b'fixture event\n',
-             'manifest.json': json.dumps({'source_id': SOURCE}).encode()}
-    hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
-    files['services_manifest.json'] = json.dumps({
-        'source_id': SOURCE, 'complete': True, 'services_sha256': hashes['services.jsonl'],
-    }).encode()
+             'sha256': hashlib.sha256(payload).hexdigest(),
+             'type': 'voice_message', 'size_bytes': len(payload),
+             'max_file_bytes': broker.DEFAULT_TELEGRAM_MEDIA_BYTES}
+    messages = (json.dumps({
+        'chat_id': '-1009000', 'date': '2026-01-01T00:00:00Z',
+        'message_id': 1, 'media': media, 'reply_to_message_id': None,
+        'sender_id': 1, 'sender_name': 'Fixture author',
+        'text': 'Fixture transcript source', 'topic_id': 1,
+    }, separators=(',', ':')) + '\n').encode()
+    services = b''
+    hashes = {
+        'messages.jsonl': hashlib.sha256(messages).hexdigest(),
+        'services.jsonl': hashlib.sha256(services).hexdigest(),
+    }
+    manifest = {
+        'export_version': 1, 'source_id': SOURCE, 'chat_id': '-1009000',
+        'topic_id': 1, 'scope': 'topic', 'scope_before': None,
+        'complete': True, 'range_complete': True, 'errors': [],
+        'media_requested': True, 'max_file_bytes': broker.DEFAULT_TELEGRAM_MEDIA_BYTES,
+        'message_count': 1, 'messages_sha256': hashes['messages.jsonl'],
+    }
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + '\n').encode()
+    hashes['manifest.json'] = hashlib.sha256(manifest_bytes).hexdigest()
+    files = {
+        'messages.jsonl': messages,
+        'services.jsonl': services,
+        'manifest.json': manifest_bytes,
+        'services_manifest.json': (json.dumps({
+            'source_id': SOURCE, 'chat_id': -1009000, 'topic_id': 1,
+            'scope': 'topic', 'complete': True, 'range_complete': True,
+            'scope_before': None, 'errors': [], 'event_count': 0,
+            'services_sha256': hashes['services.jsonl'],
+        }, sort_keys=True) + '\n').encode(),
+    }
     for directory in (src / 'media/1', tmp_path / 'broker', tmp_path / 'imports/.broker'):
         directory.mkdir(parents=True)
         for ancestor in (directory, *directory.parents):
@@ -99,7 +125,7 @@ def test_media_items_enforces_export_ceiling_not_asr_ceiling(size):
         },
     }
 
-    assert broker.media_items((json.dumps(row) + "\n").encode(), 4_000_000_000) == [
+    assert list(broker.media_items((json.dumps(row) + "\n").encode(), 4_000_000_000)) == [
         (["media", "9", "payload.bin"], size, "a" * 64)
     ]
 
@@ -111,7 +137,7 @@ def test_media_items_rejects_size_above_selected_or_absolute_limit():
             "max_file_bytes": selected, "sha256": "b" * 64,
         }}
         with pytest.raises(broker.Refused, match="UNSAFE_MEDIA"):
-            broker.media_items((json.dumps(row) + "\n").encode(), 4_000_000_000)
+            list(broker.media_items((json.dumps(row) + "\n").encode(), 4_000_000_000))
 
 
 def test_media_items_cannot_exceed_the_selected_manifest_limit():
@@ -120,12 +146,12 @@ def test_media_items_cannot_exceed_the_selected_manifest_limit():
         "max_file_bytes": 4_000_000_000, "sha256": "c" * 64,
     }}
     with pytest.raises(broker.Refused, match="UNSAFE_MEDIA"):
-        broker.media_items((json.dumps(row) + "\n").encode(), 100)
+        list(broker.media_items((json.dumps(row) + "\n").encode(), 100))
 
     row["media"]["size"] = DEFAULT_TELEGRAM_MEDIA_BYTES + 1
     row["media"]["max_file_bytes"] = DEFAULT_TELEGRAM_MEDIA_BYTES + 1
     with pytest.raises(broker.Refused, match="UNSAFE_MEDIA"):
-        broker.media_items((json.dumps(row) + "\n").encode())
+        list(broker.media_items((json.dumps(row) + "\n").encode()))
 
 
 def test_retry_requires_transient_classification_and_stops_at_three(setup):
@@ -345,7 +371,7 @@ def test_invalid_input_leaves_no_staging_or_request(setup, kind):
         source = 'telegram:-100777:topic:1'
     else:
         source = '../private'
-    expected = OSError if kind == 'symlink' else broker.Refused
+    expected = broker.Refused
     with pytest.raises(expected):
         app.handle('client', 'ingest', source)
     assert not argv

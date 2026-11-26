@@ -112,6 +112,58 @@ def _fixture(root: Path) -> Path:
     return topic
 
 
+def _scope_fixture(root: Path, *, chat_id: str, scope: str, topic_id: int | None) -> Path:
+    scope_dir = "group" if scope == "chat" else str(topic_id)
+    source_id = f"telegram:{chat_id}:group" if scope == "chat" else f"telegram:{chat_id}:topic:{topic_id}"
+    directory = root / chat_id / scope_dir
+    directory.mkdir(mode=0o700, parents=True)
+    directory.chmod(0o700)
+    actual_topics = [None] if scope == "topic" else ([None] if topic_id is None else [17, 18])
+    messages = [
+        {
+            "chat_id": chat_id,
+            "date": "2026-01-02T03:04:05Z",
+            "message_id": 500 + index,
+            "media": None,
+            "reply_to_message_id": None,
+            "sender_id": 77,
+            "sender_name": "Scope fixture",
+            "text": f"scope fixture {scope} {actual_topic}",
+            "topic_id": topic_id if scope == "topic" else actual_topic,
+        }
+        for index, actual_topic in enumerate(actual_topics)
+    ]
+    events = [
+        {
+            "actor_id": "77", "actor_name": "Scope fixture",
+            "date": "2026-01-02T03:04:05Z", "event_id": 700 + index,
+            "message_id": None, "new_value": "synthetic service event", "old_value": None,
+            "raw_action": "synthetic", "target_id": None, "target_name": None,
+            "topic_id": topic_id if scope == "topic" else actual_topic, "type": "unknown",
+        }
+        for index, actual_topic in enumerate(actual_topics)
+    ]
+    message_bytes = b"".join(_json_bytes(row) for row in messages)
+    service_bytes = b"".join(_json_bytes(row) for row in events)
+    _write_private(directory / "messages.jsonl", message_bytes)
+    _write_private(directory / "services.jsonl", service_bytes)
+    _write_private(directory / "manifest.json", _json_bytes({
+        "chat_id": chat_id, "chat_title": "Synthetic group", "complete": True,
+        "export_version": 1, "max_file_bytes": 104857600,
+        "messages_sha256": hashlib.sha256(message_bytes).hexdigest(),
+        "message_count": len(messages), "scope": scope, "scope_before": None,
+        "source_id": source_id, "topic_id": topic_id if scope == "topic" else None,
+        "topic_title": "Synthetic topic" if topic_id is not None else None,
+    }))
+    _write_private(directory / "services_manifest.json", _json_bytes({
+        "chat_id": int(chat_id), "complete": True, "errors": [],
+        "event_count": len(events), "range_complete": True, "scope": scope,
+        "scope_before": None, "services_sha256": hashlib.sha256(service_bytes).hexdigest(),
+        "source_id": source_id, "topic_id": topic_id if scope == "topic" else None,
+    }))
+    return directory
+
+
 def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(
     tmp_path: Path,
     disposable_postgres_credentials: dict[str, str],
@@ -178,6 +230,109 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(
             "SELECT count(*) FROM runs WHERE project_id=%s AND kind='telegram_ingest' AND status='done'",
             (project_id,),
         ).fetchone()[0] == 1
+
+
+def test_group_forum_group_and_topic_scopes_load_with_provenance(
+    tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
+) -> None:
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    cases = (
+        ("chat", None, f"-100{uuid.uuid4().int % 10**15 + 1}", 1),
+        ("chat", 17, f"-100{uuid.uuid4().int % 10**15 + 1}", 2),
+        ("topic", 17, f"-100{uuid.uuid4().int % 10**15 + 1}", 1),
+    )
+    for scope, topic_id, chat_id, expected_count in cases:
+        project = f"kiber-scope-{uuid.uuid4().hex[:12]}"
+        root = tmp_path / project
+        source = _scope_fixture(root, chat_id=chat_id, scope=scope, topic_id=topic_id)
+        dry = load_telegram_export(
+            source, tmp_path / "artifacts" / f"{project}-dry",
+            env_path=Path(TEST_ENV), project_slug=project, dry_run=True, root=root,
+        )
+        assert dry["status"] == "dry_run" and dry["rollback_confirmed"] is True
+        first = load_telegram_export(
+            source, tmp_path / "artifacts" / f"{project}-real",
+            env_path=Path(TEST_ENV), project_slug=project, root=root,
+        )
+        repeated = load_telegram_export(
+            source, tmp_path / "artifacts" / f"{project}-repeat",
+            env_path=Path(TEST_ENV), project_slug=project, root=root,
+        )
+        assert first["inserted"] == expected_count
+        assert first["service_events_inserted"] == expected_count
+        assert repeated["inserted"] == 0 and repeated["service_events_skipped"] == expected_count
+        with _connect(disposable_postgres_credentials) as conn:
+            rows = conn.execute(
+                """SELECT seg.external_ref, seg.meta->>'topic_id', seg.meta->>'export_scope'
+                   FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+                   JOIN sources src ON src.id=doc.source_id JOIN projects p ON p.id=src.project_id
+                   WHERE p.slug=%s ORDER BY seg.external_ref""",
+                (project,),
+            ).fetchall()
+            assert len(rows) == expected_count
+            assert all(row[2] == scope for row in rows)
+            assert conn.execute(
+                """SELECT count(*) FROM telegram_service_events ev
+                   JOIN sources src ON src.id=ev.source_id JOIN projects p ON p.id=src.project_id
+                   WHERE p.slug=%s""",
+                (project,),
+            ).fetchone()[0] == expected_count
+            if scope == "chat" and topic_id is not None:
+                assert {row[1] for row in rows} == {"17", "18"}
+            elif scope == "topic":
+                assert {row[1] for row in rows} == {str(topic_id)}
+            else:
+                assert rows[0][1] is None
+
+
+def test_group_export_refuses_overlapping_topic_in_another_project_without_mutation(
+    tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
+) -> None:
+    from kiber_analyst.errors import LoadError
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    chat_id = f"-100{uuid.uuid4().int % 10**15 + 1}"
+    project_a = f"kiber-group-owner-{uuid.uuid4().hex[:8]}"
+    project_b = f"kiber-topic-target-{uuid.uuid4().hex[:8]}"
+    root = tmp_path / "shared-source"
+    group_export = _scope_fixture(root, chat_id=chat_id, scope="chat", topic_id=17)
+    topic_export = _scope_fixture(root, chat_id=chat_id, scope="topic", topic_id=17)
+
+    first = load_telegram_export(
+        group_export, tmp_path / "artifacts" / "group-owner", env_path=Path(TEST_ENV),
+        project_slug=project_a, root=root,
+    )
+    assert first["inserted"] == 2
+    with _connect(disposable_postgres_credentials) as conn:
+        before = conn.execute(
+            """SELECT seg.external_ref, seg.document_id, seg.text, seg.meta::text
+               FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+               JOIN sources src ON src.id=doc.source_id JOIN projects p ON p.id=src.project_id
+               WHERE p.slug=%s ORDER BY seg.external_ref""",
+            (project_a,),
+        ).fetchall()
+    with pytest.raises(LoadError, match="TELEGRAM_PROJECT_CONFLICT"):
+        load_telegram_export(
+            topic_export, tmp_path / "artifacts" / "topic-conflict", env_path=Path(TEST_ENV),
+            project_slug=project_b, root=root,
+        )
+    with _connect(disposable_postgres_credentials) as conn:
+        after = conn.execute(
+            """SELECT seg.external_ref, seg.document_id, seg.text, seg.meta::text
+               FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+               JOIN sources src ON src.id=doc.source_id JOIN projects p ON p.id=src.project_id
+               WHERE p.slug=%s ORDER BY seg.external_ref""",
+            (project_a,),
+        ).fetchall()
+        assert after == before
+        assert conn.execute(
+            "SELECT count(*) FROM projects WHERE slug=%s", (project_b,),
+        ).fetchone()[0] == 0
 
 
 def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
@@ -396,6 +551,7 @@ def test_concurrent_same_chat_import_keeps_project_a_unchanged(
 def test_sequential_export_revisions_keep_both_media_and_loaded_data(
     tmp_path: Path,
     disposable_postgres_credentials: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from telegram_pipeline_support import build_partial_media_revisions
 
@@ -403,6 +559,8 @@ def test_sequential_export_revisions_keep_both_media_and_loaded_data(
     from kiber_analyst.telegram_ingest import load_telegram_export
 
     assert TEST_ENV is not None
+    # Synthetic integration data is not subject to the production shared-storage reserve.
+    monkeypatch.setattr(broker, "RESERVE", 0)
     project_slug = f"kiber-media-revision-{uuid.uuid4().hex[:10]}"
     chat_id = f"-100{uuid.uuid4().int % 10**15 + 1}"
     package: dict[str, object] = {}
