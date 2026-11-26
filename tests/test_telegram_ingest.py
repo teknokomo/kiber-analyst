@@ -238,6 +238,63 @@ def test_media_record_cannot_exceed_manifest_selected_limit(tmp_path: Path) -> N
         prepare_export(topic, tmp_path / "artifacts" / "too-large-media-limit", root=root)
 
 
+def test_resumed_media_uses_checkpoint_limit_and_preserves_voice_type(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root)
+    message_path = topic / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"] = {
+        "type": "voice_message", "size": 101, "max_file_bytes": 100,
+        "export_status": "skipped", "reason": "over_limit",
+    }
+    messages = _json_bytes(message)
+    _write_private(message_path, messages)
+    manifest_path = topic / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        messages_sha256=hashlib.sha256(messages).hexdigest(),
+        max_file_bytes=100,
+    )
+    manifest_bytes = _json_bytes(manifest)
+    _write_private(manifest_path, manifest_bytes)
+
+    resume_dir = topic / "media-resume"
+    resume_dir.mkdir(mode=0o700)
+    media_dir = resume_dir / "101"
+    media_dir.mkdir(mode=0o700)
+    payload = b"x" * 101
+    _write_private(media_dir / "audio.ogg", payload)
+    checkpoint = {
+        "version": 2,
+        "source_id": SOURCE_ID,
+        "inputs": {
+            "messages.jsonl": hashlib.sha256(messages).hexdigest(),
+            "services.jsonl": hashlib.sha256((topic / "services.jsonl").read_bytes()).hexdigest(),
+            "manifest.json": hashlib.sha256(manifest_bytes).hexdigest(),
+        },
+        "requested_max_file_bytes": 101,
+        "records": {"101": {
+            "export_status": "downloaded", "path": "media-resume/101/audio.ogg",
+            "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            "max_file_bytes": 101,
+        }},
+    }
+    _write_private(resume_dir / "status.json", _json_bytes(checkpoint))
+    (resume_dir / "status.json").chmod(0o600)
+
+    artifact_dir, _, media_missing = prepare_export(
+        topic, tmp_path / "artifacts" / "resumed-large-voice", root=root,
+    )
+    normalized = json.loads(
+        (artifact_dir / "normalized" / "messages.jsonl").read_text(encoding="utf-8")
+    )
+
+    assert media_missing == 0
+    assert normalized["media_type"] == "voice_message"
+    assert normalized["media_path"] == "media-resume/101/audio.ogg"
+    assert normalized["meta"]["media_export"]["max_file_bytes"] == 101
+
+
 def test_exporter_media_kind_is_normalized_to_media_type(tmp_path: Path) -> None:
     root = tmp_path / "telegram"
     topic = _make_export(root, media=True)

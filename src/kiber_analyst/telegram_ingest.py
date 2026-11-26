@@ -302,7 +302,14 @@ def inspect_export(
     )
 
 
-def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed: bool = False) -> tuple[str | None, str | None, bool, dict[str, Any]]:
+def _media_info(
+    export: TelegramExport,
+    message_id: int,
+    value: Any,
+    *,
+    resumed: bool = False,
+    selected_limit: int | None = None,
+) -> tuple[str | None, str | None, bool, dict[str, Any]]:
     if value is None:
         return None, None, False, {}
     if not isinstance(value, dict):
@@ -338,7 +345,8 @@ def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed:
         validate_telegram_media_limit(limit)
     except ValueError:
         raise LoadError("Telegram media size limit is invalid") from None
-    if limit > export.max_file_bytes:
+    limit_ceiling = export.max_file_bytes if selected_limit is None else selected_limit
+    if limit > limit_ceiling:
         raise LoadError("Telegram media size limit exceeds its manifest")
     if type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES or size > limit:
         raise LoadError("Telegram media size is outside the supported limit")
@@ -366,11 +374,17 @@ def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed:
     return media_type, relative, False, safe_meta
 
 
-def _normalize_message(export: TelegramExport, value: dict[str, Any], resumed_media: dict | None = None) -> tuple[dict[str, Any], bool]:
+def _normalize_message(
+    export: TelegramExport,
+    value: dict[str, Any],
+    resumed_media: dict | None = None,
+    resumed_limit: int | None = None,
+) -> tuple[dict[str, Any], bool]:
     message_id = value["message_id"]
     media_type, media_path, media_missing, media_meta = _media_info(
         export, message_id, resumed_media if resumed_media is not None else value.get("media"),
         resumed=resumed_media is not None,
+        selected_limit=resumed_limit if resumed_media is not None else None,
     )
     if resumed_media is not None and media_missing:
         raise LoadError("Media resume file is missing")
@@ -443,7 +457,9 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
         with os.fdopen(fd, "wb") as output:
             for raw, item in _iter_jsonl(export.path / "messages.jsonl"):
                 messages_digest.update(raw)
-                normalized, missing = _normalize_message(export, item, recovered.get(item["message_id"]))
+                normalized, missing = _normalize_message(
+                    export, item, recovered.get(item["message_id"]), media_limit_bytes,
+                )
                 encoded = (json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
                 output.write(encoded)
                 normalized_count += 1

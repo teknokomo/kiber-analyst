@@ -86,3 +86,37 @@ def test_media_resume_rejects_record_limit_above_export_limit():
 
     with pytest.raises(LoadError, match="unsafe path or checksum"):
         resumed_media(checkpoint, hashes, messages)
+
+
+def test_media_resume_keeps_source_audio_type_when_receipt_omits_it():
+    hashes = {"messages.jsonl": "f" * 64}
+    checkpoint = json.dumps({
+        "inputs": hashes,
+        "requested_max_file_bytes": 101,
+        "records": {"7": {
+            "export_status": "downloaded", "path": "media-resume/7/file.ogg",
+            "size": 101, "sha256": "a" * 64, "max_file_bytes": 101,
+        }},
+    }).encode()
+    messages = [{"message_id": 7, "media": {"type": "voice_message"}}]
+
+    result = resumed_media(checkpoint, hashes, messages)
+
+    assert result[7]["type"] == "voice_message"
+
+
+def test_media_resume_rejects_receipt_type_conflicting_with_source():
+    hashes = {"messages.jsonl": "0" * 64}
+    checkpoint = json.dumps({
+        "inputs": hashes,
+        "requested_max_file_bytes": 101,
+        "records": {"7": {
+            "export_status": "downloaded", "path": "media-resume/7/file.ogg",
+            "size": 101, "sha256": "a" * 64, "max_file_bytes": 101,
+            "type": "document",
+        }},
+    }).encode()
+    messages = [{"message_id": 7, "media": {"type": "voice_message"}}]
+
+    with pytest.raises(LoadError, match="unsafe path or checksum"):
+        resumed_media(checkpoint, hashes, messages)

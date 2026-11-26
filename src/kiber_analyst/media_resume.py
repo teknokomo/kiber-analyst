@@ -58,7 +58,17 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
         filename = receipt.get("path")
         size, digest = receipt.get("size"), receipt.get("sha256")
         limit = receipt.get("max_file_bytes", requested_limit)
-        media_type = receipt.get("type", receipt.get("kind", missing[mid].get("kind")))
+        source_media = missing[mid]
+        source_type = next(
+            (source_media[key] for key in ("type", "media_type", "kind")
+             if source_media.get(key) is not None),
+            None,
+        )
+        media_type = next(
+            (receipt[key] for key in ("type", "media_type", "kind")
+             if receipt.get(key) is not None),
+            source_type,
+        )
         if (
             status != "downloaded"
             or not isinstance(filename, str)
@@ -70,9 +80,9 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
             or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
             or (media_type is not None and (not isinstance(media_type, str)
                 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", media_type)))
-            or (missing[mid].get("kind") is not None
+            or (source_type is not None
                 and media_type is not None
-                and missing[mid]["kind"] != media_type)
+                and source_type != media_type)
         ):
             raise LoadError("Media resume receipt has an unsafe path or checksum")
         result[int(mid)] = {
