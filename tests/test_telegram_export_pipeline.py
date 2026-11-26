@@ -768,12 +768,22 @@ def test_pinned_better_tg_cli_mock_download_uses_only_local_write_exception(
     cli = os.environ.get("KIBER_BETTER_TG_CLI_BIN")
     if not cli:
         pytest.skip("CI or operator must provide the pinned Better-TG-CLI executable")
+    import shutil
     import subprocess
 
     home = tmp_path / "telegram-home"
     home.mkdir(mode=0o700)
     home.chmod(0o700)
     client = Client({"telegram_cli": cli, "telegram_home": str(home)})
+    assert client.env["PATH"] == "/usr/bin:/bin"
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required to run the pinned Better-TG-CLI")
+    # GitHub setup-node exposes Node from its tool cache, while the service
+    # intentionally fixes PATH to /usr/bin:/bin. Keep the production default
+    # assertion above and add the CI-managed Node directory only for this
+    # isolated CLI integration test.
+    client.env["PATH"] = f"{Path(node).resolve().parent}:/usr/bin:/bin"
     client.env["TG_MOCK"] = "1"
     client.env["TG_NO_UPDATE_CHECK"] = "1"
     with pytest.raises(ExportError, match="Unsafe Telegram CLI permission override"):
