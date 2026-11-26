@@ -11,7 +11,12 @@ from typing import Any, Iterator
 
 from kiber_analyst.config_paths import data_path
 from kiber_analyst.errors import LoadError
-from kiber_analyst.media_resume import resumed_photos
+from kiber_analyst.media_limits import (
+    DEFAULT_TELEGRAM_MEDIA_BYTES,
+    MAX_TELEGRAM_MEDIA_BYTES,
+    validate_telegram_media_limit,
+)
+from kiber_analyst.media_resume import resumed_media
 from kiber_analyst.parse import _make_url, normalized_content_hash
 from kiber_analyst.paths import job_paths, write_json_atomic
 
@@ -44,6 +49,7 @@ class TelegramExport:
     manifest_size: int
     services_manifest_size: int
     chat_title: str | None
+    max_file_bytes: int
     services_manifest: dict[str, Any]
 
     @property
@@ -233,6 +239,12 @@ def inspect_export(
     expected_messages_sha = manifest.get("messages_sha256")
     if not isinstance(expected_messages_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_messages_sha):
         raise LoadError("Telegram message manifest has no valid SHA-256")
+    try:
+        max_file_bytes = validate_telegram_media_limit(
+            manifest.get("max_file_bytes", DEFAULT_TELEGRAM_MEDIA_BYTES)
+        )
+    except ValueError:
+        raise LoadError("Telegram manifest has an invalid media size limit") from None
     message_sha, message_count, messages_size = _scan_file(
         export_dir / "messages.jsonl",
         lambda item: _validate_message(item, chat_id, topic_id),
@@ -285,6 +297,7 @@ def inspect_export(
         manifest_size=len(manifest_bytes),
         services_manifest_size=len(service_manifest_bytes),
         chat_title=manifest.get("chat_title") if isinstance(manifest.get("chat_title"), str) else None,
+        max_file_bytes=max_file_bytes,
         services_manifest=services,
     )
 
@@ -306,7 +319,8 @@ def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed:
     relative = value.get("path")
     safe_meta = {
         key: value[key]
-        for key in ("export_status", "reason", "sha256", "size")
+        for key in ("export_status", "reason", "sha256", "size", "size_bytes",
+                    "size_source", "max_file_bytes")
         if key in value and isinstance(value[key], (str, int, bool, type(None)))
     }
     if relative is None:
@@ -318,6 +332,16 @@ def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed:
         raise LoadError("Telegram media path contains traversal")
     if len(parsed.parts) < 3 or parsed.parts[1] != str(message_id):
         raise LoadError("Telegram media path does not match its message")
+    size = value.get("size", value.get("size_bytes"))
+    limit = value.get("max_file_bytes", export.max_file_bytes)
+    try:
+        validate_telegram_media_limit(limit)
+    except ValueError:
+        raise LoadError("Telegram media size limit is invalid") from None
+    if limit > export.max_file_bytes:
+        raise LoadError("Telegram media size limit exceeds its manifest")
+    if type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES or size > limit:
+        raise LoadError("Telegram media size is outside the supported limit")
     candidate = export.path.joinpath(*parsed.parts)
     current = export.path
     for part in parsed.parts[:-1]:
@@ -378,6 +402,7 @@ def _normalize_message(export: TelegramExport, value: dict[str, Any], resumed_me
 def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_ROOT) -> tuple[Path, TelegramExport, int]:
     export = inspect_export(source, root=root)
     recovered = {}
+    media_limit_bytes = export.max_file_bytes
     resume = export.path / "media-resume"
     if resume.exists() or resume.is_symlink():
         info = resume.lstat()
@@ -387,11 +412,18 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
             checkpoint = stream.read(4 * 1024**2 + 1)
         if len(checkpoint) > 4 * 1024**2:
             raise LoadError("Media resume checkpoint is too large")
-        recovered = resumed_photos(checkpoint, {
+        recovered = resumed_media(checkpoint, {
             "messages.jsonl": export.message_sha256,
             "services.jsonl": export.service_sha256,
             "manifest.json": export.manifest_sha256,
         }, (row for _, row in _iter_jsonl(export.path / "messages.jsonl")))
+        try:
+            resume_data = json.loads(checkpoint)
+            media_limit_bytes = validate_telegram_media_limit(
+                resume_data.get("requested_max_file_bytes", export.max_file_bytes)
+            )
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            raise LoadError("Media resume checkpoint has an invalid size limit") from None
     paths = job_paths(artifact_dir)
     paths["normalized"].mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(paths["normalized"], 0o700)
@@ -436,6 +468,8 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
             "service_events_sha256": export.service_sha256,
             "media_missing_count": media_missing,
             "media_resume_count": len(recovered),
+            "media_max_file_bytes": media_limit_bytes,
+            "media_size_unit": "bytes",
             "parse": {
                 "chat_title": export.chat_title,
                 "topics": [{"topic_id": str(export.topic_id), "topic_title": export.topic_title}],

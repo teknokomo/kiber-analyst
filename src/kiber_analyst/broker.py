@@ -22,6 +22,11 @@ from kiber_analyst.config_paths import config_path, data_path, runtime_path
 from kiber_analyst.connectors.source_ids import parse_source_id
 from kiber_analyst.jobapi import api_call, submit_command
 from kiber_analyst.jobqueue import JobsError
+from kiber_analyst.media_limits import (
+    DEFAULT_TELEGRAM_MEDIA_BYTES,
+    MAX_TELEGRAM_MEDIA_BYTES,
+    validate_telegram_media_limit,
+)
 from kiber_analyst.media_resume import resumed_photos
 from kiber_analyst.project_catalog import SLUG_RE, read_project_policy
 from kiber_analyst.project_catalog import request_key as project_request_key
@@ -276,7 +281,21 @@ def copy_media(source, output, items, *, owner=None):
             os.fsync(new)
 
 
-def media_items(data):
+def _manifest_media_limit(data):
+    try:
+        manifest = json.loads(data)
+        return validate_telegram_media_limit(
+            manifest.get("max_file_bytes", DEFAULT_TELEGRAM_MEDIA_BYTES)
+        )
+    except (ValueError, AttributeError):
+        raise Refused("UNSAFE_MEDIA") from None
+
+
+def media_items(data, manifest_limit=DEFAULT_TELEGRAM_MEDIA_BYTES):
+    try:
+        validate_telegram_media_limit(manifest_limit)
+    except ValueError:
+        raise Refused("UNSAFE_MEDIA") from None
     result = []
     seen = set()
     for line in data.splitlines():
@@ -286,10 +305,13 @@ def media_items(data):
         if value is None:
             continue
         rel = parts(value)
-        size = media.get('size')
+        size = media.get('size', media.get('size_bytes'))
         digest = media.get('sha256')
+        limit = media.get('max_file_bytes', manifest_limit)
         if (len(rel) != 3 or rel[:2] != ['media', str(row['message_id'])]
-                or value in seen or type(size) is not int or not 0 < size <= 100 * 1024**2
+                or value in seen or type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES
+                or type(limit) is not int or not 0 < limit <= MAX_TELEGRAM_MEDIA_BYTES
+                or limit > manifest_limit or size > limit
                 or not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)):
             raise Refused('UNSAFE_MEDIA')
         result.append((rel, size, digest))
@@ -777,6 +799,12 @@ class Broker:
             'unsupported': ['web', 'documents', 'unimplemented connectors']}
 
     def stage(self, source_id, entry, fingerprint, chat, topic, revision=""):
+        # A media-resume checkpoint is an immutable input revision. Keep the
+        # earlier stage intact and place each later checkpoint in its own tree.
+        staging_fingerprint = (
+            hashlib.sha256((fingerprint + revision).encode()).hexdigest()
+            if revision else fingerprint
+        )
         with contextlib.ExitStack() as stack:
             fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             stack.callback(os.close, fd)
@@ -793,6 +821,7 @@ class Broker:
                 raise Refused('DATA_MISMATCH')
             if json.loads(data['manifest.json']).get('source_id') != source_id:
                 raise Refused('DATA_MISMATCH')
+            manifest_limit = _manifest_media_limit(data['manifest.json'])
             data['services_manifest.json'] = services
             base = stack.enter_context(descend(fd, ['imports', '.broker']))
             def merge(final):
@@ -806,18 +835,18 @@ class Broker:
                                             map(json.loads, data['messages.jsonl'].splitlines()))
                     publish_resume(resumed, final, checkpoint, records)
 
-            destination = self.root / 'imports' / '.broker' / fingerprint / chat / topic
+            destination = self.root / 'imports' / '.broker' / staging_fingerprint / chat / topic
             try:
-                with descend(base, [fingerprint, chat, topic]) as final:
+                with descend(base, [staging_fingerprint, chat, topic]) as final:
                     if any(read_input(final, n) != v for n, v in data.items()):
                         raise Refused('HASH_MISMATCH')
                     merge(final)
                     return destination
             except FileNotFoundError:
                 # A partially missing existing final directory is never replaced.
-                if fingerprint in os.listdir(base):
+                if staging_fingerprint in os.listdir(base):
                     raise Refused('DATA_MISMATCH') from None
-            files = media_items(data['messages.jsonl'])
+            files = media_items(data['messages.jsonl'], manifest_limit)
             free = os.fstatvfs(base)
             required = sum(size for _, size, _ in files) + sum(map(len, data.values()))
             if free.f_bavail * free.f_frsize < required + RESERVE:
@@ -835,7 +864,7 @@ class Broker:
                     os.fsync(parent)
                 with descend(base, [name]) as parent:
                     os.fsync(parent)
-                os.rename(name, fingerprint, src_dir_fd=base, dst_dir_fd=base)
+                os.rename(name, staging_fingerprint, src_dir_fd=base, dst_dir_fd=base)
                 os.fsync(base)
             return destination
 
@@ -2027,7 +2056,8 @@ class Broker:
             if hashes != entry['hashes']:
                 raise Refused('HASH_MISMATCH')
             source_rows = list(map(json.loads, controls['messages.jsonl'].splitlines()))
-            downloads = media_items(controls['messages.jsonl'])
+            manifest_limit = _manifest_media_limit(controls['manifest.json'])
+            downloads = media_items(controls['messages.jsonl'], manifest_limit)
             recovered = {}
             resume_hash = None
             try:
@@ -2040,13 +2070,16 @@ class Broker:
                 recovered = resumed_photos(checkpoint, hashes, source_rows)
             missing = set()
             over = set()
+            over_100_mib = set()
             for row in source_rows:
                 media = row.get('media')
                 if not media:
                     continue
                 mid = row['message_id']
-                if media.get('reason') == 'over_100_MiB':
+                if media.get('reason') in {'over_100_MiB', 'over_limit'}:
                     over.add(mid)
+                if media.get('reason') == 'over_100_MiB':
+                    over_100_mib.add(mid)
                 if mid not in recovered and media.get('path') is None:
                     missing.add(mid)
             verify_hashes = command == 'reindex'
@@ -2062,9 +2095,11 @@ class Broker:
                             ):
                                 raise Refused('DATA_MISMATCH')
         media = {'total': len(downloads) + len(recovered) + len(missing),
-                 'recovered': len(recovered), 'missing': len(missing), 'over_100_MiB': len(over),
+                 'recovered': len(recovered), 'missing': len(missing),
+                 'over_100_MiB': len(over_100_mib), 'over_limit': len(over),
                  'missing_message_ids': sorted(missing)[:1000],
-                 'over_100_MiB_message_ids': sorted(over)[:1000],
+                 'over_100_MiB_message_ids': sorted(over_100_mib)[:1000],
+                 'over_limit_message_ids': sorted(over)[:1000],
                  'message_ids_truncated': max(len(missing), len(over)) > 1000}
         if command == 'media-status':
             return {'source_id': source_id, **media}

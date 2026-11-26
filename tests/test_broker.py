@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from kiber_analyst import broker
+from kiber_analyst.media_limits import DEFAULT_TELEGRAM_MEDIA_BYTES
 
 SOURCE = 'telegram:-1009000:topic:1'
 
@@ -74,6 +75,45 @@ def test_owned_chain_and_idempotency(setup):
     embedding = app.handle('client', 'embed', SOURCE)
     assert embedding == app.handle('client', 'embed', SOURCE)
     assert argv[-1][0] == 'embed' and first['job_id'] in argv[-1][2]
+
+
+@pytest.mark.parametrize("size", [100 * 1024**2, 100 * 1024**2 + 1, 4_000_000_000])
+def test_media_items_enforces_export_ceiling_not_asr_ceiling(size):
+    row = {
+        "message_id": 9,
+        "media": {
+            "path": "media/9/payload.bin", "size": size,
+            "max_file_bytes": 4_000_000_000, "sha256": "a" * 64,
+        },
+    }
+
+    assert broker.media_items((json.dumps(row) + "\n").encode(), 4_000_000_000) == [
+        (["media", "9", "payload.bin"], size, "a" * 64)
+    ]
+
+
+def test_media_items_rejects_size_above_selected_or_absolute_limit():
+    for size, selected in ((101, 100), (4_000_000_001, 4_000_000_001)):
+        row = {"message_id": 9, "media": {
+            "path": "media/9/payload.bin", "size": size,
+            "max_file_bytes": selected, "sha256": "b" * 64,
+        }}
+        with pytest.raises(broker.Refused, match="UNSAFE_MEDIA"):
+            broker.media_items((json.dumps(row) + "\n").encode(), 4_000_000_000)
+
+
+def test_media_items_cannot_exceed_the_selected_manifest_limit():
+    row = {"message_id": 9, "media": {
+        "path": "media/9/payload.bin", "size": DEFAULT_TELEGRAM_MEDIA_BYTES + 1,
+        "max_file_bytes": 4_000_000_000, "sha256": "c" * 64,
+    }}
+    with pytest.raises(broker.Refused, match="UNSAFE_MEDIA"):
+        broker.media_items((json.dumps(row) + "\n").encode(), 100)
+
+    row["media"]["size"] = DEFAULT_TELEGRAM_MEDIA_BYTES + 1
+    row["media"]["max_file_bytes"] = DEFAULT_TELEGRAM_MEDIA_BYTES + 1
+    with pytest.raises(broker.Refused, match="UNSAFE_MEDIA"):
+        broker.media_items((json.dumps(row) + "\n").encode())
 
 
 def test_retry_requires_transient_classification_and_stops_at_three(setup):
@@ -380,6 +420,7 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
     gateway = broker.Broker(tmp_path, {SOURCE: {'project': 'fixture', 'hashes': hashes}},
                             worker_api=lambda action, **payload: {'state': 'done'}, submit=submit)
     before = gateway.handle('client', 'ingest', SOURCE)
+    original_stage = Path(submissions[before['job_id']][3])
     if live_db:
         initial = ingest('baseline-db')
         assert (initial['inserted'], initial['media_missing'], initial['service_events_inserted']) == (7, 7, 3)
@@ -397,6 +438,10 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
     assert gateway.handle('client', 'ingest', SOURCE) == after
     assert len(submissions) == 2
     worker_stage = Path(submissions[after['job_id']][3])
+    assert worker_stage != original_stage
+    assert (original_stage / 'messages.jsonl').is_file()
+    assert not (original_stage / 'media-resume').exists()
+    assert (worker_stage / 'media-resume/status.json').is_file()
     media = gateway.handle('client', 'media-status', SOURCE)
     assert (media['total'], media['recovered'], media['missing'], media['over_100_MiB']) == (7, 5, 2, 2)
     assert media['missing_message_ids'] == [6, 7]

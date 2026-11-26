@@ -220,6 +220,24 @@ def test_media_metadata_is_checked_and_missing_media_counted(tmp_path: Path) -> 
     assert _source_hashes(topic) == before
 
 
+def test_media_record_cannot_exceed_manifest_selected_limit(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    message_path = topic / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"]["size"] = 101
+    message["media"]["max_file_bytes"] = 101
+    messages = _json_bytes(message)
+    _write_private(message_path, messages)
+    manifest_path = topic / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(messages_sha256=hashlib.sha256(messages).hexdigest(), max_file_bytes=100)
+    _write_private(manifest_path, _json_bytes(manifest))
+
+    with pytest.raises(LoadError, match="exceeds its manifest"):
+        prepare_export(topic, tmp_path / "artifacts" / "too-large-media-limit", root=root)
+
+
 def test_exporter_media_kind_is_normalized_to_media_type(tmp_path: Path) -> None:
     root = tmp_path / "telegram"
     topic = _make_export(root, media=True)

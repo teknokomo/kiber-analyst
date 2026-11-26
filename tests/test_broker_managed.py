@@ -350,6 +350,71 @@ def test_telegram_prepared_export_has_hash_checked_dry_run_and_ingest(control, t
             for path in export_dir.iterdir() if path.is_file()} == before
 
 
+def test_large_telegram_media_is_registered_staged_and_ingest_ready(control, tmp_path):
+    app, _projects, _jobs, submitted, _api_calls = control
+    export_dir = _telegram_export(tmp_path)
+    media_size = broker.ASR_MAX_MEDIA_BYTES + 1
+    media_path = export_dir / "media" / "1" / "synthetic-video.bin"
+    media_path.parent.mkdir(mode=0o700, parents=True)
+    media_path.parent.parent.chmod(0o700)
+    media_path.parent.chmod(0o700)
+    fd = broker.os.open(media_path, broker.os.O_WRONLY | broker.os.O_CREAT | broker.os.O_EXCL, 0o600)
+    try:
+        broker.os.ftruncate(fd, media_size)
+    finally:
+        broker.os.close(fd)
+    digest = hashlib.sha256()
+    block = bytes(1024 * 1024)
+    for _ in range(media_size // len(block)):
+        digest.update(block)
+    digest.update(bytes(media_size % len(block)))
+
+    message = {
+        "chat_id": -1009000, "message_id": 1, "topic_id": 1,
+        "date": "2026-01-01T00:00:00Z", "text": "large synthetic attachment",
+        "sender_id": 12, "sender_name": "Fixture",
+        "media": {
+            "type": "video", "path": "media/1/synthetic-video.bin",
+            "size": media_size, "size_bytes": media_size,
+            "max_file_bytes": 4_000_000_000, "sha256": digest.hexdigest(),
+            "export_status": "downloaded",
+        },
+    }
+    message_bytes = (json.dumps(message, separators=(",", ":")) + "\n").encode()
+    (export_dir / "messages.jsonl").write_bytes(message_bytes)
+    (export_dir / "messages.jsonl").chmod(0o600)
+    manifest_path = export_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update({
+        "messages_sha256": hashlib.sha256(message_bytes).hexdigest(),
+        "max_file_bytes": 4_000_000_000,
+        "media_requested": True,
+    })
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    manifest_path.chmod(0o600)
+
+    registered = app.handle("client", "source-add", TELEGRAM_SOURCE, PROJECT)
+    assert registered["registered"] is True
+    request = app.handle("client", "ingest", TELEGRAM_SOURCE, PROJECT)
+    staged = Path(submitted[-1][1][3])
+    staged_file = staged / "media" / "1" / "synthetic-video.bin"
+
+    assert app.handle("client", "job-status", request["request_id"])["status"] == "queued"
+    assert staged_file.stat().st_size == media_size
+    with staged_file.open("rb") as stream:
+        assert hashlib.file_digest(stream, "sha256").hexdigest() == digest.hexdigest()
+
+    from kiber_analyst.telegram_ingest import prepare_export
+
+    artifact, _export, media_missing = prepare_export(
+        staged, tmp_path / "large-media-artifact", root=app.root / "imports",
+    )
+    normalized = json.loads((artifact / "normalized" / "messages.jsonl").read_text().splitlines()[0])
+    assert media_missing == 0
+    assert normalized["media_path"] == "media/1/synthetic-video.bin"
+    assert normalized["meta"]["media_export"]["size"] == media_size
+    assert normalized["meta"]["media_export"]["max_file_bytes"] == 4_000_000_000
+
 def test_telegram_source_add_rejects_symlinked_export(control, tmp_path):
     app, _projects, _jobs, _submitted, _api_calls = control
     target = tmp_path / "elsewhere"

@@ -278,20 +278,23 @@ def test_asr_workspace_skips_missing_oversize_and_provider_limit_without_mutatin
             'date': '2020-01-02T12:00:00+03:00', 'text': '',
             'sender_name': 'Example Author', 'chat_id': '-1009000',
             'media': {'type': 'voice_message', 'path': f'media/{message_id}/audio.ogg',
-                      'size': size, 'sha256': 'a' * 64},
+                      'size': size, 'max_file_bytes': 4_000_000_000,
+                      'sha256': 'a' * 64},
         })
     records.append({
         'message_id': 7, 'topic_id': 1,
         'date': '2020-01-02T12:00:00+03:00', 'text': '',
         'sender_name': 'Example Author', 'chat_id': '-1009000',
         'media': {'type': 'audio_file', 'path': 'media/7/missing.ogg',
-                  'size': 1234, 'sha256': 'b' * 64},
+                  'size': 1234, 'max_file_bytes': 4_000_000_000,
+                  'sha256': 'b' * 64},
     })
     messages = ''.join(json.dumps(item) + '\n' for item in records).encode()
     private_write(source_dir / 'messages.jsonl', messages)
     message_hash = hashlib.sha256(messages).hexdigest()
     manifest = json.loads((source_dir / 'manifest.json').read_text())
-    manifest.update(message_count=len(records), messages_sha256=message_hash)
+    manifest.update(message_count=len(records), messages_sha256=message_hash,
+                    max_file_bytes=4_000_000_000, max_file_size_unit='bytes')
     manifest_data = json.dumps(manifest, sort_keys=True).encode()
     private_write(source_dir / 'manifest.json', manifest_data)
     app.sources[SOURCE]['hashes']['messages.jsonl'] = message_hash
