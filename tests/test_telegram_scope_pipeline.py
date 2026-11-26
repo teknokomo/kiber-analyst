@@ -483,18 +483,24 @@ def test_history_over_32_mib_stays_streamed_through_publisher_and_broker(
     if test_env and Path(test_env).is_file():
         from kiber_analyst.telegram_ingest import load_telegram_export
 
-        dry = load_telegram_export(
-            staged, tmp_path / "large-history-dry", env_path=Path(test_env),
-            project_slug=PROJECT, dry_run=True, root=imports_root,
-        )
-        assert dry["status"] == "dry_run" and dry["rollback_confirmed"] is True
-        loaded = load_telegram_export(
-            staged, tmp_path / "large-history-load", env_path=Path(test_env),
-            project_slug=PROJECT, root=imports_root,
-        )
-        repeated = load_telegram_export(
-            staged, tmp_path / "large-history-repeat", env_path=Path(test_env),
-            project_slug=PROJECT, root=imports_root,
-        )
-        assert loaded["inserted"] == total and loaded["errors"] == 0
-        assert repeated["inserted"] == 0 and repeated["skipped"] == total
+        tracemalloc.start()
+        try:
+            dry = load_telegram_export(
+                staged, tmp_path / "large-history-dry", env_path=Path(test_env),
+                project_slug=PROJECT, dry_run=True, root=imports_root,
+            )
+            assert dry["status"] == "dry_run" and dry["rollback_confirmed"] is True
+            loaded = load_telegram_export(
+                staged, tmp_path / "large-history-load", env_path=Path(test_env),
+                project_slug=PROJECT, root=imports_root,
+            )
+            repeated = load_telegram_export(
+                staged, tmp_path / "large-history-repeat", env_path=Path(test_env),
+                project_slug=PROJECT, root=imports_root,
+            )
+            assert loaded["inserted"] == total and loaded["errors"] == 0
+            assert repeated["inserted"] == 0 and repeated["skipped"] == total
+            _current, ingest_peak = tracemalloc.get_traced_memory()
+            assert ingest_peak < 96 * 1024**2
+        finally:
+            tracemalloc.stop()
