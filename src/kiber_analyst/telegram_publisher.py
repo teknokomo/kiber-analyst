@@ -318,7 +318,7 @@ def _rename_exchange(parent: int, first: str, second: str) -> None:
     raise OSError(error, os.strerror(error))
 
 
-def _transfer_record(parent: int, name: str, *, uid: int):
+def _transfer_record(parent: int, name: str, *, uid: int, allow_temp_marker: bool = False):
     directory = _open_child(parent, name, uid=uid)
     try:
         raw = _read_file(directory, "telegram_transfer_manifest.json", uid=uid,
@@ -326,7 +326,10 @@ def _transfer_record(parent: int, name: str, *, uid: int):
         record = json.loads(raw)
         if not isinstance(record, dict) or not isinstance(record.get("source_id"), str):
             _fail("TRANSFER_MANIFEST_INVALID")
-        status = _staged_status(parent, name, record["source_id"], dest_uid=uid)
+        status = _staged_status(
+            parent, name, record["source_id"], dest_uid=uid,
+            allow_temp_marker=allow_temp_marker,
+        )
         if not status:
             _fail("STAGING_REVISION_INVALID")
         return record, hashlib.sha256(raw).hexdigest()
@@ -342,21 +345,11 @@ def _media_manifest_sha(media_manifest: dict | None) -> str | None:
 
 def _temp_marker_matches(parent: int, name: str, *, uid: int, source_id: str,
                          source_hashes: dict, media_manifest_sha: str | None) -> bool:
-    try:
-        directory = _open_child(parent, name, uid=uid)
-    except (OSError, TransferError):
-        return False
-    try:
-        marker = json.loads(_read_file(directory, ".publisher-temp.json", uid=uid,
-                                       maximum=MAX_METADATA_BYTES))
-        return marker == {
-            "source_id": source_id, "source_hashes": source_hashes,
-            "media_manifest_sha256": media_manifest_sha,
-        }
-    except (TransferError, OSError, ValueError, UnicodeError):
-        return False
-    finally:
-        os.close(directory)
+    marker = _read_temp_marker(parent, name, uid=uid)
+    return marker == {
+        "source_id": source_id, "source_hashes": source_hashes,
+        "media_manifest_sha256": media_manifest_sha,
+    }
 
 
 def _read_init_intent(parent: int, name: str, *, uid: int) -> dict:
@@ -369,6 +362,12 @@ def _read_init_intent(parent: int, name: str, *, uid: int) -> dict:
             or value.get("init_name") != name
             or not isinstance(value.get("source_id"), str)
             or not isinstance(value.get("source_hashes"), dict)
+            or set(value["source_hashes"]) != {
+                "messages.jsonl", "services.jsonl", "manifest.json", "services_manifest.json",
+            }
+            or any(not isinstance(digest, str)
+                   or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                   for digest in value["source_hashes"].values())
             or value.get("media_manifest_sha256") is not None
             and not re.fullmatch(r"[0-9a-f]{64}", str(value["media_manifest_sha256"]))):
         _fail("TRANSFER_RECOVERY_REQUIRED")
@@ -383,7 +382,8 @@ def _write_init_intent(parent: int, name: str, *, uid: int, gid: int,
         "source_hashes": source_hashes,
         "media_manifest_sha256": media_manifest_sha,
     }, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    temporary = ".publisher-init-write-" + uuid.uuid4().hex + ".tmp"
+    source_token = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:16]
+    temporary = f".publisher-init-write-{source_token}-{uuid.uuid4().hex}.tmp"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                  | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
     try:
@@ -405,52 +405,189 @@ def _write_init_intent(parent: int, name: str, *, uid: int, gid: int,
             os.unlink(temporary, dir_fd=parent)
 
 
-def _cleanup_init_intent_temporaries(parent: int, *, uid: int, gid: int) -> bool:
-    """Remove only private, singly-linked scratch files from the exact writer namespace."""
-    removed = False
-    pattern = re.compile(r"\.publisher-init-write-[0-9a-f]{32}\.tmp\Z")
+def _transfer_candidate_name(source_id: str, source_hashes: dict,
+                             media_manifest_sha: str | None) -> str:
+    fingerprint = hashlib.sha256(
+        (source_id + json.dumps(source_hashes, sort_keys=True)
+         + (media_manifest_sha or "none")).encode("utf-8")
+    ).hexdigest()[:32]
+    return ".transfer-" + fingerprint
+
+
+def _recovery_summary() -> dict:
+    return {
+        "removed_artifacts": 0,
+        "reclaimed_bytes": 0,
+        "archived_candidates": 0,
+        "preserved": {},
+    }
+
+
+def _preserve_recovery_item(summary: dict, reason: str) -> None:
+    summary["preserved"][reason] = summary["preserved"].get(reason, 0) + 1
+
+
+def _remove_recovery_tree(parent: int, name: str, *, uid: int, summary: dict) -> None:
+    descriptor = _open_child(parent, name, uid=uid, mode=0o700)
+    try:
+        size = _walk_size(descriptor)
+    finally:
+        os.close(descriptor)
+    _remove_tree(parent, name, expected_uid=uid)
+    os.fsync(parent)
+    summary["removed_artifacts"] += 1
+    summary["reclaimed_bytes"] += size
+
+
+def _read_temp_marker(parent: int, name: str, *, uid: int) -> dict | None:
+    try:
+        directory = _open_child(parent, name, uid=uid, mode=0o700)
+    except (OSError, TransferError):
+        return None
+    try:
+        marker = json.loads(_read_file(
+            directory, ".publisher-temp.json", uid=uid, maximum=MAX_METADATA_BYTES,
+        ))
+    except (OSError, TransferError, ValueError, UnicodeError):
+        return None
+    finally:
+        os.close(directory)
+    hashes = marker.get("source_hashes") if isinstance(marker, dict) else None
+    if (not isinstance(marker, dict)
+            or set(marker) != {"source_id", "source_hashes", "media_manifest_sha256"}
+            or not isinstance(marker.get("source_id"), str)
+            or not isinstance(hashes, dict)
+            or set(hashes) != {
+                "messages.jsonl", "services.jsonl", "manifest.json", "services_manifest.json",
+            }
+            or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                   for value in hashes.values())
+            or (marker["media_manifest_sha256"] is not None
+                and not re.fullmatch(r"[0-9a-f]{64}", str(marker["media_manifest_sha256"])) )):
+        return None
+    return marker
+
+
+def _remove_temp_marker(parent: int, name: str, *, uid: int) -> None:
+    directory = _open_child(parent, name, uid=uid, mode=0o700)
+    try:
+        os.unlink(".publisher-temp.json", dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _archive_recovery_candidate(parent: int, name: str, *, uid: int,
+                                transfer: dict, transfer_sha: str,
+                                summary: dict) -> None:
+    try:
+        os.mkdir(".revisions", 0o700, dir_fd=parent)
+    except FileExistsError:
+        pass
+    revisions = _open_child(parent, ".revisions", uid=uid, mode=0o700)
+    archive_name = "recovery-" + transfer_sha
+    try:
+        if archive_name in os.listdir(revisions):
+            existing, existing_sha = _transfer_record(revisions, archive_name, uid=uid)
+            if existing != transfer or existing_sha != transfer_sha:
+                _fail("REVISION_ARCHIVE_CONFLICT")
+            _remove_recovery_tree(parent, name, uid=uid, summary=summary)
+        else:
+            _rename_noreplace(parent, name, revisions, archive_name)
+            os.fsync(revisions)
+            os.fsync(parent)
+            summary["archived_candidates"] += 1
+    finally:
+        os.close(revisions)
+
+
+def _cleanup_init_intent_temporaries(parent: int, *, uid: int, gid: int,
+                                     source_id: str) -> dict:
+    """Clean only private intent writes cryptographically namespaced to this source."""
+    summary = _recovery_summary()
+    token = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:16]
+    current = re.compile(rf"\.publisher-init-write-{token}-[0-9a-f]{{32}}\.tmp\Z")
+    other = re.compile(r"\.publisher-init-write-[0-9a-f]{16}-[0-9a-f]{32}\.tmp\Z")
+    legacy = re.compile(r"\.publisher-init-write-[0-9a-f]{32}\.tmp\Z")
+    changed = False
     for name in sorted(os.listdir(parent)):
-        if not pattern.fullmatch(name):
-            continue
-        try:
-            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                or info.st_uid != uid or info.st_gid != gid
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_size > MAX_METADATA_BYTES):
-            _fail("TRANSFER_RECOVERY_REQUIRED")
-        os.unlink(name, dir_fd=parent)
-        removed = True
-    if removed:
+        if current.fullmatch(name):
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != uid or info.st_gid != gid
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > MAX_METADATA_BYTES):
+                _preserve_recovery_item(summary, "unsafe_source_intent_write")
+                continue
+            os.unlink(name, dir_fd=parent)
+            changed = True
+            summary["removed_artifacts"] += 1
+            summary["reclaimed_bytes"] += info.st_size
+        elif other.fullmatch(name):
+            _preserve_recovery_item(summary, "other_source_intent_write")
+        elif legacy.fullmatch(name):
+            _preserve_recovery_item(summary, "unscoped_legacy_intent_write")
+    if changed:
         os.fsync(parent)
-    return removed
+    return summary
 
 
 def _recover_initialization_directories(parent: int, *, uid: int, source_id: str,
                                         source_hashes: dict,
                                         media_manifest_sha: str | None,
-                                        temp_name: str, gid: int) -> None:
-    """Recover only scratch paths proven by a durable, matching intent file."""
-    removed = _cleanup_init_intent_temporaries(parent, uid=uid, gid=gid)
+                                        temp_name: str, gid: int) -> dict:
+    """Recover this source's verified scratch artifacts under the publisher lock.
+
+    Old, complete candidates are kept in a private recovery archive. Partial
+    candidates are removed only when a source-bound intent or marker proves
+    their origin. Unknown and other-source entries remain untouched.
+    """
+    summary = _cleanup_init_intent_temporaries(
+        parent, uid=uid, gid=gid, source_id=source_id,
+    )
     names = set(os.listdir(parent))
     init_re = re.compile(r"\.publisher-init-[0-9a-f]{32}\Z")
+    processed_candidates = set()
     for name in sorted(names):
         if not init_re.fullmatch(name):
             continue
-        intent = _read_init_intent(parent, name, uid=uid)
-        # A valid other-scope intent is isolated from this transfer. Leave it
-        # for the matching source operation instead of blocking this one.
-        if intent["source_id"] != source_id:
-            continue
-        if (intent["source_hashes"] != source_hashes
-                or intent["media_manifest_sha256"] != media_manifest_sha):
+        sidecar = name + ".json"
+        if sidecar not in names:
             _fail("TRANSFER_RECOVERY_REQUIRED")
-        if name in names:
-            _remove_tree(parent, name, expected_uid=uid)
-        os.unlink(name + ".json", dir_fd=parent)
-        removed = True
+        try:
+            intent = _read_init_intent(parent, name, uid=uid)
+        except TransferError:
+            _fail("TRANSFER_RECOVERY_REQUIRED")
+        if intent["source_id"] != source_id:
+            _preserve_recovery_item(summary, "other_source_init_directory")
+            continue
+        init_directory = _open_child(parent, name, uid=uid, mode=0o700)
+        try:
+            marker_present = ".publisher-temp.json" in os.listdir(init_directory)
+        finally:
+            os.close(init_directory)
+        if marker_present:
+            expected_marker = {
+                "source_id": intent["source_id"],
+                "source_hashes": intent["source_hashes"],
+                "media_manifest_sha256": intent["media_manifest_sha256"],
+            }
+            if _read_temp_marker(parent, name, uid=uid) != expected_marker:
+                _fail("TRANSFER_RECOVERY_REQUIRED")
+        child = _open_child(parent, name, uid=uid, mode=0o700)
+        try:
+            size = _walk_size(child)
+        finally:
+            os.close(child)
+        sidecar_size = os.stat(sidecar, dir_fd=parent, follow_symlinks=False).st_size
+        _remove_tree(parent, name, expected_uid=uid)
+        os.unlink(sidecar, dir_fd=parent)
+        os.fsync(parent)
+        summary["removed_artifacts"] += 1
+        summary["reclaimed_bytes"] += size + sidecar_size
 
     for name in sorted(names):
         if not re.fullmatch(r"\.publisher-init-[0-9a-f]{32}\.json\Z", name):
@@ -458,23 +595,139 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
         init_name = name[:-5]
         if init_name in names:
             continue
-        intent = _read_init_intent(parent, init_name, uid=uid)
+        try:
+            intent = _read_init_intent(parent, init_name, uid=uid)
+        except TransferError:
+            _fail("TRANSFER_RECOVERY_REQUIRED")
         if intent["source_id"] != source_id:
+            _preserve_recovery_item(summary, "other_source_init_intent")
             continue
-        if (intent["source_hashes"] != source_hashes
-                or intent["media_manifest_sha256"] != media_manifest_sha):
+        candidate_name = _transfer_candidate_name(
+            intent["source_id"], intent["source_hashes"],
+            intent["media_manifest_sha256"],
+        )
+        candidate_exists = candidate_name in names
+        if candidate_exists:
+            marker = _read_temp_marker(parent, candidate_name, uid=uid)
+            expected_marker = {
+                "source_id": intent["source_id"],
+                "source_hashes": intent["source_hashes"],
+                "media_manifest_sha256": intent["media_manifest_sha256"],
+            }
+            if marker == expected_marker:
+                try:
+                    record, transfer_sha = _transfer_record(
+                        parent, candidate_name, uid=uid, allow_temp_marker=True,
+                    )
+                except (TransferError, OSError, ValueError, UnicodeError):
+                    record = None
+                if record is not None:
+                    if (record.get("source_id") != intent["source_id"]
+                            or record.get("source_hashes") != intent["source_hashes"]
+                            or record.get("media_manifest_sha256")
+                            != intent["media_manifest_sha256"]):
+                        _preserve_recovery_item(summary, "candidate_intent_mismatch")
+                        continue
+                    _remove_temp_marker(parent, candidate_name, uid=uid)
+                    if candidate_name != temp_name:
+                        _archive_recovery_candidate(
+                            parent, candidate_name, uid=uid, transfer=record,
+                            transfer_sha=transfer_sha, summary=summary,
+                        )
+                        processed_candidates.add(candidate_name)
+                elif candidate_name != temp_name:
+                    _remove_recovery_tree(
+                        parent, candidate_name, uid=uid, summary=summary,
+                    )
+                    processed_candidates.add(candidate_name)
+            else:
+                try:
+                    record, transfer_sha = _transfer_record(parent, candidate_name, uid=uid)
+                except (TransferError, OSError):
+                    _preserve_recovery_item(summary, "unverified_candidate")
+                    continue
+                if (record.get("source_id") != intent["source_id"]
+                        or record.get("source_hashes") != intent["source_hashes"]
+                        or record.get("media_manifest_sha256")
+                        != intent["media_manifest_sha256"]):
+                    _preserve_recovery_item(summary, "candidate_intent_mismatch")
+                    continue
+                if candidate_name != temp_name:
+                    _archive_recovery_candidate(
+                        parent, candidate_name, uid=uid, transfer=record,
+                        transfer_sha=transfer_sha, summary=summary,
+                    )
+                    processed_candidates.add(candidate_name)
+        sidecar_info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(sidecar_info.st_mode) or sidecar_info.st_nlink != 1
+                or sidecar_info.st_uid != uid or stat.S_IMODE(sidecar_info.st_mode) != 0o600
+                or sidecar_info.st_size > MAX_METADATA_BYTES):
             _fail("TRANSFER_RECOVERY_REQUIRED")
-        if temp_name in names and not _temp_marker_matches(
-            parent, temp_name, uid=uid, source_id=source_id,
-            source_hashes=source_hashes, media_manifest_sha=media_manifest_sha,
-        ):
-            _fail("TRANSFER_RECOVERY_REQUIRED")
-        # No directory means the crash happened before mkdir, or the proven
-        # directory was atomically renamed to the verified transfer candidate.
         os.unlink(name, dir_fd=parent)
-        removed = True
-    if removed:
+        summary["removed_artifacts"] += 1
+        summary["reclaimed_bytes"] += sidecar_info.st_size
+
+    # Reconcile candidate trees whose durable init intent was already removed.
+    # A marker or fully verified transfer manifest must bind the generated name
+    # to its source/revision before the tree can be touched.
+    names = set(os.listdir(parent))
+    candidate_re = re.compile(r"\.transfer-[0-9a-f]{32}\Z")
+    for name in sorted(names):
+        if not candidate_re.fullmatch(name) or name == temp_name or name in processed_candidates:
+            continue
+        marker = _read_temp_marker(parent, name, uid=uid)
+        if marker is not None:
+            marker_candidate = _transfer_candidate_name(
+                marker["source_id"], marker["source_hashes"],
+                marker["media_manifest_sha256"],
+            )
+            if marker_candidate != name:
+                _preserve_recovery_item(summary, "candidate_name_mismatch")
+            elif marker["source_id"] != source_id:
+                _preserve_recovery_item(summary, "other_source_candidate")
+            else:
+                try:
+                    record, transfer_sha = _transfer_record(
+                        parent, name, uid=uid, allow_temp_marker=True,
+                    )
+                except (TransferError, OSError, ValueError, UnicodeError):
+                    record = None
+                if record is None:
+                    _remove_recovery_tree(parent, name, uid=uid, summary=summary)
+                elif (record.get("source_id") != marker["source_id"]
+                      or record.get("source_hashes") != marker["source_hashes"]
+                      or record.get("media_manifest_sha256")
+                      != marker["media_manifest_sha256"]):
+                    _preserve_recovery_item(summary, "candidate_marker_mismatch")
+                else:
+                    _remove_temp_marker(parent, name, uid=uid)
+                    if name != temp_name:
+                        _archive_recovery_candidate(
+                            parent, name, uid=uid, transfer=record,
+                            transfer_sha=transfer_sha, summary=summary,
+                        )
+            continue
+        try:
+            record, transfer_sha = _transfer_record(parent, name, uid=uid)
+        except (TransferError, OSError):
+            _preserve_recovery_item(summary, "unverified_candidate")
+            continue
+        record_source = record.get("source_id")
+        record_hashes = record.get("source_hashes")
+        record_media_sha = record.get("media_manifest_sha256")
+        if (not isinstance(record_source, str) or not isinstance(record_hashes, dict)
+                or _transfer_candidate_name(record_source, record_hashes, record_media_sha) != name):
+            _preserve_recovery_item(summary, "candidate_name_mismatch")
+        elif record_source != source_id:
+            _preserve_recovery_item(summary, "other_source_candidate")
+        else:
+            _archive_recovery_candidate(
+                parent, name, uid=uid, transfer=record, transfer_sha=transfer_sha,
+                summary=summary,
+            )
+    if summary["removed_artifacts"]:
         os.fsync(parent)
+    return summary
 
 
 def _media_inventory_count(transfer: dict) -> int:
@@ -1118,7 +1371,7 @@ def _new_topic_dir(parent: int, name: str, *, uid: int, gid: int) -> int:
 
 
 def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
-                   *, dest_uid: int) -> dict | None:
+                   *, dest_uid: int, allow_temp_marker: bool = False) -> dict | None:
     try:
         final = _open_child(destination_chat, scope_dir, uid=dest_uid)
     except FileNotFoundError:
@@ -1149,6 +1402,14 @@ def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
         if not isinstance(staged_hashes, dict) or set(staged_hashes) != expected_files:
             _fail("TRANSFER_MANIFEST_INVALID")
         expected_entries = expected_files | {"telegram_transfer_manifest.json"}
+        if allow_temp_marker and ".publisher-temp.json" in os.listdir(final):
+            marker = _read_temp_marker(destination_chat, scope_dir, uid=dest_uid)
+            if (marker is None or marker.get("source_id") != source_id
+                    or marker.get("source_hashes") != transfer.get("source_hashes")
+                    or marker.get("media_manifest_sha256")
+                    != transfer.get("media_manifest_sha256")):
+                _fail("TRANSFER_MANIFEST_INVALID")
+            expected_entries.add(".publisher-temp.json")
         if transfer.get("version") == 2 and inventory_count:
             expected_entries.add("media_files.jsonl")
         if media_manifest_sha is not None:
@@ -1327,17 +1588,18 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
             )
             try:
                 desired_media_sha = _media_manifest_sha(media_manifest)
-                temp_name = ".transfer-" + hashlib.sha256(
-                    (source_id + json.dumps(hashes, sort_keys=True) + (desired_media_sha or "none"))
-                    .encode()
-                ).hexdigest()[:32]
-                _recover_initialization_directories(
+                temp_name = _transfer_candidate_name(source_id, hashes, desired_media_sha)
+                recovery = _recover_initialization_directories(
                     destination_chat, uid=config["destination_uid"],
                     gid=config["destination_gid"],
                     source_id=source_id, source_hashes=hashes,
                     media_manifest_sha=desired_media_sha,
                     temp_name=temp_name,
                 )
+
+                def recovery_result(value):
+                    return {**value, "recovery_cleanup": recovery}
+
                 final_status = _staged_status(destination_chat, scope_dir, source_id,
                                               dest_uid=config["destination_uid"])
                 # Recover the three crash windows around the atomic publish:
@@ -1390,14 +1652,14 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                                     dest_uid=config["destination_uid"],
                                 )
                                 os.fsync(destination_chat)
-                                return {**final_status, "status": "ready"}
+                                return recovery_result({**final_status, "status": "ready"})
                             _rename_noreplace(destination_chat, temp_name,
                                               destination_chat, scope_dir)
                             os.fsync(destination_chat)
-                            return {**_staged_status(
+                            return recovery_result({**_staged_status(
                                 destination_chat, scope_dir, source_id,
                                 dest_uid=config["destination_uid"],
-                            ), "status": "ready"}
+                            ), "status": "ready"})
                         if final_status:
                             current, _ = _transfer_record(
                                 destination_chat, scope_dir, uid=config["destination_uid"],
@@ -1429,7 +1691,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     if transfer.get("media_manifest_sha256") == desired_media_sha:
                         final_status["status"] = "already_ready"
                         os.fsync(destination_chat)
-                        return final_status
+                        return recovery_result(final_status)
 
                 def transform(row):
                     media = row.get("media")
@@ -1694,7 +1956,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                 else:
                     _rename_noreplace(destination_chat, temp_name, destination_chat, scope_dir)
                 os.fsync(destination_chat)
-                return {
+                return recovery_result({
                     "source_id": source_id, "status": "ready",
                     "message_count": source_manifest["message_count"],
                     "service_event_count": service_count,
@@ -1703,7 +1965,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     "messages_sha256": staged_message_sha,
                     "copied_bytes": copied_bytes,
                     "shared_free_bytes": free, "shared_used_bytes": used + required,
-                }
+                })
             finally:
                 os.close(destination_chat)
         finally:

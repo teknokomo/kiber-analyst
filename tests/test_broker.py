@@ -115,6 +115,79 @@ def test_staging_reuse_rechecks_media_bytes(setup):
         app.stage(SOURCE, entry, fingerprint, chat, topic)
 
 
+def _write_resume_checkpoint(src: Path, app: broker.Broker, *, version: int = 2) -> bytes:
+    resume = src / 'media-resume'
+    resume.mkdir(mode=0o700)
+    registered_hashes = dict(app.sources[SOURCE]['hashes'])
+    inputs = dict(registered_hashes)
+    service_manifest_sha = hashlib.sha256((src / 'services_manifest.json').read_bytes()).hexdigest()
+    if version == 2:
+        inputs['services_manifest.json'] = service_manifest_sha
+    checkpoint = json.dumps({
+        'version': version, 'source_id': SOURCE, 'inputs': inputs,
+        'records': {}, 'requested_max_file_bytes': broker.DEFAULT_TELEGRAM_MEDIA_BYTES,
+        'over_limit_message_ids': [],
+    }, sort_keys=True).encode() + b'\n'
+    (resume / 'status.json').write_bytes(checkpoint)
+    (resume / 'status.json').chmod(0o600)
+    return checkpoint
+
+
+@pytest.mark.parametrize('version', [1, 2])
+def test_inspect_source_accepts_legacy_and_v2_resume_hash_sets(setup, version):
+    app, src, _jobs, _argv = setup
+    _write_resume_checkpoint(src, app, version=version)
+    app.worker_api = lambda action, **_kwargs: {
+        'messages': 1, 'unique_messages': 1, 'service_events': 0,
+        'documents': 1, 'messages_with_media': 1,
+    } if action == 'source-overview' else {}
+
+    media = app.handle('client', 'media-status', SOURCE)
+    status = app.handle('client', 'source-status', SOURCE)
+    integrity = app.handle('client', 'reindex', SOURCE)['integrity']
+
+    assert media['recovered'] == 0 and media['missing'] == 0
+    assert status['staging']['media_resume_sha256'] == hashlib.sha256(
+        (src / 'media-resume' / 'status.json').read_bytes()
+    ).hexdigest()
+    assert status['export']['sha256']['services_manifest.json'] == hashlib.sha256(
+        (src / 'services_manifest.json').read_bytes()
+    ).hexdigest()
+    assert integrity == {
+        'media_sha256_verified': 1, 'messages_match': True,
+        'service_events_match': True, 'ingested_media_match': True,
+    }
+
+
+def test_inspect_source_rejects_modified_v2_services_manifest(setup):
+    app, src, _jobs, _argv = setup
+    _write_resume_checkpoint(src, app, version=2)
+    service_manifest = json.loads((src / 'services_manifest.json').read_bytes())
+    service_manifest['tampered'] = True
+    (src / 'services_manifest.json').write_text(json.dumps(service_manifest) + '\n')
+    (src / 'services_manifest.json').chmod(0o600)
+
+    with pytest.raises(broker.Refused, match='MEDIA_CHECKPOINT_MISMATCH'):
+        app.handle('client', 'media-status', SOURCE)
+
+
+@pytest.mark.parametrize('malformation', ['missing', 'invalid_json'])
+def test_inspect_source_rejects_missing_or_malformed_services_manifest(setup, malformation):
+    app, src, _jobs, _argv = setup
+    _write_resume_checkpoint(src, app, version=2)
+    manifest = src / 'services_manifest.json'
+    if malformation == 'missing':
+        manifest.unlink()
+        expected_error = 'DATA_MISMATCH'
+    else:
+        manifest.write_bytes(b'{not-json}\n')
+        manifest.chmod(0o600)
+        expected_error = 'SERVICES_MANIFEST_INVALID'
+
+    with pytest.raises(broker.Refused, match=expected_error):
+        app.handle('client', 'source-status', SOURCE)
+
+
 @pytest.mark.parametrize("size", [100 * 1024**2, 100 * 1024**2 + 1, 4_000_000_000])
 def test_media_items_enforces_export_ceiling_not_asr_ceiling(size):
     row = {
@@ -383,6 +456,8 @@ def test_invalid_input_leaves_no_staging_or_request(setup, kind):
 def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
     tmp_path, monkeypatch, live_db, loopback_postgres_driver,
 ):
+    chat_id = "-100" + f"{uuid.uuid4().int % 10**10:010d}"
+    source_id = f"telegram:{chat_id}:topic:1"
     dsn = os.environ.get('KIBER_MEDIA_RESUME_TEST_DSN')
     if live_db and not dsn:
         pytest.skip('requires disposable PostgreSQL fixture DSN')
@@ -398,7 +473,7 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
 
     monkeypatch.setattr(broker, 'RESERVE', 0)
     root = tmp_path / 'imports'
-    source = root / '-1009000' / '1'
+    source = root / chat_id / '1'
     repair = tmp_path / 'export-repairs'
     for directory in (root, source.parent, source, repair):
         directory.mkdir(mode=0o700)
@@ -427,24 +502,27 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
     services = jsonl(dict(event_id=i, topic_id=1, date=date, type='unknown') for i in range(1, 4))
     msg = jsonl(messages)
     sh, mh = (hashlib.sha256(data).hexdigest() for data in (services, msg))
-    meta = dict(topic_id=1, source_id=SOURCE, complete=True, scope_before=None)
+    meta = dict(topic_id=1, source_id=source_id, complete=True, scope_before=None)
     control = {
         'messages.jsonl': msg,
         'services.jsonl': services,
-        'manifest.json': jsonl([dict(meta, chat_id='-1009000', export_version=1, message_count=7,
+        'manifest.json': jsonl([dict(meta, chat_id=chat_id, export_version=1, message_count=7,
                                     messages_sha256=mh)]),
     }
     for name, data in control.items():
         put(source / name, data)
     put(source / 'services_manifest.json', jsonl([
-        dict(meta, chat_id=-1009000, event_count=3, range_complete=True, services_sha256=sh),
+        dict(meta, chat_id=int(chat_id), event_count=3, range_complete=True, services_sha256=sh),
     ]))
     hashes = {name: hashlib.sha256(data).hexdigest() for name, data in control.items()}
     checkpoint = jsonl([dict(inputs=hashes, records=records,
                              over_limit_message_ids=[6, 7])])
     def ingest(name):
+        project_slug = ingest_project_slug
         return load_telegram_export(source, tmp_path / name, env_path=tmp_path / 'unused',
-                                    project_slug='resume-fixture', root=root)
+                                    project_slug=project_slug, root=root)
+
+    ingest_project_slug = f"resume-fixture-{uuid.uuid4().hex[:10]}"
 
     assert prepare_export(source, tmp_path / 'baseline', root=root)[2] == 7
     (root / '.broker').mkdir(mode=0o700)
@@ -455,9 +533,9 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
         submissions[job_id] = argv
         return {'job_id': job_id}
 
-    gateway = broker.Broker(tmp_path, {SOURCE: {'project': 'fixture', 'hashes': hashes}},
+    gateway = broker.Broker(tmp_path, {source_id: {'project': 'fixture', 'hashes': hashes}},
                             worker_api=lambda action, **payload: {'state': 'done'}, submit=submit)
-    before = gateway.handle('client', 'ingest', SOURCE)
+    before = gateway.handle('client', 'ingest', source_id)
     original_stage = Path(submissions[before['job_id']][3])
     if live_db:
         initial = ingest('baseline-db')
@@ -471,16 +549,16 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
     finally:
         broker.os.close(sfd)
         broker.os.close(dfd)
-    after = gateway.handle('client', 'ingest', SOURCE)
+    after = gateway.handle('client', 'ingest', source_id)
     assert after['job_id'] != before['job_id']
-    assert gateway.handle('client', 'ingest', SOURCE) == after
+    assert gateway.handle('client', 'ingest', source_id) == after
     assert len(submissions) == 2
     worker_stage = Path(submissions[after['job_id']][3])
     assert worker_stage != original_stage
     assert (original_stage / 'messages.jsonl').is_file()
     assert not (original_stage / 'media-resume').exists()
     assert (worker_stage / 'media-resume/status.json').is_file()
-    media = gateway.handle('client', 'media-status', SOURCE)
+    media = gateway.handle('client', 'media-status', source_id)
     assert (media['total'], media['recovered'], media['missing'], media['over_100_MiB']) == (7, 5, 2, 2)
     assert media['missing_message_ids'] == [6, 7]
     assert all('path' not in key for key in media)
@@ -488,7 +566,7 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
                 'messages_with_media': 5, 'nonempty_messages': 7, 'service_events': 3, 'embeddings': 0}
     previous_worker_api = gateway.worker_api
     gateway.worker_api = lambda action, **kw: overview if action == 'source-overview' else previous_worker_api(action, **kw)
-    integrity = gateway.handle('client', 'reindex', SOURCE)['integrity']
+    integrity = gateway.handle('client', 'reindex', source_id)['integrity']
     assert integrity == {'media_sha256_verified': 5, 'messages_match': True,
                          'service_events_match': True, 'ingested_media_match': True}
     gateway.db.close()
@@ -512,9 +590,32 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
             assert result['media_missing'] == 2
             assert result['service_events_skipped'] == 3
         with psycopg.connect(dsn) as conn:
-            assert conn.execute("SELECT count(*), count(DISTINCT external_ref) FROM segments").fetchone() == (7, 7)
-            assert conn.execute("SELECT count(*) FROM segments WHERE meta->>'media_path' LIKE 'media-resume/%'").fetchone()[0] == 5
-            assert conn.execute("SELECT count(*) FROM telegram_service_events").fetchone()[0] == 3
+            assert conn.execute(
+                """SELECT count(*), count(DISTINCT s.external_ref)
+                   FROM segments s
+                   JOIN documents d ON d.id=s.document_id
+                   JOIN sources so ON so.id=d.source_id
+                   JOIN projects p ON p.id=so.project_id
+                   WHERE p.slug=%s""",
+                (ingest_project_slug,),
+            ).fetchone() == (7, 7)
+            assert conn.execute(
+                """SELECT count(*)
+                   FROM segments s
+                   JOIN documents d ON d.id=s.document_id
+                   JOIN sources so ON so.id=d.source_id
+                   JOIN projects p ON p.id=so.project_id
+                   WHERE p.slug=%s AND s.meta->>'media_path' LIKE 'media-resume/%%'""",
+                (ingest_project_slug,),
+            ).fetchone()[0] == 5
+            assert conn.execute(
+                """SELECT count(*)
+                   FROM telegram_service_events events
+                   JOIN sources so ON so.id=events.source_id
+                   JOIN projects p ON p.id=so.project_id
+                   WHERE p.slug=%s""",
+                (ingest_project_slug,),
+            ).fetchone()[0] == 3
 
         # Use the same persisted normalized input for both attempts, just as broker does.
         from importlib import import_module
@@ -533,11 +634,15 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
             return [[1.0] + [0.0] * 1535 for _ in texts], None
 
         args = (tmp_path / 'merged-db',)
-        options = dict(project='resume-fixture', env_path=tmp_path / 'unused')
+        options = dict(project=ingest_project_slug, env_path=tmp_path / 'unused')
         with pytest.raises(PermanentProviderError):
             embed.embed_job(*args, embedding_call=first_provider, **options)
         with psycopg.connect(dsn) as conn:
-            assert conn.execute('SELECT count(*) FROM embeddings').fetchone()[0] == 4
+            assert conn.execute(
+                """SELECT count(*) FROM embeddings e
+                   JOIN projects p ON p.id=e.project_id WHERE p.slug=%s""",
+                (ingest_project_slug,),
+            ).fetchone()[0] == 4
 
         def resume_provider(texts):
             assert not set(texts).intersection(sent)
@@ -547,8 +652,18 @@ def test_completed_resume_supplies_synthetic_photos_and_preserves_large_files(
         completed = embed.embed_job(*args, embedding_call=resume_provider, **options)
         assert len(sent) == len(set(sent)) == completed['inserted'] == 7
         with psycopg.connect(dsn) as conn:
-            assert conn.execute('SELECT count(*),count(distinct owner_id) FROM embeddings').fetchone() == (7, 7)
-            assert conn.execute("SELECT count(*) FROM runs WHERE kind='telegram_embed' AND status='done'").fetchone()[0] == 1
+            assert conn.execute(
+                """SELECT count(*), count(DISTINCT e.owner_id)
+                   FROM embeddings e JOIN projects p ON p.id=e.project_id
+                   WHERE p.slug=%s""",
+                (ingest_project_slug,),
+            ).fetchone() == (7, 7)
+            assert conn.execute(
+                """SELECT count(*) FROM runs r
+                   JOIN projects p ON p.id=r.project_id
+                   WHERE p.slug=%s AND r.kind='telegram_embed' AND r.status='done'""",
+                (ingest_project_slug,),
+            ).fetchone()[0] == 1
 
 
 @pytest.mark.parametrize('damage', ['symlink', 'sha256'])

@@ -997,6 +997,48 @@ def test_search_result_retrieves_completed_project_and_source_searches(
     assert source_result["degraded_reason"] == "quota"
 
 
+def test_group_search_result_accepts_topics_in_same_chat(control, monkeypatch):
+    app, _projects, jobs, _submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    group_source = "telegram:-1009000:group"
+    topic_source = "telegram:-1009000:topic:456"
+    app.sources[group_source] = {"project": PROJECT, "hashes": {}}
+    pending = app.handle("client", "search", group_source, "forum query", "1")
+    assert pending["error_code"] == "SEARCH_PENDING"
+    jobs[pending["job_id"]].update(
+        state="done", result={
+            "mode": "fts", "degraded": False, "degraded_reason": None,
+            "results": [{"source_id": topic_source, "chat_id": "-1009000",
+                         "topic_id": "456", "message_id": "42", "text": "safe result"}],
+        },
+    )
+
+    result = app.handle("client", "search-result", pending["request_id"])
+
+    assert result["status"] == "done"
+    assert result["source_id"] == group_source
+    assert result["results"][0]["source_id"] == topic_source
+    assert result["results"][0]["topic_id"] == "456"
+
+
+def test_group_search_result_rejects_topic_from_another_chat(control, monkeypatch):
+    app, _projects, jobs, _submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    group_source = "telegram:-1009000:group"
+    app.sources[group_source] = {"project": PROJECT, "hashes": {}}
+    pending = app.handle("client", "search", group_source, "forum query", "1")
+    jobs[pending["job_id"]].update(
+        state="done", result={
+            "mode": "fts", "degraded": False, "degraded_reason": None,
+            "results": [{"source_id": "telegram:-1009001:topic:456",
+                         "message_id": "42", "text": "foreign result"}],
+        },
+    )
+
+    with pytest.raises(broker.Refused, match="SEARCH_RESULT_INVALID"):
+        app.handle("client", "search-result", pending["request_id"])
+
+
 def test_source_search_skips_status_lookup_for_known_terminal_requests(
     control, monkeypatch,
 ):

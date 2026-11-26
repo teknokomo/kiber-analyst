@@ -22,6 +22,7 @@ from typing import BinaryIO, Iterator
 from kiber_analyst import __version__ as KIBER_ANALYST_VERSION
 from kiber_analyst.config_paths import config_path, data_path, runtime_path
 from kiber_analyst.connectors.source_ids import parse_source_id
+from kiber_analyst.errors import LoadError
 from kiber_analyst.jobapi import api_call, submit_command
 from kiber_analyst.jobqueue import JobsError
 from kiber_analyst.media_limits import (
@@ -2157,12 +2158,19 @@ class Broker:
         if not 1 <= limit <= SEARCH_MAX_LIMIT:
             raise Refused('SEARCH_RESULT_INVALID')
         expected_source = row['source'] if row['operation'] == 'search' else None
+        expected_scope = telegram_export_source(expected_source) if expected_source else None
         safe_results = []
         for item in result['results'][:limit]:
             if not isinstance(item, dict):
                 raise Refused('SEARCH_RESULT_INVALID')
-            if expected_source is not None and item.get('source_id') != expected_source:
-                raise Refused('SEARCH_RESULT_INVALID')
+            if expected_source is not None:
+                item_source = item.get('source_id')
+                source_matches = item_source == expected_source
+                if not source_matches and expected_scope is not None and expected_scope[1] is None:
+                    result_scope = telegram_export_source(item_source)
+                    source_matches = result_scope is not None and result_scope[0] == expected_scope[0]
+                if not source_matches:
+                    raise Refused('SEARCH_RESULT_INVALID')
             safe_item = {key: item.get(key) for key in (
                 'source_id', 'chat_id', 'chat_title', 'topic_id', 'topic_title',
                 'message_id', 'author', 'score', 'thread_ref', 'item_ref',
@@ -2339,8 +2347,23 @@ class Broker:
             service_size, hashes['services.jsonl'] = _hash_input(
                 source, 'services.jsonl', CONTROL_FILE_MAX_BYTES,
             )
+            _services_manifest_size, services_manifest_sha = _hash_input(
+                source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES,
+            )
+            try:
+                services_manifest = json.loads(read_input(
+                    source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES,
+                ))
+            except (OSError, ValueError, UnicodeError):
+                raise Refused('SERVICES_MANIFEST_INVALID') from None
             if hashes != entry['hashes']:
                 raise Refused('HASH_MISMATCH')
+            if (not isinstance(services_manifest, dict)
+                    or services_manifest.get('source_id') != source_id
+                    or services_manifest.get('services_sha256') != hashes['services.jsonl']
+                    or type(services_manifest.get('event_count')) is not int
+                    or services_manifest['event_count'] < 0):
+                raise Refused('SERVICES_MANIFEST_INVALID')
             manifest_limit = _manifest_media_limit(manifest_bytes)
             downloaded_count = 0
             with open_input(source, 'messages.jsonl') as stream:
@@ -2359,11 +2382,19 @@ class Broker:
             except FileNotFoundError:
                 resume = None
             if resume is not None:
-                checkpoint = read_input(resume, 'status.json', 4 * 1024**2)
+                resume_hashes = dict(hashes)
+                resume_hashes['services_manifest.json'] = services_manifest_sha
+                try:
+                    checkpoint = read_input(resume, 'status.json', 4 * 1024**2)
+                except OSError:
+                    raise Refused('MEDIA_CHECKPOINT_INVALID') from None
                 resume_hash = hashlib.sha256(checkpoint).hexdigest()
-                recovered = resumed_photos(
-                    checkpoint, hashes, _iter_jsonl_input(source, 'messages.jsonl'),
-                )
+                try:
+                    recovered = resumed_photos(
+                        checkpoint, resume_hashes, _iter_jsonl_input(source, 'messages.jsonl'),
+                    )
+                except LoadError:
+                    raise Refused('MEDIA_CHECKPOINT_MISMATCH') from None
             missing_count = 0
             missing_ids = []
             over_limit_count = 0
@@ -2434,7 +2465,7 @@ class Broker:
         export = {'complete': manifest.get('complete') is True,
                   'messages': message_count,
                   'service_events': service_count,
-                  'sha256': hashes}
+                  'sha256': {**hashes, 'services_manifest.json': services_manifest_sha}}
         result = {'source_id': source_id, 'export': export, 'media': media,
                   'staging': {'checked': True, 'media_resume_sha256': resume_hash},
                   'ingest': by_operation.get('ingest'), 'embed': by_operation.get('embed'),

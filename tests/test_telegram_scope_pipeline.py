@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import tracemalloc
 import uuid
@@ -666,9 +667,18 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
         }
 
     before = snapshot()
-    unmarked_write_temp = ".publisher-init-write-" + uuid.uuid4().hex + ".tmp"
+    source_token = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:16]
+    unmarked_write_temp = f".publisher-init-write-{source_token}-{uuid.uuid4().hex}.tmp"
     (parent / unmarked_write_temp).write_bytes(b'{"partial":')
     (parent / unmarked_write_temp).chmod(0o600)
+    other_source = source_id + ":other-scope"
+    other_token = hashlib.sha256(other_source.encode("utf-8")).hexdigest()[:16]
+    other_source_temp = f".publisher-init-write-{other_token}-{uuid.uuid4().hex}.tmp"
+    (parent / other_source_temp).write_bytes(b'{"other":')
+    (parent / other_source_temp).chmod(0o600)
+    legacy_unscoped_temp = ".publisher-init-write-" + uuid.uuid4().hex + ".tmp"
+    (parent / legacy_unscoped_temp).write_bytes(b'{"legacy":')
+    (parent / legacy_unscoped_temp).chmod(0o600)
     parent_info = os.stat(parent)
     original_fsync_for_temp = os.fsync
     temp_recovery_syncs = []
@@ -685,6 +695,13 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
     )
     assert recovered_temp["status"] == "already_ready"
     assert not (parent / unmarked_write_temp).exists()
+    assert (parent / other_source_temp).exists()
+    assert (parent / legacy_unscoped_temp).exists()
+    assert recovered_temp["recovery_cleanup"]["reclaimed_bytes"] >= len(b'{"partial":')
+    assert recovered_temp["recovery_cleanup"]["preserved"] == {
+        "other_source_intent_write": 1,
+        "unscoped_legacy_intent_write": 1,
+    }
     assert any(temp_recovery_syncs)
     monkeypatch.setattr(telegram_publisher.os, "fsync", original_fsync_for_temp)
 
@@ -772,6 +789,284 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
             "copy", source_id, config_path=str(tmp_path / "config" / "publisher.json"),
         )
     assert snapshot() == before
+
+
+def _add_empty_media_resume_revision(export_dir: Path, source_id: str) -> str:
+    names = ("messages.jsonl", "services.jsonl", "manifest.json", "services_manifest.json")
+    hashes = {name: hashlib.sha256((export_dir / name).read_bytes()).hexdigest()
+              for name in names}
+    resume = export_dir / "media-resume"
+    resume.mkdir(mode=0o700)
+    checkpoint = {
+        "version": 2, "source_id": source_id, "inputs": hashes, "records": {},
+        "requested_max_file_bytes": telegram_publisher.MAX_FILE_BYTES,
+        "over_limit_message_ids": [],
+    }
+    checkpoint_bytes = (json.dumps(checkpoint, sort_keys=True) + "\n").encode()
+    (resume / "status.json").write_bytes(checkpoint_bytes)
+    (resume / "status.json").chmod(0o600)
+    media_manifest = {
+        "version": 2, "source_id": source_id, "inputs": hashes,
+        "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+        "requested_max_file_bytes": telegram_publisher.MAX_FILE_BYTES,
+        "media_count": 0, "remaining": 0, "complete": True,
+        "download_errors": 0,
+    }
+    (resume / "manifest.json").write_text(
+        json.dumps(media_manifest, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    (resume / "manifest.json").chmod(0o600)
+    return telegram_publisher._media_manifest_sha(media_manifest)
+
+
+def _add_interrupted_revision(parent: Path, *, kind: str, source_id: str,
+                              source_hashes: dict, stage: Path) -> tuple[str, str | None]:
+    old_media_sha = None
+    candidate_name = telegram_publisher._transfer_candidate_name(
+        source_id, source_hashes, old_media_sha,
+    )
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if kind in {"before_directory", "partial_init_directory", "complete_candidate"}:
+            init_name = ".publisher-init-" + uuid.uuid4().hex
+            telegram_publisher._write_init_intent(
+                parent_fd, init_name, uid=os.geteuid(), gid=os.getegid(),
+                source_id=source_id, source_hashes=source_hashes,
+                media_manifest_sha=old_media_sha,
+            )
+            if kind == "partial_init_directory":
+                os.mkdir(init_name, 0o700, dir_fd=parent_fd)
+                init_fd = os.open(init_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                  dir_fd=parent_fd)
+                try:
+                    fd = os.open("partial-metadata", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                 0o600, dir_fd=init_fd)
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(b"partial-init-data")
+                    os.fsync(init_fd)
+                finally:
+                    os.close(init_fd)
+            elif kind == "complete_candidate":
+                shutil.copytree(stage, parent / candidate_name)
+                marker = {
+                    "source_id": source_id, "source_hashes": source_hashes,
+                    "media_manifest_sha256": old_media_sha,
+                }
+                marker_path = parent / candidate_name / ".publisher-temp.json"
+                marker_path.write_text(json.dumps(marker, sort_keys=True) + "\n")
+                marker_path.chmod(0o600)
+        elif kind == "complete_candidate_marked":
+            shutil.copytree(stage, parent / candidate_name)
+            marker = {
+                "source_id": source_id, "source_hashes": source_hashes,
+                "media_manifest_sha256": old_media_sha,
+            }
+            marker_path = parent / candidate_name / ".publisher-temp.json"
+            marker_path.write_text(json.dumps(marker, sort_keys=True) + "\n")
+            marker_path.chmod(0o600)
+        elif kind == "partial_candidate":
+            marker = {
+                "source_id": source_id, "source_hashes": source_hashes,
+                "media_manifest_sha256": old_media_sha,
+            }
+            (parent / candidate_name).mkdir(mode=0o700)
+            (parent / candidate_name / ".publisher-temp.json").write_text(
+                json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8",
+            )
+            (parent / candidate_name / ".publisher-temp.json").chmod(0o600)
+            (parent / candidate_name / "messages.jsonl").write_bytes(b"partial-candidate")
+            (parent / candidate_name / "messages.jsonl").chmod(0o600)
+        else:
+            raise AssertionError(kind)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return candidate_name, old_media_sha
+
+
+@pytest.mark.parametrize(
+    "kind", ["before_directory", "partial_init_directory", "partial_candidate",
+             "complete_candidate", "complete_candidate_marked"],
+)
+def test_publisher_recovers_old_revision_before_publishing_new_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    parent = stage.parent
+    source_id = result["source_id"]
+    old_transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    candidate_name, old_media_sha = _add_interrupted_revision(
+        parent, kind=kind, source_id=source_id,
+        source_hashes=old_transfer["source_hashes"], stage=stage,
+    )
+    new_media_sha = _add_empty_media_resume_revision(result["export_dir"], source_id)
+    assert new_media_sha != old_media_sha
+    previous_ready_sha = hashlib.sha256(
+        (stage / "telegram_transfer_manifest.json").read_bytes()
+    ).hexdigest()
+
+    published = telegram_publisher.handle(
+        "copy", source_id, config_path=str(result["publisher_config"]),
+    )
+    current = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    assert published["status"] == "ready"
+    assert current["media_manifest_sha256"] == new_media_sha
+    assert (parent / ".revisions" / f"revision-{previous_ready_sha}").is_dir()
+    if kind in {"complete_candidate", "complete_candidate_marked"}:
+        # The fully verified unpublished candidate is retained separately;
+        # the prior ready package is retained in the normal revision archive.
+        recovery_archives = list((parent / ".revisions").glob("recovery-*"))
+        assert len(recovery_archives) == 1
+        revisions_fd = os.open(parent / ".revisions", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            recovered_record, recovered_sha = telegram_publisher._transfer_record(
+                revisions_fd, recovery_archives[0].name, uid=os.geteuid(),
+            )
+        finally:
+            os.close(revisions_fd)
+        assert recovered_record == old_transfer
+        assert recovered_sha == previous_ready_sha
+        assert published["recovery_cleanup"]["archived_candidates"] == 1
+    else:
+        assert not (parent / candidate_name).exists()
+        assert published["recovery_cleanup"]["reclaimed_bytes"] > 0
+
+    before_revisions = sorted(path.name for path in (parent / ".revisions").iterdir())
+    repeated = telegram_publisher.handle(
+        "copy", source_id, config_path=str(result["publisher_config"]),
+    )
+    assert repeated["status"] == "already_ready"
+    assert sorted(path.name for path in (parent / ".revisions").iterdir()) == before_revisions
+    assert repeated["recovery_cleanup"]["removed_artifacts"] == 0
+
+
+def test_publisher_keeps_previous_ready_revision_if_new_candidate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    source_id = result["source_id"]
+    old_transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    _add_interrupted_revision(
+        stage.parent, kind="before_directory", source_id=source_id,
+        source_hashes=old_transfer["source_hashes"], stage=stage,
+    )
+    new_media_sha = _add_empty_media_resume_revision(result["export_dir"], source_id)
+    old_bytes = (stage / "telegram_transfer_manifest.json").read_bytes()
+    write_file = telegram_publisher._write_file
+
+    def fail_candidate(parent_fd, name, data, **kwargs):
+        if name == "telegram_transfer_manifest.json":
+            raise OSError("simulated crash before candidate completion")
+        return write_file(parent_fd, name, data, **kwargs)
+
+    monkeypatch.setattr(telegram_publisher, "_write_file", fail_candidate)
+    with pytest.raises(OSError, match="simulated crash before candidate completion"):
+        telegram_publisher.handle(
+            "copy", source_id, config_path=str(result["publisher_config"]),
+        )
+    assert (stage / "telegram_transfer_manifest.json").read_bytes() == old_bytes
+    assert json.loads(old_bytes)["media_manifest_sha256"] is None
+
+    monkeypatch.setattr(telegram_publisher, "_write_file", write_file)
+    retried = telegram_publisher.handle(
+        "copy", source_id, config_path=str(result["publisher_config"]),
+    )
+    assert retried["status"] == "ready"
+    assert json.loads((stage / "telegram_transfer_manifest.json").read_text())[
+        "media_manifest_sha256"
+    ] == new_media_sha
+
+
+def test_publisher_cleanup_is_source_scoped_and_restores_storage_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    source_id = result["source_id"]
+    source_hashes = json.loads((stage / "telegram_transfer_manifest.json").read_text())[
+        "source_hashes"
+    ]
+    parent = stage.parent
+    old_media_sha = hashlib.sha256(b"old-media-revision").hexdigest()
+    stale_name = telegram_publisher._transfer_candidate_name(
+        source_id, source_hashes, old_media_sha,
+    )
+    marker = {
+        "source_id": source_id, "source_hashes": source_hashes,
+        "media_manifest_sha256": old_media_sha,
+    }
+    stale = parent / stale_name
+    stale.mkdir(mode=0o700)
+    (stale / ".publisher-temp.json").write_text(json.dumps(marker, sort_keys=True) + "\n")
+    (stale / ".publisher-temp.json").chmod(0o600)
+    stale_marker_size = (stale / ".publisher-temp.json").stat().st_size
+    payload = b"stale-private-candidate" * 4096
+    (stale / "messages.jsonl").write_bytes(payload)
+    (stale / "messages.jsonl").chmod(0o600)
+
+    other_source = source_id.rsplit(":", 1)[0] + ":topic:987"
+    other_hashes = dict(source_hashes)
+    other_media_sha = hashlib.sha256(b"another-source-revision").hexdigest()
+    other_name = telegram_publisher._transfer_candidate_name(
+        other_source, other_hashes, other_media_sha,
+    )
+    other_dir = parent / other_name
+    other_dir.mkdir(mode=0o700)
+    other_marker = {
+        "source_id": other_source, "source_hashes": other_hashes,
+        "media_manifest_sha256": other_media_sha,
+    }
+    (other_dir / ".publisher-temp.json").write_text(
+        json.dumps(other_marker, sort_keys=True) + "\n",
+    )
+    (other_dir / ".publisher-temp.json").chmod(0o600)
+    (other_dir / "messages.jsonl").write_bytes(b"keep-other-source")
+    (other_dir / "messages.jsonl").chmod(0o600)
+
+    config = telegram_publisher._safe_config(str(result["publisher_config"]))
+    current_temp_name = telegram_publisher._transfer_candidate_name(source_id, source_hashes, None)
+    with telegram_publisher._exclusive_lock(config):
+        before_available = telegram_publisher._available(config)[0]
+        destination_root = telegram_publisher._open_root(config["destination_root"])
+        try:
+            chat_fd = telegram_publisher._open_child(
+                destination_root, result["chat"], uid=config["destination_uid"],
+            )
+            try:
+                recovery = telegram_publisher._recover_initialization_directories(
+                    chat_fd, uid=config["destination_uid"], gid=config["destination_gid"],
+                    source_id=source_id, source_hashes=source_hashes,
+                    media_manifest_sha=None, temp_name=current_temp_name,
+                )
+            finally:
+                os.close(chat_fd)
+        finally:
+            os.close(destination_root)
+        after_available = telegram_publisher._available(config)[0]
+
+    assert recovery["removed_artifacts"] == 1
+    assert recovery["reclaimed_bytes"] == len(payload) + stale_marker_size
+    assert after_available - before_available == recovery["reclaimed_bytes"]
+    assert not stale.exists()
+    assert (other_dir / "messages.jsonl").read_bytes() == b"keep-other-source"
+    assert recovery["preserved"]["other_source_candidate"] == 1
 
 
 class _LargeHistoryTelegram(_ScopeTelegram):
