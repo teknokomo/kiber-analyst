@@ -18,16 +18,22 @@ CHAT = "-1007654321"
 
 
 class _ScopeTelegram:
-    def __init__(self, *, chat: str, scope: str, forum: bool, count: int = 1):
+    def __init__(self, *, chat: str, scope: str, forum: bool, count: int = 1,
+                 topic_provenance: bool = False):
         self.chat = chat
         self.scope = scope
         self.forum = forum
         self.count = count
+        self.topic_provenance = topic_provenance
         self.page_calls = 0
         self.service_calls = 0
 
     def info(self, _chat):
-        return {"id": int(self.chat), "forum": self.forum, "title": "Synthetic group"}
+        return {
+            "id": int(self.chat), "forum": self.forum,
+            "type": "supergroup" if self.forum else "group",
+            "title": "Synthetic group",
+        }
 
     def title(self, _chat, topic):
         return f"Synthetic topic {topic}" if topic is not None else None
@@ -36,6 +42,21 @@ class _ScopeTelegram:
         self.page_calls += 1
         if self.page_calls > 1:
             return []
+        if self.topic_provenance:
+            cases = [
+                (1004, {"forumTopic": False}),
+                (1003, {"forumTopic": True, "topMsgId": 17}),
+                (1002, {"forumTopic": True, "replyToMsgId": 1003}),
+                (1001, {"forumTopic": True, "replyToMsgId": 9999}),
+                (1000, {"forumTopic": True, "topMsgId": 17, "replyToMsgId": 1003}),
+            ]
+            return [{
+                "id": message_id, "date": "2026-01-01T00:00:00Z",
+                "sender": "Synthetic author", "senderId": 42,
+                "text": f"forum provenance {message_id}",
+                "topicId": 17 if message_id == 1002 else None,
+                "full": {"replyTo": reply}, "media": None,
+            } for message_id, reply in cases[:limit]]
         rows = []
         for index in range(self.count):
             message_id = 1000 - index
@@ -57,7 +78,7 @@ class _ScopeTelegram:
             })
         return rows[:limit]
 
-    def media_metadata(self, _chat, _message_ids):
+    def media_metadata(self, _chat, _message_ids, peer_type='supergroup'):
         return {}
 
     def service_page(self, _chat, topic, limit, before):
@@ -107,6 +128,7 @@ def _write_config(path: Path, value: dict, mode: int):
 def _run_scope_pipeline(
     tmp_path: Path, *, scope: str, forum: bool, count: int,
     monkeypatch: pytest.MonkeyPatch,
+    topic_provenance: bool = False, project_slug: str | None = None,
 ):
     if os.geteuid() == 0:
         pytest.skip("the restricted publisher intentionally refuses root execution")
@@ -138,7 +160,9 @@ def _run_scope_pipeline(
         "destination_uid": os.geteuid(), "destination_gid": os.getegid(),
     }, 0o600)
 
-    client = _ScopeTelegram(chat=chat, scope=scope, forum=forum, count=count)
+    project_slug = project_slug or PROJECT
+    client = _ScopeTelegram(chat=chat, scope=scope, forum=forum, count=count,
+                            topic_provenance=topic_provenance)
     root = Dir.root(str(export_root))
     try:
         export_manifest = export(
@@ -163,21 +187,39 @@ def _run_scope_pipeline(
     staged = inspect_export(stage, root=imports_root)
     transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
     assert transfer["source_id"] == source_id and staged.message_count == count
+    assert published["copied_bytes"] == transfer["copied_bytes"]
     assert staged.scope == ("chat" if scope == "group" else "topic")
     message_rows = [json.loads(line) for line in (stage / "messages.jsonl").read_text().splitlines()]
     event_rows = [json.loads(line) for line in (stage / "services.jsonl").read_text().splitlines()]
-    assert all((row["topic_id"] is None) == (not forum) for row in message_rows) if scope == "group" else all(
-        row["topic_id"] == topic for row in message_rows
+    assert published["copied_bytes"] == sum(
+        row["media"]["size_bytes"] for row in message_rows
+        if row.get("media") and row["media"].get("export_status") == "downloaded"
     )
+    if scope == "group" and not topic_provenance:
+        assert all((row["topic_id"] is None) == (not forum) for row in message_rows)
+    elif scope == "topic":
+        assert all(row["topic_id"] == topic for row in message_rows)
+    if topic_provenance:
+        assert [(row["message_id"], row["topic_id"], row["topic_id_status"])
+                for row in message_rows] == [
+                    (1004, 1, "known"), (1003, 17, "known"),
+                    (1002, 17, "known"), (1001, None, "unknown"),
+                    (1000, 17, "known"),
+                ]
+        assert export_manifest["topic_assignment_complete"] is False
+        assert export_manifest["topic_assignment_unknown_count"] == 1
     assert len(event_rows) == inspected.service_event_count
-    assert all((stage / row["media"]["path"]).is_file() for row in message_rows)
+    assert all(
+        row.get("media") is None or (stage / row["media"]["path"]).is_file()
+        for row in message_rows
+    )
 
     submissions = []
     monkeypatch.setattr(broker, "RESERVE", 0)
 
     def worker_api(action, **_kwargs):
         if action == "project-catalog":
-            return {"projects": [{"slug": PROJECT, "title": "Synthetic project"}]}
+            return {"projects": [{"slug": project_slug, "title": "Synthetic project"}]}
         if action == "source-overview":
             return {"messages": count, "unique_messages": count, "service_events": len(event_rows)}
         raise AssertionError(action)
@@ -187,11 +229,11 @@ def _run_scope_pipeline(
         return {"job_id": str(uuid.uuid4())}
 
     app = broker.Broker(
-        app_root, {}, worker_api=worker_api, submit=submit, authorized_projects={PROJECT},
+        app_root, {}, worker_api=worker_api, submit=submit, authorized_projects={project_slug},
     )
     try:
-        registration = app.handle("synthetic-owner", "source-add", source_id, PROJECT)
-        request = app.handle("synthetic-owner", "ingest-dry-run", source_id, PROJECT)
+        registration = app.handle("synthetic-owner", "source-add", source_id, project_slug)
+        request = app.handle("synthetic-owner", "ingest-dry-run", source_id, project_slug)
         worker_stage = Path(submissions[-1][0][submissions[-1][0].index("--job") + 1])
         normalized_dir, _metadata, media_missing = prepare_export(
             worker_stage, tmp_path / "normalized", root=imports_root,
@@ -208,17 +250,17 @@ def _run_scope_pipeline(
 
             dry = load_telegram_export(
                 worker_stage, tmp_path / "artifacts" / "scope-dry",
-                env_path=Path(test_env), project_slug=PROJECT, dry_run=True,
+                env_path=Path(test_env), project_slug=project_slug, dry_run=True,
                 root=imports_root,
             )
             assert dry["status"] == "dry_run" and dry["rollback_confirmed"] is True
             loaded = load_telegram_export(
                 worker_stage, tmp_path / "artifacts" / "scope-load",
-                env_path=Path(test_env), project_slug=PROJECT, root=imports_root,
+                env_path=Path(test_env), project_slug=project_slug, root=imports_root,
             )
             repeated = load_telegram_export(
                 worker_stage, tmp_path / "artifacts" / "scope-repeat",
-                env_path=Path(test_env), project_slug=PROJECT, root=imports_root,
+                env_path=Path(test_env), project_slug=project_slug, root=imports_root,
             )
             assert loaded["inserted"] == count
             assert loaded["service_events_inserted"] == len(event_rows)
@@ -226,7 +268,10 @@ def _run_scope_pipeline(
             assert repeated["service_events_skipped"] == len(event_rows)
         return {
             "source_id": source_id, "messages": message_rows, "events": event_rows,
-            "stage": stage, "sha256": hashlib.sha256((stage / "messages.jsonl").read_bytes()).hexdigest(),
+            "stage": stage, "export_dir": export_dir, "publisher_config": publisher_config_path,
+            "imports_root": imports_root, "chat": chat,
+            "project_slug": project_slug, "normalized": normalized,
+            "sha256": hashlib.sha256((stage / "messages.jsonl").read_bytes()).hexdigest(),
         }
     finally:
         app.db.close()
@@ -247,6 +292,155 @@ def test_group_forum_group_and_topic_export_transfer_register_and_stage(
     assert result["source_id"].endswith(":group") if scope == "group" else ":topic:17" in result["source_id"]
     assert len(result["messages"]) == count
     assert all("media" in row and row["media"]["path"].startswith("media/") for row in result["messages"])
+
+
+def test_forum_topic_provenance_is_explicit_and_survives_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    project = f"forum-provenance-{uuid.uuid4().hex[:10]}"
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=True, count=5, monkeypatch=monkeypatch,
+        topic_provenance=True, project_slug=project,
+    )
+    normalized = result["normalized"]
+    assert [(item["topic_id"], item["meta"]["topic_id_status"]) for item in normalized] == [
+        ("1", "known"), ("17", "known"), ("17", "known"),
+        (None, "unknown"), ("17", "known"),
+    ]
+    if optional_disposable_postgres_credentials is None:
+        return
+    import psycopg
+    from conftest import connect_validated_postgres
+
+    with connect_validated_postgres(
+        optional_disposable_postgres_credentials, psycopg.connect,
+    ) as conn:
+        rows = conn.execute(
+            """SELECT seg.meta->>'topic_id', seg.meta->>'topic_id_status',
+                      seg.meta->>'export_scope'
+                 FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+                 JOIN sources src ON src.id=doc.source_id
+                 JOIN projects p ON p.id=src.project_id
+                 WHERE p.slug=%s ORDER BY seg.external_ref DESC""",
+            (project,),
+        ).fetchall()
+    assert rows == [
+        ("1", "known", "chat"), ("17", "known", "chat"),
+        ("17", "known", "chat"), (None, "unknown", "chat"),
+        ("17", "known", "chat"),
+    ]
+
+
+def test_publisher_refuses_messages_changed_between_validation_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    source = result["export_dir"]
+    stage = result["stage"]
+    previous_stage = tmp_path / "preserved-previous-stage"
+    os.rename(stage, previous_stage)
+
+    messages = source / "messages.jsonl"
+    raw = messages.read_bytes()
+    decoded = json.loads(raw)
+    decoded["text"] = "updated source before second publication"
+    changed = (json.dumps(decoded, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    messages.write_bytes(changed)
+    messages.chmod(0o600)
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["messages_sha256"] = hashlib.sha256(changed).hexdigest()
+    manifest_bytes = (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode()
+    manifest_path.write_bytes(manifest_bytes)
+    manifest_path.chmod(0o600)
+
+    original_iter = telegram_publisher._validated_message_rows
+    validations = 0
+    mutation = b"updated source"
+    replacement = b"Updated source"
+
+    def change_source_after_sizing_pass(*args, **kwargs):
+        nonlocal validations
+        validations += 1
+        yield from original_iter(*args, **kwargs)
+        if validations == 3:
+            current = messages.read_bytes()
+            assert mutation in current
+            altered = current.replace(mutation, replacement, 1)
+            assert len(altered) == len(current)
+            with messages.open("wb") as stream:
+                stream.write(altered)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    monkeypatch.setattr(
+        telegram_publisher, "_validated_message_rows", change_source_after_sizing_pass,
+    )
+    with pytest.raises(telegram_publisher.TransferError, match="MESSAGES_HASH_MISMATCH"):
+        telegram_publisher.handle(
+            "copy", result["source_id"], config_path=str(result["publisher_config"]),
+        )
+
+    assert validations >= 4
+    assert previous_stage.is_dir()
+    assert not stage.exists()
+    chat_root = result["imports_root"] / result["chat"]
+    assert not list(chat_root.glob(".transfer-*"))
+    assert not list(chat_root.glob(".publisher-init-*"))
+    assert not list(chat_root.glob(".publisher-init-*.json"))
+
+
+def test_publisher_fsyncs_chat_directory_after_final_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    previous_stage = tmp_path / "preserved-ready-revision"
+    os.rename(stage, previous_stage)
+    parent_info = os.stat(stage.parent)
+    events: list[str] = []
+    final_renamed = False
+    original_rename = telegram_publisher._rename_noreplace
+    original_fsync = os.fsync
+
+    def record_rename(source_parent, source_name, destination_parent, destination_name):
+        nonlocal final_renamed
+        result_value = original_rename(
+            source_parent, source_name, destination_parent, destination_name,
+        )
+        parent = os.fstat(destination_parent)
+        if ((parent.st_dev, parent.st_ino) == (parent_info.st_dev, parent_info.st_ino)
+                and destination_name == stage.name):
+            events.append("final_rename")
+            final_renamed = True
+        return result_value
+
+    def record_fsync(fd):
+        info = os.fstat(fd)
+        if (final_renamed
+                and (info.st_dev, info.st_ino) == (parent_info.st_dev, parent_info.st_ino)):
+            events.append("chat_directory_fsync_after_final")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(telegram_publisher, "_rename_noreplace", record_rename)
+    monkeypatch.setattr(telegram_publisher.os, "fsync", record_fsync)
+    published = telegram_publisher.handle(
+        "copy", result["source_id"], config_path=str(result["publisher_config"]),
+    )
+    assert published["status"] == "ready"
+    assert events.index("final_rename") < events.index("chat_directory_fsync_after_final")
+    assert stage.is_dir() and previous_stage.is_dir()
 
 
 def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
@@ -283,13 +477,15 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
     parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         init_name = ".publisher-init-" + uuid.uuid4().hex
+        telegram_publisher._write_init_intent(
+            parent_fd, init_name, uid=os.geteuid(), gid=os.getegid(),
+            source_id=source_id, source_hashes=source_hashes,
+            media_manifest_sha=media_sha,
+        )
         os.mkdir(init_name, 0o700, dir_fd=parent_fd)
         init_fd = os.open(init_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         try:
-            fd = os.open(".publisher-temp.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600, dir_fd=init_fd)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write((json.dumps(marker, sort_keys=True) + "\n").encode())
+            # Simulate a crash after mkdir but before the internal marker.
             (parent / init_name / "partial-metadata").write_bytes(b"partial")
             (parent / init_name / "partial-metadata").chmod(0o600)
             os.fsync(init_fd)
@@ -314,12 +510,13 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
     finally:
         os.close(parent_fd)
 
-    # A valid marker lets the publisher discard both pre-manifest crash states;
-    # the completed revision remains byte-for-byte unchanged.
+    # The durable sidecar proves ownership of an init tree even before its
+    # in-directory marker exists; the completed revision remains unchanged.
     recovered = telegram_publisher.handle(
         "copy", source_id, config_path=str(tmp_path / "config" / "publisher.json"),
     )
     assert recovered["status"] == "already_ready"
+    assert (parent / init_name).with_suffix(".json").exists() is False
     assert not (parent / init_name).exists() and not (parent / temp_name).exists()
     assert snapshot() == before
 
@@ -333,12 +530,12 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
     os.chmod(temp_dir, 0o700)
     parent_info = os.stat(parent)
     real_fsync = os.fsync
-    synced_parent = []
+    synced_parent_after_removal = []
 
     def record_directory_fsync(fd):
         info = os.fstat(fd)
         if stat.S_ISDIR(info.st_mode) and info.st_ino == parent_info.st_ino:
-            synced_parent.append(info.st_ino)
+            synced_parent_after_removal.append(not temp_dir.exists())
         return real_fsync(fd)
 
     import stat
@@ -348,7 +545,8 @@ def test_publisher_recovers_marked_partial_temps_and_refuses_unknown_provenance(
         "copy", source_id, config_path=str(tmp_path / "config" / "publisher.json"),
     )
     assert recovered["status"] == "already_ready"
-    assert synced_parent and not temp_dir.exists()
+    assert not temp_dir.exists()
+    assert any(synced_parent_after_removal), "parent directory must be fsynced after temp removal"
     assert snapshot() == before
     monkeypatch.setattr(telegram_publisher.os, "fsync", real_fsync)
 
@@ -425,17 +623,27 @@ def test_history_over_32_mib_stays_streamed_through_publisher_and_broker(
             root, export_config, ["export", chat, "GROUP", "1000"], client=client,
         )
         services = export_services(root, export_config, chat, None, 1000, None, client=client)
+        _current, export_peak = tracemalloc.get_traced_memory()
+        assert export_peak < 64 * 1024**2
     finally:
         root.close()
     try:
         export_dir = export_root / chat / "group"
         message_path = export_dir / "messages.jsonl"
         size = message_path.stat().st_size
-        assert size > 32 * 1024**2
+        assert size > 70 * 1024**2
+        # Each stage must stay below the complete input size; 64 MiB leaves
+        # headroom for bounded 1,000-message exporter pages but catches a
+        # whole-file allocation of this >70 MiB history.
         expected_sha = hashlib.file_digest(message_path.open("rb"), "sha256").hexdigest()
         assert manifest["message_count"] == total
         assert services["complete"] is True
+        tracemalloc.reset_peak()
         assert inspect_export(export_dir, root=export_root).message_count == total
+        _current, inspect_peak = tracemalloc.get_traced_memory()
+        assert inspect_peak < 64 * 1024**2
+
+        tracemalloc.reset_peak()
         published = telegram_publisher.handle("copy", f"telegram:{chat}:group", config_path=str(publisher_config_path))
         assert published["status"] == "ready"
         stage = imports_root / chat / "group"
@@ -444,6 +652,8 @@ def test_history_over_32_mib_stays_streamed_through_publisher_and_broker(
         staged_sha = hashlib.file_digest(stage.joinpath("messages.jsonl").open("rb"), "sha256").hexdigest()
         assert transfer["staged_hashes"]["messages.jsonl"] == staged_sha
         assert stage.joinpath("messages.jsonl").stat().st_size > 32 * 1024**2
+        _current, publisher_peak = tracemalloc.get_traced_memory()
+        assert publisher_peak < 64 * 1024**2
 
         submissions = []
 
@@ -461,6 +671,7 @@ def test_history_over_32_mib_stays_streamed_through_publisher_and_broker(
         # This synthetic run verifies streaming behavior, not the deployment's
         # shared-storage reserve. Production retains the 5 GiB reserve.
         monkeypatch.setattr(broker, "RESERVE", 0)
+        tracemalloc.reset_peak()
         app = broker.Broker(app_root, {}, worker_api=worker_api, submit=submit,
                             authorized_projects={PROJECT})
         try:
@@ -476,7 +687,9 @@ def test_history_over_32_mib_stays_streamed_through_publisher_and_broker(
         finally:
             app.db.close()
         _current, peak = tracemalloc.get_traced_memory()
-        assert peak < 96 * 1024**2
+        # The history itself exceeds 70 MiB. Measure this stage independently
+        # so either publisher or broker buffering the whole JSONL is caught.
+        assert peak < 64 * 1024**2
     finally:
         tracemalloc.stop()
     test_env = os.environ.get("KIBER_ANALYST_INGEST_TEST_ENV")
@@ -501,6 +714,6 @@ def test_history_over_32_mib_stays_streamed_through_publisher_and_broker(
             assert loaded["inserted"] == total and loaded["errors"] == 0
             assert repeated["inserted"] == 0 and repeated["skipped"] == total
             _current, ingest_peak = tracemalloc.get_traced_memory()
-            assert ingest_peak < 96 * 1024**2
+            assert ingest_peak < 48 * 1024**2
         finally:
             tracemalloc.stop()

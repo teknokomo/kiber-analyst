@@ -58,7 +58,7 @@ class _FakeTelegram:
             },
         }]
 
-    def media_metadata(self, _chat: str, _ids: list[int]) -> dict:
+    def media_metadata(self, _chat: str, _ids: list[int], peer_type: str = 'supergroup') -> dict:
         return {}
 
     def service_page(self, _chat: str, _topic: int, _limit: int, _before: int | None) -> list:
@@ -125,7 +125,7 @@ class _InterruptedTelegram:
             "media": {"kind": "document", "size": len(payload), "file_name": f"{mid}.bin"},
         } for mid, payload in self.payloads.items()]
 
-    def media_metadata(self, _chat: str, _ids: list[int]) -> dict:
+    def media_metadata(self, _chat: str, _ids: list[int], peer_type: str = 'supergroup') -> dict:
         return {}
 
     def service_page(self, _chat: str, _topic: int, _limit: int, _before: int | None) -> list:
@@ -148,6 +148,128 @@ class _InterruptedTelegram:
 def _write_config(path: Path, config: dict, mode: int) -> None:
     path.write_text(json.dumps(config, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(mode)
+
+
+class _BasicGroupPhotoTelegram:
+    def __init__(self, chat: str):
+        self.chat = chat
+        self.pages = 0
+        self.metadata_calls = []
+        self.download_calls = 0
+
+    def info(self, _chat: str) -> dict:
+        return {"id": int(self.chat), "forum": False, "type": "group", "title": "Synthetic group"}
+
+    def title(self, _chat: str, _topic: int | None) -> None:
+        return None
+
+    def page(self, _chat: str, _topic: int | None, _limit: int, _before: int | None) -> list[dict]:
+        self.pages += 1
+        if self.pages > 1:
+            return []
+        return [{
+            "id": 42, "date": "2026-01-01T00:00:00Z", "sender": "Synthetic",
+            "senderId": 7, "text": "photo from a basic group", "media": {"kind": "photo"},
+        }]
+
+    def media_metadata(self, chat: str, ids: list[int], peer_type: str = "supergroup") -> dict:
+        self.metadata_calls.append((chat, ids, peer_type))
+        return {42: {
+            "_": "messageMediaPhoto",
+            "photo": {
+                "_": "photo",
+                "sizes": [
+                    {"_": "photoSize", "size": 17},
+                    {"_": "photoSize", "size": 51},
+                ],
+                "videoSizes": None,
+            },
+        }}
+
+    def service_page(self, _chat: str, _topic: int | None, _limit: int, _before: int | None) -> list:
+        return []
+
+    def download(self, _chat: str, _message: int, directory: Dir, _file_limit: int) -> None:
+        self.download_calls += 1
+        fd = os.open("photo.jpg", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory.fd)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(b"p" * 51)
+
+
+@pytest.mark.parametrize("peer_type,expected_method", [
+    ("group", "messages.GetMessages"),
+    ("supergroup", "channels.GetMessages"),
+    ("forum", "channels.GetMessages"),
+])
+def test_media_metadata_uses_the_telegram_method_for_each_peer_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer_type: str, expected_method: str,
+) -> None:
+    home = tmp_path / "telegram-home"
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
+    client = Client({"telegram_cli": "/unused", "telegram_home": str(home)})
+    calls = []
+
+    def fake_call(argv):
+        calls.append(argv)
+        return {"messages": [{
+            "id": 42,
+            "peerId": {"_": "peerChat", "chatId": 12345},
+            "media": {"_": "messageMediaPhoto", "photo": {"_": "photo", "sizes": []}},
+        }]}
+
+    monkeypatch.setattr(client, "call", fake_call)
+    result = client.media_metadata("-12345", [42], peer_type=peer_type)
+
+    assert result[42]["_"] == "messageMediaPhoto"
+    assert calls[0][1] == expected_method
+    params = json.loads(calls[0][calls[0].index("--params") + 1])
+    if peer_type == "group":
+        assert params == {"id": [{"_": "inputMessageID", "id": 42}]}
+    else:
+        assert params["channel"] == {"_chat": "-12345"}
+    if peer_type == "group":
+        monkeypatch.setattr(client, "call", lambda _argv: {
+            "messages": [{"id": 42, "media": {"_": "messageMediaPhoto"}}],
+        })
+        assert client.media_metadata("-12345", [42], peer_type="group") == {}
+
+
+@pytest.mark.parametrize("download_media", [False, True])
+def test_basic_group_photo_metadata_is_preserved_with_or_without_download(
+    tmp_path: Path, download_media: bool,
+) -> None:
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    export_root.chmod(0o700)
+    config = {"storage_limit_bytes": 1024**2, "min_free_bytes": 0}
+    client = _BasicGroupPhotoTelegram("-12345")
+    root = Dir.root(str(export_root))
+    try:
+        command = ["export", "-12345", "GROUP"]
+        if download_media:
+            command.append("MEDIA")
+        command.extend(["10", "100MiB"])
+        manifest = export(root, config, command, client=client)
+    finally:
+        root.close()
+
+    topic = export_root / "-12345" / "group"
+    message = json.loads((topic / "messages.jsonl").read_text(encoding="utf-8"))
+    assert manifest["complete"] is True
+    assert manifest["media_metadata_unavailable_count"] == 0
+    assert client.metadata_calls == [("-12345", [42], "group")]
+    assert message["media"]["size_bytes"] == 51
+    assert message["media"]["size_source"] == "photo.sizes"
+    if download_media:
+        assert client.download_calls == 1
+        assert message["media"]["export_status"] == "downloaded"
+        assert (topic / message["media"]["path"]).read_bytes() == b"p" * 51
+    else:
+        assert client.download_calls == 0
+        assert message["media"]["export_status"] == "not_requested"
+        assert "path" not in message["media"]
 
 
 def test_telegram_file_limit_uses_decimal_mb_and_default_mib() -> None:
@@ -194,6 +316,8 @@ def test_four_gigabyte_attachment_boundary_uses_decimal_bytes_without_allocating
 def test_export_publisher_registration_and_worker_stage_keep_media_over_100_mib(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
     media_size = 100 * 1024**2 + 1
     data_root = tmp_path / "data"
     export_root = data_root / "exports"
@@ -443,7 +567,7 @@ def test_publisher_configuration_rejects_outside_and_overlapping_storage_roots(
 
 
 def test_sequential_resume_revisions_keep_both_media_files(tmp_path: Path) -> None:
-    from telegram_pipeline_support import build_partial_media_revisions
+    from telegram_pipeline_support import _transfer_media_records, build_partial_media_revisions
 
     package = build_partial_media_revisions(tmp_path)
     final_stage = package["final_stage"]
@@ -458,7 +582,8 @@ def test_sequential_resume_revisions_keep_both_media_files(tmp_path: Path) -> No
     transfer = json.loads(
         (final_stage / "telegram_transfer_manifest.json").read_text(encoding="utf-8")
     )
-    large_record = next(item for item in transfer["media_files"] if item["message_id"] == 502)
+    large_record = next(item for item in _transfer_media_records(final_stage)
+                        if item["message_id"] == 502)
     assert large_record["size"] == 100 * 1024**2 + 1
     assert large_record["sha256"] == large_sha256
 
@@ -571,6 +696,40 @@ def test_export_resume_keeps_completed_download_receipt_when_free_space_shrinks(
         root.close()
 
 
+def test_export_resume_complete_noop_does_not_require_new_storage_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kiber_analyst.telegram_exporter as exporter
+
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    export_root.chmod(0o700)
+    client = _FakeTelegram(32_768)
+    config = {"storage_limit_bytes": 1024**3, "min_free_bytes": 0}
+    root = Dir.root(str(export_root))
+    try:
+        export(root, config, ["export", CHAT, str(TOPIC), "100"], client=client)
+        export_services(root, config, CHAT, TOPIC, 100, None, client=client)
+        first = exporter.export_resume(root, config, CHAT, TOPIC, 100, None, client)
+        assert first["status"] == "complete"
+
+        resume_dir = export_root / CHAT / str(TOPIC) / "media-resume"
+        checkpoint_before = (resume_dir / "status.json").read_bytes()
+        manifest_before = (resume_dir / "manifest.json").read_bytes()
+
+        def no_headroom(_self, _required):
+            raise exporter.ExportError("STORAGE_BUDGET_EXHAUSTED")
+
+        monkeypatch.setattr(exporter.Budget, "check", no_headroom)
+        repeated = exporter.export_resume(root, config, CHAT, TOPIC, 100, None, client)
+
+        assert repeated["status"] == "complete"
+        assert (resume_dir / "status.json").read_bytes() == checkpoint_before
+        assert (resume_dir / "manifest.json").read_bytes() == manifest_before
+    finally:
+        root.close()
+
+
 @pytest.mark.parametrize("channel", ["stdout", "stderr"])
 def test_telegram_cli_bounds_output_while_reading_and_kills_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str,
@@ -601,6 +760,44 @@ def test_telegram_cli_bounds_output_while_reading_and_kills_process_group(
     assert time.monotonic() - started < 1.5
     time.sleep(0.65)
     assert not marker.exists()
+
+
+def test_pinned_better_tg_cli_mock_download_uses_only_local_write_exception(
+    tmp_path: Path,
+) -> None:
+    cli = os.environ.get("KIBER_BETTER_TG_CLI_BIN")
+    if not cli:
+        pytest.skip("CI or operator must provide the pinned Better-TG-CLI executable")
+    import subprocess
+
+    home = tmp_path / "telegram-home"
+    home.mkdir(mode=0o700)
+    home.chmod(0o700)
+    client = Client({"telegram_cli": cli, "telegram_home": str(home)})
+    client.env["TG_MOCK"] = "1"
+    client.env["TG_NO_UPDATE_CHECK"] = "1"
+    with pytest.raises(ExportError, match="Unsafe Telegram CLI permission override"):
+        client.call(["api", "messages.SendMessage"], read_only=False)
+    assert client.env["TG_READ_ONLY"] == "1"
+    version = subprocess.run(
+        [cli, "--version"], cwd=home, env=client.env,
+        capture_output=True, timeout=15, check=True,
+    )
+    assert version.stdout.decode("utf-8").strip() == "0.41.2"
+
+    output = tmp_path / "media-output"
+    output.mkdir(mode=0o700)
+    output.chmod(0o700)
+    directory = Dir.root(str(output))
+    try:
+        response = client.download("-1004002", 1, directory, file_limit=4 * 1024**2)
+        names = directory.names()
+        assert response["messageId"] == 1
+        assert len(names) == 1
+        size, digest = directory.digest(names[0], 4 * 1024**2)
+        assert size > 0 and len(digest) == 64
+    finally:
+        directory.close()
 
 
 def test_export_manifest_bounds_skipped_media_sample_and_keeps_exact_counts(

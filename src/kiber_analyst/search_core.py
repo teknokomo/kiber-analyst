@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 from datetime import date
 from typing import Any
 
 from kiber_analyst.embedding_contract import MODEL_KEY
 from kiber_analyst.errors import SearchError
+from kiber_analyst.telegram_source import parse_telegram_source
 
 SEARCH_SQL = """
 WITH query_args AS (
@@ -37,7 +37,9 @@ search_units AS (
     p.id AS project_id,
     p.slug AS project_slug,
     (CASE WHEN so.kind = 'telegram'
-      THEN ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id'))
+      THEN CASE WHEN s.meta->>'topic_id' IS NULL
+           THEN ('telegram:' || so.external_id || ':group')
+           ELSE ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id')) END
       ELSE (so.kind || ':' || so.external_id) END) AS source_id,
     so.external_id AS chat_id,
     CASE WHEN so.kind = 'telegram' THEN p.title
@@ -79,7 +81,9 @@ search_units AS (
     p.id AS project_id,
     p.slug AS project_slug,
     (CASE WHEN so.kind = 'telegram'
-      THEN ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id'))
+      THEN CASE WHEN s.meta->>'topic_id' IS NULL
+           THEN ('telegram:' || so.external_id || ':group')
+           ELSE ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id')) END
       ELSE (so.kind || ':' || so.external_id) END) AS source_id,
     so.external_id AS chat_id,
     CASE WHEN so.kind = 'telegram' THEN p.title
@@ -118,7 +122,10 @@ base AS (
          ((%(date_to)s::date + 1)::timestamp AT TIME ZONE 'Europe/Moscow'))
     AND (%(author)s::text IS NULL OR u.author ILIKE '%%' || %(author)s::text || '%%')
     AND (%(topic)s::text IS NULL OR u.meta->>'topic_id' = %(topic)s::text)
-    AND (%(source_id)s::text IS NULL OR u.source_id = %(source_id)s::text)
+    AND (%(source_id)s::text IS NULL OR u.source_id = %(source_id)s::text OR
+         (%(source_id)s::text ~ '^telegram:-[1-9][0-9]{0,18}:group$'
+          AND u.source_kind = 'telegram'
+          AND u.chat_id = split_part(%(source_id)s::text, ':', 2)))
 ),
 lexical_rank AS (
   SELECT b.unit_key,
@@ -225,9 +232,8 @@ def execute_search(
         from kiber_analyst.connectors.source_ids import parse_source_id
 
         external_source = parse_source_id(source_id)
-        if external_source is None and not re.fullmatch(
-            r"telegram:-[1-9][0-9]{0,18}:topic:[1-9][0-9]{0,9}", source_id
-        ):
+        telegram_source = parse_telegram_source(source_id)
+        if external_source is None and telegram_source is None:
             raise SearchError("Source ID is invalid")
     if type(limit) is not int or not 1 <= limit <= 100:
         raise SearchError("Limit must be between 1 and 100")
@@ -258,15 +264,16 @@ def execute_search(
                     if not cursor.fetchone():
                         raise SearchError("External source does not exist")
                 else:
+                    chat, topic_id = telegram_source
                     cursor.execute(
                         """SELECT 1 FROM sources so
                            JOIN projects p ON p.id = so.project_id
                            JOIN documents d ON d.source_id = so.id
                            WHERE p.slug = %s AND so.kind = 'telegram'
-                             AND ('telegram:' || so.external_id || ':topic:' ||
-                                  (d.meta->>'topic_id')) = %s
+                             AND so.external_id = %s
+                                 AND (%s::text IS NULL OR d.meta->>'topic_id' = %s::text)
                            LIMIT 1""",
-                        (project, source_id),
+                        (project, chat, topic_id, topic_id),
                     )
                     if not cursor.fetchone():
                         raise SearchError("Telegram source or topic does not exist")

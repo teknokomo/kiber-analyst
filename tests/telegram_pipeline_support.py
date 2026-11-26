@@ -6,6 +6,8 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
+
 from kiber_analyst.telegram_exporter import (
     DEFAULT_FILE_BYTES,
     MAX_FILE_BYTES,
@@ -52,7 +54,7 @@ class _PartialMediaClient:
             for mid, size in self.sizes.items()
         ]
 
-    def media_metadata(self, _chat, message_ids):
+    def media_metadata(self, _chat, message_ids, peer_type='supergroup'):
         return {
             mid: {"document": {"_": "document", "size": self.sizes[mid]}}
             for mid in message_ids
@@ -97,6 +99,13 @@ def _private_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
     path.parent.chmod(0o700)
 
 
+def _transfer_media_records(stage: Path) -> list[dict]:
+    transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    if transfer.get("version") == 1:
+        return transfer["media_files"]
+    return [json.loads(line) for line in (stage / "media_files.jsonl").read_text().splitlines()]
+
+
 def build_partial_media_revisions(
     tmp_path: Path,
     *,
@@ -104,6 +113,8 @@ def build_partial_media_revisions(
     chat_id: str | None = None,
 ) -> dict[str, Path | str]:
     """Build initial, A-only, and cumulative A+B immutable publisher revisions."""
+    if os.geteuid() == 0:
+        pytest.skip("publisher integration tests require a non-root user")
     chat = chat_id or f"-100{uuid.uuid4().int % 10**15 + 1}"
     topic = _PartialMediaClient.topic
     source_id = f"telegram:{chat}:topic:{topic}"
@@ -168,9 +179,7 @@ def build_partial_media_revisions(
         )
         first_stage = import_root / chat / str(topic)
         assert first_publish["status"] == "ready"
-        assert [item["message_id"] for item in json.loads(
-            (first_stage / "telegram_transfer_manifest.json").read_text()
-        )["media_files"]] == [501]
+        assert [item["message_id"] for item in _transfer_media_records(first_stage)] == [501]
         if after_first_stage is not None:
             after_first_stage(first_stage)
 
@@ -183,9 +192,7 @@ def build_partial_media_revisions(
         )
         final_stage = import_root / chat / str(topic)
         assert second_publish["status"] == "ready"
-        final_files = json.loads((final_stage / "telegram_transfer_manifest.json").read_text())[
-            "media_files"
-        ]
+        final_files = _transfer_media_records(final_stage)
         assert sorted(item["message_id"] for item in final_files) == [501, 502]
         assert (final_stage / "media/501/item-501.bin").is_file()
         assert (final_stage / "media/502/item-502.bin").is_file()

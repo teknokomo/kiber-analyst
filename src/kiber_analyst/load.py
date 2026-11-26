@@ -148,7 +148,18 @@ def _assert_telegram_refs_project(
              AND project.slug = %s AND doc.doc_type = 'export'""",
         (chat_id, project_slug),
     )
-    for prior_scope, prior_topic in cursor.fetchall():
+    previous_scopes = cursor.fetchall()
+    cursor.execute(
+        """SELECT snapshot.scope, snapshot.meta->>'topic_id'
+           FROM snapshots snapshot
+           JOIN sources src ON src.id = snapshot.source_id
+           JOIN projects project ON project.id = src.project_id
+           WHERE src.kind = 'telegram' AND src.external_id = %s
+             AND project.slug = %s""",
+        (chat_id, project_slug),
+    )
+    previous_scopes.extend(cursor.fetchall())
+    for prior_scope, prior_topic in previous_scopes:
         # Legacy topic documents have a topic_id but no explicit scope. A null
         # topic on a legacy row is ambiguous, so refuse a potentially mixed set.
         if prior_scope not in {"topic", "chat"}:
@@ -206,6 +217,30 @@ def _assert_snapshot_scope(
     row = cursor.fetchone()
     if row is not None and (row[0] != scope or row[1] != topic_id):
         raise TelegramScopeConflict("Telegram snapshot hash is already recorded for another scope")
+
+
+def _snapshot_identity(
+    cursor: Any, source_id: str, content_sha256: str, scope: str, topic_id: str | None,
+) -> tuple[str, bool]:
+    """Keep the historical raw hash unless it already identifies another scope."""
+    cursor.execute(
+        "SELECT scope, meta->>'topic_id' FROM snapshots WHERE source_id=%s::uuid AND sha256=%s",
+        (source_id, content_sha256),
+    )
+    previous = cursor.fetchone()
+    if previous is None or (previous[0] == scope and previous[1] == topic_id):
+        return content_sha256, False
+    qualified = hashlib.sha256(
+        f"telegram-scope-v1\0{scope}\0{topic_id or ''}\0{content_sha256}".encode()
+    ).hexdigest()
+    cursor.execute(
+        "SELECT scope, meta->>'topic_id' FROM snapshots WHERE source_id=%s::uuid AND sha256=%s",
+        (source_id, qualified),
+    )
+    existing = cursor.fetchone()
+    if existing is not None and (existing[0] != scope or existing[1] != topic_id):
+        raise TelegramScopeConflict("Telegram scoped snapshot identity conflicts with another scope")
+    return qualified, True
 
 
 def _project_id(cursor: Any, project_slug: str = PROJECT_SLUG) -> str:
@@ -267,8 +302,15 @@ def _snapshot_id(
     uri: str,
     scope: str,
     topic_id: str | None,
+    *,
+    content_sha256: str | None = None,
+    scope_qualified: bool = False,
 ) -> str:
     meta = {"topic_id": topic_id}
+    if content_sha256 is not None:
+        meta["content_sha256"] = content_sha256
+    if scope_qualified:
+        meta["scope_key_version"] = 1
     cursor.execute(
         """INSERT INTO snapshots (source_id, sha256, size_bytes, uri, scope, meta)
            VALUES (%s::uuid, %s, %s, %s, %s, %s::jsonb)
@@ -761,9 +803,13 @@ def load_job(
                 )
                 project_id = _project_id(cursor, project_slug)
                 source_id = _source_id(cursor, project_id, manifest)
-                _assert_snapshot_scope(cursor, source_id, sha256, scope, scope_topic_id)
+                snapshot_sha256, scope_qualified = _snapshot_identity(
+                    cursor, source_id, sha256, scope, scope_topic_id,
+                )
+                _assert_snapshot_scope(cursor, source_id, snapshot_sha256, scope, scope_topic_id)
                 snapshot_id = _snapshot_id(
-                    cursor, source_id, sha256, size, uri, scope, scope_topic_id
+                    cursor, source_id, snapshot_sha256, size, uri, scope, scope_topic_id,
+                    content_sha256=sha256, scope_qualified=scope_qualified,
                 )
                 import_key = manifest.get("telegram_import_key")
                 topic_data = {

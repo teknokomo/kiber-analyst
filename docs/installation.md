@@ -65,8 +65,12 @@ Pass an explicit archive URI, chat identifier, and topic scope. The application 
 
 The Python package installs `kiber-analyst-telegram-export` and
 `kiber-analyst-telegram-publish`. The supported Telegram CLI is Better-TG-CLI
-v0.41.2 (Node.js >=20): `npm install --global better-tg-cli@0.41.2`; verify with
-`telegram --version`. The integration uses its `info`, `read`, `api`, forum
+v0.41.2 (Node.js >=20): `npm install --global better-tg-cli@0.41.2`. Resolve
+the installed executable as the service user, set its absolute path in
+`telegram_cli`, and verify that exact path with `"$TELEGRAM_CLI" --version`.
+The exporter launches child processes with a fixed `PATH=/usr/bin:/bin`, so
+Node must be available there (for example, `/usr/bin/node`); do not rely on an
+interactive shell's PATH. The integration uses `info`, `read`, `api`, forum
 topic lookup and `download` command interfaces. It requires an account already
 authorized on that machine. Configure the
 private file paths, storage quota, and optional mounted-filesystem UUID from

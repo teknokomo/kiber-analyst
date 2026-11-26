@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -205,6 +206,30 @@ def test_inspect_export_checks_jsonl_size_before_scanning_and_accepts_exact_limi
 
     expected_scanned_files = 1 if largest == services else 0
     assert len(scanned_streams) == expected_scanned_files
+
+
+def test_jsonl_reader_bounds_a_newline_free_record_before_allocation() -> None:
+    import kiber_analyst.telegram_ingest as telegram_ingest
+
+    class UnboundedInput:
+        def __init__(self):
+            self.requested = []
+
+        def readline(self, size: int) -> bytes:
+            self.requested.append(size)
+            return b"x" * size
+
+    stream = UnboundedInput()
+    tracemalloc.start()
+    try:
+        with pytest.raises(LoadError, match="record 1 is oversized"):
+            next(telegram_ingest._iter_jsonl_stream(stream))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert stream.requested == [telegram_ingest._MAX_LINE_BYTES + 1]
+    assert peak < 8 * 1024**2
 
 
 def test_media_metadata_is_checked_and_missing_media_counted(tmp_path: Path) -> None:

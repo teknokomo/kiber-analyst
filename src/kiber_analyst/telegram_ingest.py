@@ -54,6 +54,7 @@ class TelegramExport:
     chat_title: str | None
     max_file_bytes: int
     services_manifest: dict[str, Any]
+    forum: bool | None = None
 
     @property
     def import_key(self) -> str:
@@ -188,7 +189,15 @@ def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
 
 
 def _iter_jsonl_stream(stream) -> Iterator[tuple[bytes, dict[str, Any]]]:
-    for number, raw in enumerate(stream, 1):
+    number = 0
+    while True:
+        # readline(size) bounds allocation even when an attacker supplies a
+        # newline-free record.  The extra byte distinguishes an exact-limit
+        # record from an oversized one without buffering the rest of the file.
+        raw = stream.readline(_MAX_LINE_BYTES + 1)
+        if not raw:
+            break
+        number += 1
         if len(raw) > _MAX_LINE_BYTES:
             raise LoadError(f"Telegram JSONL record {number} is oversized")
         try:
@@ -237,6 +246,19 @@ def _validate_message(
         raise LoadError("Telegram message is outside the exported topic")
     if scope == "chat" and row_topic is not None and (type(row_topic) is not int or row_topic <= 0):
         raise LoadError("Telegram message has an invalid forum topic ID")
+    topic_status = value.get("topic_id_status")
+    if topic_status is not None and (
+        not isinstance(topic_status, str)
+        or topic_status not in {"known", "unknown", "not_applicable"}
+    ):
+        raise LoadError("Telegram message has an invalid topic provenance status")
+    if scope == "topic" and topic_status not in (None, "known"):
+        raise LoadError("Topic export has inconsistent topic provenance")
+    if scope == "chat":
+        if topic_status == "known" and row_topic is None:
+            raise LoadError("Known topic provenance has no topic ID")
+        if topic_status in {"unknown", "not_applicable"} and row_topic is not None:
+            raise LoadError("Unassigned topic provenance has a topic ID")
     if not isinstance(value.get("date"), str) or not isinstance(value.get("text"), str):
         raise LoadError("Telegram message is missing its date or text")
     if "sender_name" in value and value["sender_name"] is not None and not isinstance(value["sender_name"], str):
@@ -383,6 +405,7 @@ def inspect_export(
         chat_title=manifest.get("chat_title") if isinstance(manifest.get("chat_title"), str) else None,
         max_file_bytes=max_file_bytes,
         services_manifest=services,
+        forum=manifest.get("forum") if type(manifest.get("forum")) is bool else None,
     )
 
 
@@ -491,6 +514,18 @@ def _normalize_message(
     text = value["text"]
     source_topic = value.get("topic_id") if export.scope == "chat" else export.topic_id
     topic_id = str(source_topic) if source_topic is not None else None
+    topic_status = value.get("topic_id_status")
+    if export.scope == "topic":
+        topic_status = "known"
+    elif topic_status is None:
+        if source_topic is not None:
+            topic_status = "known"
+        elif export.forum is True:
+            topic_status = "unknown"
+        else:
+            # Legacy full-group exports did not carry forum metadata. Do not
+            # infer a forum topic from an absent ID.
+            topic_status = "unknown" if export.forum is None else "not_applicable"
     internal_chat_id = export.chat_id.removeprefix("-100").removeprefix("-")
     message_url = (
         _make_url(export.chat_id, topic_id, str(message_id))
@@ -517,7 +552,11 @@ def _normalize_message(
         "edited_at": None,
         "content_hash": normalized_content_hash(text),
         "url": message_url,
-        "meta": {"export_scope": export.scope, **({"media_export": media_meta} if media_meta else {})},
+        "meta": {
+            "export_scope": export.scope,
+            "topic_id_status": topic_status,
+            **({"media_export": media_meta} if media_meta else {}),
+        },
         "_media_missing": media_missing,
     }, media_missing
 
@@ -562,6 +601,9 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
     messages_digest = hashlib.sha256()
     normalized_count = 0
     media_missing = 0
+    topic_titles: dict[str, str | None] = {}
+    unknown_topic_ids: list[int] = []
+    unknown_topic_count = 0
     try:
         with os.fdopen(fd, "wb") as output:
             for raw, item in _iter_jsonl(export.path / "messages.jsonl"):
@@ -569,6 +611,18 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
                 normalized, missing = _normalize_message(
                     export, item, recovered.get(item["message_id"]), media_limit_bytes,
                 )
+                if export.scope == "chat":
+                    topic_status = normalized["meta"].get("topic_id_status")
+                    if topic_status == "unknown":
+                        unknown_topic_count += 1
+                        if len(unknown_topic_ids) < 100:
+                            unknown_topic_ids.append(item["message_id"])
+                    topic = normalized.get("topic_id")
+                    if topic is not None:
+                        topic_titles.setdefault(
+                            str(topic), item.get("topic_title")
+                            if isinstance(item.get("topic_title"), str) else None,
+                        )
                 encoded = (json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
                 output.write(encoded)
                 normalized_count += 1
@@ -584,13 +638,7 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
         uri = f"telegram-export://{export.chat_id}/{scope_dir}/{export.message_sha256}"
         archive_scope = export.scope
         archive_topic = str(export.topic_id) if export.topic_id is not None else None
-        topic_titles: dict[str, str | None] = {}
-        if export.scope == "chat":
-            for _raw, item in _iter_jsonl(export.path / "messages.jsonl"):
-                if item.get("topic_id") is not None:
-                    topic_titles.setdefault(str(item["topic_id"]),
-                                            item.get("topic_title") if isinstance(item.get("topic_title"), str) else None)
-        else:
+        if export.scope != "chat":
             topic_titles[archive_topic] = export.topic_title
         normalized_manifest = {
             "source_id": source_id,
@@ -607,6 +655,11 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
             "media_resume_count": len(recovered),
             "media_max_file_bytes": media_limit_bytes,
             "media_size_unit": "bytes",
+            "forum": export.forum,
+            "topic_assignment_complete": unknown_topic_count == 0,
+            "topic_assignment_unknown_count": unknown_topic_count,
+            "topic_assignment_unknown_message_ids": unknown_topic_ids,
+            "topic_assignment_unknown_sample_truncated": unknown_topic_count > len(unknown_topic_ids),
             "parse": {
                 "chat_title": export.chat_title,
                 "topics": [

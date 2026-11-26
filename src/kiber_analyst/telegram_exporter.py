@@ -89,7 +89,9 @@ def parse(args):
     if cmd == 'export-resume':
         if not re.fullmatch(r'-?[1-9][0-9]{0,18}', chat) or len(rest) > 2:
             raise ExportError('Use export-resume NUMERIC_CHAT TOPIC|GROUP [MAX_FILE_SIZE] [BATCH]')
-        max_file_bytes = _file_limit_bytes(rest[0] if rest else None)
+        # Preserve the distinction between the default on a fresh export and
+        # an omitted limit on resume, where the stored checkpoint is canonical.
+        max_file_bytes = _file_limit_bytes(rest[0]) if rest else None
         batch = numeric(rest[1], 100) if len(rest) > 1 else DEFAULT_RESUME_BATCH
         return cmd, chat, topic, False, batch, None, max_file_bytes
     if cmd == 'export-status':
@@ -261,7 +263,7 @@ class Dir:
             except FileNotFoundError:
                 pass
 
-    def private_stream_temp(self, chunks):
+    def private_stream_temp(self, chunks, budget=None, reserve_bytes=65536):
         """Write a private streamed candidate and return its name, size, and SHA-256."""
         temp = '.tmp-services-' + uuid.uuid4().hex
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -275,7 +277,13 @@ class Dir:
                 for chunk in chunks:
                     if not isinstance(chunk, bytes):
                         raise ExportError('Invalid streamed output chunk')
+                    if budget is not None:
+                        # Already-written candidate bytes are included in
+                        # tree_size; reserve only the next chunk and metadata.
+                        budget.check(len(chunk) + reserve_bytes)
                     stream.write(chunk)
+                    if budget is not None and hasattr(budget, 'consume'):
+                        budget.consume(len(chunk))
                     digest.update(chunk)
                     total += len(chunk)
                 stream.flush()
@@ -395,6 +403,13 @@ class Budget:
             raise ExportError('Invalid storage reservation')
         self.reserved_bytes += amount * PIPELINE_MEDIA_COPIES
 
+    def check_pipeline(self, amount):
+        if type(amount) is not int or amount < 0:
+            raise ExportError('Storage budget exhausted')
+        aggregate = self.cfg.get('aggregate_available_bytes')
+        if type(aggregate) is int and aggregate - self.reserved_bytes < amount:
+            raise ExportError('Storage budget exhausted')
+
     def check(self, extra=0):
         if type(extra) is not int or extra < 0:
             raise ExportError('Storage budget exhausted')
@@ -430,7 +445,15 @@ class Client:
             'TG_READ_ONLY': '1', 'TG_NO_UPDATE_CHECK': '1', 'TG_FLOOD_WAIT_MAX': '60',
         }
 
-    def call(self, argv, output=None, file_limit=MAX_FILE, timeout=300):
+    def call(self, argv, output=None, file_limit=MAX_FILE, timeout=300, *, read_only=True):
+        call_env = dict(self.env)
+        if not read_only:
+            # Better-TG-CLI v0.41.2 classifies its local download command as a
+            # write operation. This call only writes to the supplied file fd;
+            # no Telegram mutation command is allowed through this exception.
+            if not argv or argv[0] != 'download' or output is None:
+                raise ExportError('Unsafe Telegram CLI permission override')
+            call_env.pop('TG_READ_ONLY', None)
         def limits():
             resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
         process = None
@@ -459,7 +482,7 @@ class Client:
         try:
             process = subprocess.Popen(
                 [self.cli, *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                env=self.env, cwd=self.home, close_fds=True,
+                env=call_env, cwd=self.home, close_fds=True,
                 pass_fds=(output.fd,) if output else (), preexec_fn=limits,
                 start_new_session=True,
             )
@@ -578,15 +601,28 @@ class Client:
             raise ExportError('Invalid Telegram service page shape')
         return messages
 
-    def media_metadata(self, chat, ids):
-        params = {'channel': {'_chat': chat},
-                  'id': [{'_': 'inputMessageID', 'id': mid} for mid in ids]}
-        result = self.call(['api', 'channels.GetMessages', '--params', json.dumps(params)])
+    def media_metadata(self, chat, ids, peer_type='supergroup'):
+        if not ids:
+            return {}
+        input_ids = [{'_': 'inputMessageID', 'id': mid} for mid in ids]
+        if peer_type in {'group', 'basic_group', 'chat'}:
+            method = 'messages.GetMessages'
+            params = {'id': input_ids}
+        else:
+            method = 'channels.GetMessages'
+            params = {'channel': {'_chat': chat}, 'id': input_ids}
+        result = self.call(['api', method, '--params', json.dumps(params)])
         messages = result.get('messages')
         if not isinstance(messages, list):
-            raise ExportError('Invalid Telegram media metadata response')
-        return {m['id']: m.get('media') for m in messages
-                if isinstance(m, dict) and type(m.get('id')) is int}
+            return {}
+        result_by_id = {}
+        for message in messages:
+            if not isinstance(message, dict) or type(message.get('id')) is not int:
+                continue
+            if peer_type in {'group', 'basic_group', 'chat'} and not _message_matches_basic_group(message, chat):
+                continue
+            result_by_id[message['id']] = message.get('media')
+        return result_by_id
 
     def download(self, chat, message, directory, file_limit=MAX_FILE):
         # The pinned client streams to a file. The kernel rejects writes beyond
@@ -596,44 +632,84 @@ class Client:
         timeout = min(12 * 60 * 60, max(300, 300 + file_limit // (128 * 1024)))
         return self.call(['download', chat, str(message), '--output',
                           '/proc/self/fd/'+str(directory.fd), '--json'],
-                         directory, file_limit=file_limit, timeout=timeout)
+                         directory, file_limit=file_limit, timeout=timeout,
+                         read_only=False)
 
 
-def belongs(message, topic):
+def _message_matches_basic_group(message, chat):
+    """Require the messages.getMessages result to identify the requested peer."""
+    peer = _first(message, 'peerId', 'peer_id', 'peer', 'chatId', 'chat_id')
+    if isinstance(peer, dict):
+        kind = str(peer.get('_', peer.get('type', ''))).lower()
+        if kind and 'chat' not in kind:
+            return False
+        peer = _first(peer, 'chatId', 'chat_id', 'id')
+    if type(peer) is bool or not isinstance(peer, (int, str)):
+        return False
+    expected = str(chat)
+    aliases = {expected}
+    try:
+        aliases.add(str(abs(int(expected))))
+    except ValueError:
+        pass
+    return str(peer) in aliases
+
+
+def belongs(message, topic, forum=False):
     if topic is None:
         return True
     reply = (message.get('full') or {}).get('replyTo') or {}
-    top = reply.get('topMsgId')
+    top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id') if isinstance(reply, dict) else None
     if top is not None:
         return top == topic
     if topic == 1:
-        return not reply.get('forumTopic') or reply.get('replyToMsgId') == 1
+        forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
+        reply_id = _first(reply, 'replyToMsgId', 'reply_to_msg_id') if isinstance(reply, dict) else None
+        return forum_topic is not True or reply_id == 1
     # GetReplies itself scopes ordinary topics; explicit conflicting metadata is rejected above.
     return True
 
 
-def record(message, topic):
+def record(message, topic, forum=False):
     if type(message.get('id')) is not int or message['id'] <= 0:
         raise ExportError('Invalid message ID in page')
     for name in ['date', 'text', 'sender']:
         if not isinstance(message.get(name), str):
             raise ExportError('Missing or invalid message field: '+name)
     actual_topic = topic
+    topic_status = 'known' if topic is not None else 'not_applicable'
     if topic is None:
         reply = (message.get('full') or {}).get('replyTo') or {}
-        top = reply.get('topMsgId') if isinstance(reply, dict) else None
+        top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id') if isinstance(reply, dict) else None
         full = message.get('full')
         if top is None and isinstance(full, dict):
             top = full.get('topicId', full.get('topic_id'))
         if top is None:
             top = message.get('topicId', message.get('topic_id'))
+        forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
+        reply_id = _first(reply, 'replyToMsgId', 'reply_to_msg_id') if isinstance(reply, dict) else None
         if type(top) is int and top > 0:
             actual_topic = top
-        elif isinstance(reply, dict) and (reply.get('forumTopic') or reply.get('replyToMsgId') == 1):
+            topic_status = 'known'
+        elif forum and forum_topic is True:
+            # Telegram marks non-General forum messages with forumTopic. If
+            # both topMsgId and Better-TG-CLI's topicId are absent, the
+            # message belongs to a forum topic but its identity is unresolved.
+            # Never silently assign it to General (topic ID 1).
+            topic_status = 'unknown'
+        elif forum and (forum_topic is False or reply_id == 1):
             actual_topic = 1
+            topic_status = 'known'
+        elif forum:
+            topic_status = 'unknown'
+    reply = (message.get('full') or {}).get('replyTo') or {}
+    reply_to_message_id = _first(message, 'replyToMsgId', 'reply_to_msg_id')
+    if reply_to_message_id is None and isinstance(reply, dict):
+        reply_to_message_id = _first(reply, 'replyToMsgId', 'reply_to_msg_id')
     return {'message_id': message['id'], 'topic_id': actual_topic, 'date': message['date'],
+            'topic_id_status': topic_status,
             'sender_id': message.get('senderId'), 'sender_name': message['sender'],
-            'text': message['text'], 'reply_to_message_id': message.get('replyToMsgId'),
+            'text': message['text'], 'reply_to_message_id': reply_to_message_id,
             'media': message.get('media')}
 
 
@@ -832,8 +908,9 @@ def service_event(message, topic):
         top = _first(reply, 'topMsgId', 'top_msg_id') if isinstance(reply, dict) else None
         if type(top) is int and top > 0:
             actual_topic = top
-        elif event_id == 1 and action_name == 'message_action_topic_create':
-            actual_topic = 1
+        elif action_name == 'message_action_topic_create':
+            # Telegram assigns each non-General topic the ID of its create event.
+            actual_topic = event_id
     return ({'event_id': event_id, 'topic_id': actual_topic, 'date': date, 'type': action_type,
              'actor_id': actor_id, 'actor_name': actor_name, 'target_id': target_id,
              'target_name': target_name, 'message_id': message_id, 'old_value': old_value,
@@ -1075,10 +1152,11 @@ def _publish_services(destination, meta, records, cursor, exhausted, budget, rec
                       unsupported_ranges=()):
     count = len(records)
     first_id, last_id = records.first_last()
-    temp, data_size, digest = destination.private_stream_temp(
+    chunks = (
         (json.dumps(item, ensure_ascii=False, sort_keys=True) + '\n').encode()
         for item in records.iter_records()
     )
+    temp, _data_size, digest = destination.private_stream_temp(chunks, budget=budget)
     manifest = {**meta, 'exported_at': now(), 'event_count': count,
                 'first_event_id': first_id,
                 'last_event_id': last_id,
@@ -1091,7 +1169,9 @@ def _publish_services(destination, meta, records, cursor, exhausted, budget, rec
                 'errors': [error] if error else [],
                 'unsupported_ranges': list(unsupported_ranges)}
     try:
-        budget.check(data_size + len(json.dumps(manifest).encode()) + 65536)
+        # private_stream_temp checked every chunk while it was added to the
+        # tree. Here only the publication metadata remains to be reserved.
+        budget.check(len(json.dumps(manifest).encode()) + 65536)
         previous = _read_services_manifest(destination)
         if previous and 'pending_publish' in previous:
             raise ExportError('Pending service publication requires recovery')
@@ -1234,39 +1314,37 @@ def export_services(root, cfg, supplied_chat, topic, limit, before, client=None)
                     except ExportError as exc:
                         diagnostic = _service_error_record(exc, cursor)
                         if cursor is not None and diagnostic["error_code"] in _UNSUPPORTED_CURSOR_CODES:
-                            if len(unsupported_ranges) >= 20:
-                                _publish_services(
-                                    destination, meta, records, cursor, False, budget,
-                                    all_limits, diagnostic, unsupported_ranges,
-                                )
-                                raise ExportError("Too many unsupported Telegram service events") from None
-                            unsupported_ranges.append(diagnostic)
-                            records.setdefault(
-                                cursor,
-        _unsupported_service_event(cursor, topic, diagnostic["error_code"]),
-                            )
-                            all_limits.add("service_event_unavailable_at_message_id")
-                            if cursor <= 1:
-                                cursor = 0
-                                result, _ = _publish_services(
-                                    destination, meta, records, cursor, True, budget,
-                                    all_limits, unsupported_ranges=unsupported_ranges,
-                                )
-                                return result
-                            # The next request uses exclusive before/offsetId.
-                            # Keep this ID as the boundary so the preceding
-                            # service event is not skipped.
-                            _publish_services(
+                            # A rejected exclusive cursor does not prove that
+                            # the message at cursor is unavailable, nor that
+                            # the preceding ID can be skipped. Preserve the
+                            # exact boundary and stop this run as incomplete.
+                            # An operator may explicitly retry later; repeated
+                            # retries are one diagnostic per cursor, not a loop.
+                            if not any(item.get('message_id') == cursor
+                                       for item in unsupported_ranges):
+                                unsupported_ranges.append({
+                                    **diagnostic, 'message_id': cursor,
+                                    'range_status': 'unverified',
+                                })
+                            all_limits.add('service_cursor_unverified')
+                            result, _ = _publish_services(
                                 destination, meta, records, cursor, False, budget,
-                                all_limits, unsupported_ranges=unsupported_ranges,
+                                all_limits, diagnostic, unsupported_ranges,
                             )
-                            time.sleep(0.25)
-                            continue
+                            return result
                         _publish_services(
                             destination, meta, records, cursor, False, budget,
                             all_limits, diagnostic, unsupported_ranges,
                         )
                         raise
+                    if unsupported_ranges:
+                        before_count = len(unsupported_ranges)
+                        unsupported_ranges = [
+                            item for item in unsupported_ranges
+                            if item.get('message_id') != cursor
+                        ]
+                        if len(unsupported_ranges) != before_count and not unsupported_ranges:
+                            all_limits.discard('service_cursor_unverified')
                     if not page:
                         result, _ = _publish_services(destination, meta, records, cursor, True,
                                                       budget, all_limits,
@@ -1392,6 +1470,25 @@ def _clear_media_stage(stage):
         os.unlink(name, dir_fd=stage.fd)
 
 
+def _reconcile_resume_stage(media_root, message_id, size, file_limit):
+    """Keep a verified completed stage; discard only owned incomplete files."""
+    stage_name = '.part-' + str(message_id)
+    if stage_name not in media_root.names():
+        return False
+    stage = media_root.child(stage_name)
+    try:
+        _private_resume_dir(stage)
+        if 'receipt.json' in stage.names():
+            _media_receipt(stage, size, file_limit)
+            return True
+        _clear_media_stage(stage)
+    finally:
+        stage.close()
+    os.rmdir(stage_name, dir_fd=media_root.fd)
+    os.fsync(media_root.fd)
+    return False
+
+
 def _media_receipt(directory, size, file_limit=None):
     file_limit = MAX_FILE if file_limit is None else file_limit
     receipt = directory.json('receipt.json')
@@ -1478,6 +1575,9 @@ def attachment(client, chat, item, media_dir, budget, raw=None, file_limit=None)
                 # available count can hide a quota deficit, so check(0) must
                 # reject negative storage, filesystem, and shared-budget margins.
                 budget.check(0)
+                # A retained partial receipt already occupies one local copy;
+                # downstream transfer still needs its configured headroom.
+                budget.check_pipeline(receipt['size'] * PIPELINE_MEDIA_COPIES)
             os.rename(stage_name, mid, src_dir_fd=media_dir.fd, dst_dir_fd=media_dir.fd)
             promoted = True
             os.fsync(media_dir.fd)
@@ -1517,6 +1617,9 @@ def publish(destination, pages, meta, budget, error=None, active=False):
     skipped = []
     skipped_count = 0
     skipped_by_reason = {}
+    unknown_topic_count = 0
+    unknown_topic_ids = []
+    metadata_unavailable_count = 0
     temp = '.tmp-messages.jsonl'
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=destination.fd)
     st = os.fstat(fd)
@@ -1549,7 +1652,13 @@ def publish(destination, pages, meta, budget, error=None, active=False):
                 count += 1
                 first = mid if first is None else min(first, mid)
                 last = mid if last is None else max(last, mid)
+                if item.get('topic_id_status') == 'unknown':
+                    unknown_topic_count += 1
+                    if len(unknown_topic_ids) < 100:
+                        unknown_topic_ids.append(mid)
                 m = item.get('media')
+                if isinstance(m, dict) and m.get('metadata_status') == 'unavailable':
+                    metadata_unavailable_count += 1
                 if m and m.get('export_status') == 'skipped':
                     skipped_count += 1
                     reason = m.get('reason') if isinstance(m.get('reason'), str) else 'unknown'
@@ -1577,6 +1686,11 @@ def publish(destination, pages, meta, budget, error=None, active=False):
                 'skipped_media': skipped, 'skipped_media_count': skipped_count,
                 'skipped_media_by_reason': dict(sorted(skipped_by_reason.items())),
                 'skipped_media_sample_truncated': skipped_count > len(skipped),
+                'topic_assignment_complete': unknown_topic_count == 0,
+                'topic_assignment_unknown_count': unknown_topic_count,
+                'topic_assignment_unknown_message_ids': unknown_topic_ids,
+                'topic_assignment_unknown_sample_truncated': unknown_topic_count > len(unknown_topic_ids),
+                'media_metadata_unavailable_count': metadata_unavailable_count,
                 'page_count': len(page_names)}
     budget.check(len(json.dumps(manifest).encode()))
     destination.write_json('manifest.json', manifest)
@@ -1840,31 +1954,86 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
         chat_dir.close()
     try:
         _private_resume_dir(source)
-        source_id, _data, hashes, _source_manifest, message_rows = _read_resume_source(
+        source_id, _data, hashes, source_manifest, message_rows = _read_resume_source(
             source, chat, topic,
         )
+        chat_info = client.info(chat)
+        peer_type = chat_info.get('type', 'supergroup') if isinstance(chat_info, dict) else 'supergroup'
+        forum = source_manifest.get('forum')
+        if type(forum) is not bool:
+            forum = bool(chat_info.get('forum')) if isinstance(chat_info, dict) else False
+        stored_limit = DEFAULT_FILE_BYTES
+        try:
+            existing_repair = source.child('media-resume')
+        except FileNotFoundError:
+            existing_repair = None
+        if existing_repair is not None:
+            try:
+                _private_resume_dir(existing_repair)
+                try:
+                    saved_checkpoint = existing_repair.json('status.json')
+                except FileNotFoundError:
+                    saved_checkpoint = {}
+                candidate_limit = saved_checkpoint.get('requested_max_file_bytes')
+                if type(candidate_limit) is int and 0 < candidate_limit <= MAX_FILE_BYTES:
+                    stored_limit = candidate_limit
+            finally:
+                existing_repair.close()
+        requested_limit = stored_limit if max_file_bytes is None else max_file_bytes
         missing = {mid: row for mid, row in message_rows.items()
                    if isinstance(row.get('media'), dict) and not row['media'].get('path')}
         if not missing:
             return {
                 'source_id': source_id, 'status': 'complete',
-                'requested_max_file_bytes': max_file_bytes,
-                'effective_max_file_bytes': max_file_bytes,
+                'requested_max_file_bytes': requested_limit,
+                'effective_max_file_bytes': requested_limit,
                 'max_file_bytes_ceiling': MAX_FILE_BYTES,
                 'max_file_size_unit': 'bytes', 'media_count': 0, 'remaining': 0,
                 **_resume_counts({}),
             }
         budget = Budget(root, cfg)
-        budget.check(65536)
         repair = source.child('media-resume', True)
         try:
             _private_resume_dir(repair)
             checkpoint, _had_checkpoint = _resume_checkpoint(repair, hashes, source_id, message_rows)
             records = checkpoint['records']
+            checkpoint_limit = checkpoint.get('requested_max_file_bytes')
+            if type(checkpoint_limit) is int and 0 < checkpoint_limit <= MAX_FILE_BYTES:
+                if max_file_bytes is None:
+                    requested_limit = checkpoint_limit
+            elif max_file_bytes is None:
+                requested_limit = DEFAULT_FILE_BYTES
+            max_file_bytes = requested_limit
+            # Verify every checkpointed receipt before either a no-op return or
+            # an explicit limit change. A lower limit must not relabel retained
+            # files that exceed it, and stale manifests must not hide damage.
+            for mid, row in records.items():
+                if row.get('export_status') not in {'downloaded', 'already_present'}:
+                    continue
+                path = row.get('path')
+                components = path.split('/') if isinstance(path, str) else []
+                if (len(components) != 3
+                        or components[0] not in {'media', 'media-resume'}
+                        or components[1] != mid):
+                    raise ExportError('RESUME_CHECKPOINT_INVALID')
+                media_root = source.child(components[0])
+                try:
+                    media_item = media_root.child(mid)
+                    try:
+                        receipt = _media_receipt(
+                            media_item, row.get('size_bytes'), requested_limit,
+                        )
+                        if (receipt['name'] != components[2]
+                                or receipt['sha256'] != row.get('sha256')):
+                            raise ExportError('RESUME_CHECKPOINT_INVALID')
+                    finally:
+                        media_item.close()
+                finally:
+                    media_root.close()
             if checkpoint.get('legacy_checkpoint_imported'):
                 checkpoint = {
                     'version': 2, 'source_id': source_id, 'inputs': hashes,
-                    'records': records, 'requested_max_file_bytes': max_file_bytes,
+                    'records': records, 'requested_max_file_bytes': requested_limit,
                     'max_file_size_unit': 'bytes',
                     'media_count': len(missing), 'updated_at': now(),
                 }
@@ -1893,31 +2062,55 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                     retry_pending.append(mid)
             # A persistent failure must not starve later not-yet-attempted files
             # when a small batch is used.
-            pending = (unattempted + retry_pending)[:limit]
+            retry_cursor = checkpoint.get('retry_cursor_message_id')
+            if retry_pending:
+                retry_order = sorted(retry_pending, key=int)
+                if (isinstance(retry_cursor, str) and retry_cursor in retry_order
+                        and len(retry_order) > 1):
+                    position = retry_order.index(retry_cursor)
+                    retry_order = retry_order[position + 1:] + retry_order[:position + 1]
+            else:
+                retry_order = []
+            pending = (unattempted + retry_order)[:limit]
+            for mid in pending:
+                item = missing[mid]
+                media_meta, _reason = media_size_metadata(
+                    item['media'], None, max_file_bytes,
+                )
+                if _reconcile_resume_stage(
+                    repair, mid, media_meta.get('size_bytes'), max_file_bytes,
+                ):
+                    continue
             if not pending and 'manifest.json' in repair.names():
                 existing_status = repair.json('manifest.json')
                 checkpoint_bytes = repair.read('status.json', 64 * 1024**2)
                 checkpoint_sha = hashlib.sha256(checkpoint_bytes).hexdigest()
-                if (existing_status.get('source_id') != source_id
-                        or existing_status.get('inputs') != hashes
-                        or existing_status.get('checkpoint_sha256') != checkpoint_sha
-                        or existing_status.get('requested_max_file_bytes')
-                        != checkpoint.get('requested_max_file_bytes')
-                        or existing_status.get('complete') is not True):
+                same_input = (existing_status.get('source_id') == source_id
+                              and existing_status.get('inputs') == hashes)
+                if not same_input:
                     raise ExportError('RESUME_CHECKPOINT_MANIFEST_MISMATCH')
-                return {
-                    'source_id': source_id, 'status': 'complete',
-                    'requested_max_file_bytes': existing_status['requested_max_file_bytes'],
-                    'effective_max_file_bytes': existing_status['effective_max_file_bytes'],
-                    'max_file_bytes_ceiling': MAX_FILE_BYTES,
-                    'max_file_size_unit': 'bytes',
-                    'media_count': existing_status['media_count'],
-                    'remaining': existing_status['remaining'],
-                    **{key: existing_status[key] for key in (
-                        'downloaded', 'skipped', 'download_errors', 'already_present',
-                        'skipped_by_reason',
-                    )},
-                }
+                if (existing_status.get('checkpoint_sha256') == checkpoint_sha
+                        and existing_status.get('requested_max_file_bytes')
+                        == checkpoint.get('requested_max_file_bytes')
+                        and existing_status.get('complete') is True):
+                    return {
+                        'source_id': source_id, 'status': 'complete',
+                        'requested_max_file_bytes': existing_status['requested_max_file_bytes'],
+                        'effective_max_file_bytes': existing_status['effective_max_file_bytes'],
+                        'max_file_bytes_ceiling': MAX_FILE_BYTES,
+                        'max_file_size_unit': 'bytes',
+                        'media_count': existing_status['media_count'],
+                        'remaining': existing_status['remaining'],
+                        **{key: existing_status[key] for key in (
+                            'downloaded', 'skipped', 'download_errors', 'already_present',
+                            'skipped_by_reason',
+                        )},
+                    }
+            # Reconcile incomplete .part files before measuring the storage
+            # budget, so killed downloads cannot permanently consume quota.
+            # A verified completed rerun above is read-only and needs no new
+            # storage headroom.
+            budget.check(65536)
             existing_ids = set()
             if pending:
                 try:
@@ -1931,13 +2124,20 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                         original_media.close()
                 lookup = [int(mid) for mid in pending if mid not in existing_ids]
                 try:
-                    raw = client.media_metadata(chat, lookup) if lookup else {}
+                    raw = client.media_metadata(chat, lookup, peer_type=peer_type) if lookup else {}
                     metadata_error = None
                 except (ValueError, OSError, subprocess.SubprocessError) as exc:
                     raw = {}
                     metadata_error = getattr(exc, 'error_code', None) or 'METADATA_UNAVAILABLE'
                 for mid in pending:
                     item = missing[mid]
+                    if mid in retry_pending:
+                        checkpoint['retry_cursor_message_id'] = mid
+                        checkpoint['updated_at'] = now()
+                        repair.atomic_private(
+                            'status.json',
+                            (json.dumps(checkpoint, sort_keys=True) + '\n').encode(),
+                        )
                     if mid in existing_ids:
                         original_media = source.child('media')
                         try:
@@ -1998,7 +2198,8 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                                         'max_file_bytes': effective_limit,
                                     }
                     if 'path' in attachment_info:
-                        if attachment_info['path'].startswith('media/'):
+                        if (attachment_info['path'].startswith('media/')
+                                and mid not in existing_ids):
                             attachment_info['path'] = attachment_info['path'].replace('media/', 'media-resume/', 1)
                         aggregate_available = max(0, aggregate_available - attachment_info.get('size_bytes', 0))
                     records[mid] = attachment_info
@@ -2006,6 +2207,7 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                         'version': 2, 'source_id': source_id, 'inputs': hashes,
                         'records': records, 'requested_max_file_bytes': max_file_bytes,
                         'max_file_size_unit': 'bytes',
+                        'retry_cursor_message_id': checkpoint.get('retry_cursor_message_id'),
                         'media_count': len(missing), 'updated_at': now(),
                     }
                     repair.atomic_private('status.json',
@@ -2014,9 +2216,6 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
             unresolved = [mid for mid in missing if mid not in records]
             errors = counts['download_errors']
             complete = not unresolved and errors == 0
-            requested_limit = (max_file_bytes if pending else checkpoint.get(
-                'requested_max_file_bytes', max_file_bytes,
-            ))
             current_limits = [r.get('max_file_bytes', requested_limit) for r in records.values()
                               if r.get('export_status') == 'downloaded']
             effective_max = min([requested_limit, *current_limits]) if current_limits else requested_limit
@@ -2170,7 +2369,7 @@ def export(root, cfg, args, client=None):
                     raise ExportError('Existing export file limit differs; no data overwritten')
                 meta = {k: meta[k] for k in [
                     'export_version', 'source_id', 'chat_id', 'topic_id', 'scope',
-                    'chat_title', 'topic_title', 'scope_before', 'media_requested',
+                    'chat_title', 'topic_title', 'scope_before', 'media_requested', 'forum', 'chat_type',
                     'started_at', 'snapshot_newest_id',
                 ] if k in meta}
                 meta['max_file_bytes'] = stored_file_limit
@@ -2182,6 +2381,8 @@ def export(root, cfg, args, client=None):
                         'chat_id': canonical, 'topic_id': topic,
                         'scope': 'chat' if topic is None else 'topic',
                         'chat_title': info.get('title') if isinstance(info.get('title'), str) else None,
+                        'forum': info.get('forum') if type(info.get('forum')) is bool else False,
+                        'chat_type': info.get('type') if isinstance(info.get('type'), str) else None,
                         'topic_title': client.title(canonical, topic),
                         'scope_before': before, 'media_requested': media,
                         'max_file_bytes': max_file_bytes,
@@ -2205,7 +2406,8 @@ def export(root, cfg, args, client=None):
                     raw = client.page(canonical, topic, limit, cursor)
                     if not isinstance(raw, list) or len(raw) > limit:
                         raise ExportError('Invalid page shape')
-                    ids = [record(m, topic)['message_id'] for m in raw]
+                    forum = info.get('forum') is True
+                    ids = [record(m, topic, forum=forum)['message_id'] for m in raw]
                     valid = [m for m in raw if cursor is None or m['id'] < cursor]
                     if raw and not valid:
                         raise ExportError('Pagination made no progress')
@@ -2213,11 +2415,21 @@ def export(root, cfg, args, client=None):
                     if cursor is not None and ids:
                         next_cursor = min(m['id'] for m in valid)
                     lookup_ids = sorted({
-                        m['id'] for m in valid if belongs(m, topic)
+                        m['id'] for m in valid if belongs(m, topic, forum=forum)
                         and m.get('media') and (m['media'].get('kind') == 'photo'
                                                 or not _positive_size(m['media'].get('size')))
                     })
-                    raw_media = client.media_metadata(canonical, lookup_ids) if lookup_ids else {}
+                    metadata_error = None
+                    try:
+                        raw_media = client.media_metadata(
+                            canonical, lookup_ids, peer_type=info.get('type', 'supergroup'),
+                        ) if lookup_ids else {}
+                    except (ExportError, OSError, subprocess.SubprocessError, ValueError) as exc:
+                        # Metadata is optional to preserve the history record.
+                        # Unknown-size downloads remain bounded by the selected
+                        # file limit and storage budget.
+                        raw_media = {}
+                        metadata_error = getattr(exc, 'error_code', None) or 'METADATA_UNAVAILABLE'
                     records = []
                     page_seen = set()
                     for message in sorted(valid, key=lambda m: m['id'], reverse=True):
@@ -2225,20 +2437,30 @@ def export(root, cfg, args, client=None):
                         if mid in page_seen:
                             continue
                         page_seen.add(mid)
-                        if not belongs(message, topic):
+                        if not belongs(message, topic, forum=forum):
                             if topic == 1:
                                 continue
                             raise ExportError('Message explicitly belongs to another topic')
-                        item = record(message, topic)
+                        item = record(message, topic, forum=forum)
                         if item['media']:
                             raw_attachment = raw_media.get(mid)
+                            metadata_unavailable = metadata_error is not None or (
+                                mid in lookup_ids and mid not in raw_media
+                            )
                             if media:
-                                item['media'] = attachment(
+                                attached = attachment(
                                     client, canonical, item, media_dir, budget,
                                     raw_attachment, max_file_bytes,
                                 )
+                                if metadata_unavailable:
+                                    attached['metadata_status'] = 'unavailable'
+                                    attached['metadata_error_code'] = metadata_error or 'METADATA_MISSING'
+                                item['media'] = attached
                             else:
                                 metadata, _ = media_size_metadata(item['media'], raw_attachment, max_file_bytes)
+                                if metadata_unavailable:
+                                    metadata['metadata_status'] = 'unavailable'
+                                    metadata['metadata_error_code'] = metadata_error or 'METADATA_MISSING'
                                 item['media'] = {**metadata, 'export_status': 'not_requested'}
                         records.append(item)
                     if meta['snapshot_newest_id'] is None and ids:

@@ -359,47 +359,183 @@ def _temp_marker_matches(parent: int, name: str, *, uid: int, source_id: str,
         os.close(directory)
 
 
+def _read_init_intent(parent: int, name: str, *, uid: int) -> dict:
+    try:
+        value = json.loads(_read_file(parent, name + ".json", uid=uid,
+                                      maximum=MAX_METADATA_BYTES))
+    except (TransferError, OSError, ValueError, UnicodeError):
+        _fail("TRANSFER_RECOVERY_REQUIRED")
+    if (not isinstance(value, dict) or value.get("version") != 1
+            or value.get("init_name") != name
+            or not isinstance(value.get("source_id"), str)
+            or not isinstance(value.get("source_hashes"), dict)
+            or value.get("media_manifest_sha256") is not None
+            and not re.fullmatch(r"[0-9a-f]{64}", str(value["media_manifest_sha256"]))):
+        _fail("TRANSFER_RECOVERY_REQUIRED")
+    return value
+
+
+def _write_init_intent(parent: int, name: str, *, uid: int, gid: int,
+                       source_id: str, source_hashes: dict,
+                       media_manifest_sha: str | None) -> None:
+    payload = (json.dumps({
+        "version": 1, "init_name": name, "source_id": source_id,
+        "source_hashes": source_hashes,
+        "media_manifest_sha256": media_manifest_sha,
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd = os.open(name + ".json", os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+    try:
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(parent)
+
+
 def _recover_initialization_directories(parent: int, *, uid: int, source_id: str,
                                         source_hashes: dict,
-                                        media_manifest_sha: str | None) -> None:
-    """Remove only marked, identity-matching pre-publication scratch trees."""
+                                        media_manifest_sha: str | None,
+                                        temp_name: str) -> None:
+    """Recover only scratch paths proven by a durable, matching intent file."""
     removed = False
-    for name in os.listdir(parent):
-        if not re.fullmatch(r"\.publisher-init-[0-9a-f]{32}", name):
+    names = set(os.listdir(parent))
+    init_re = re.compile(r"\.publisher-init-[0-9a-f]{32}\Z")
+    for name in sorted(names):
+        if not init_re.fullmatch(name):
             continue
-        if not _temp_marker_matches(
-            parent, name, uid=uid, source_id=source_id,
+        intent = _read_init_intent(parent, name, uid=uid)
+        # A valid other-scope intent is isolated from this transfer. Leave it
+        # for the matching source operation instead of blocking this one.
+        if intent["source_id"] != source_id:
+            continue
+        if (intent["source_hashes"] != source_hashes
+                or intent["media_manifest_sha256"] != media_manifest_sha):
+            _fail("TRANSFER_RECOVERY_REQUIRED")
+        if name in names:
+            _remove_tree(parent, name, expected_uid=uid)
+        os.unlink(name + ".json", dir_fd=parent)
+        removed = True
+
+    for name in sorted(names):
+        if not re.fullmatch(r"\.publisher-init-[0-9a-f]{32}\.json\Z", name):
+            continue
+        init_name = name[:-5]
+        if init_name in names:
+            continue
+        intent = _read_init_intent(parent, init_name, uid=uid)
+        if intent["source_id"] != source_id:
+            continue
+        if (intent["source_hashes"] != source_hashes
+                or intent["media_manifest_sha256"] != media_manifest_sha):
+            _fail("TRANSFER_RECOVERY_REQUIRED")
+        if temp_name in names and not _temp_marker_matches(
+            parent, temp_name, uid=uid, source_id=source_id,
             source_hashes=source_hashes, media_manifest_sha=media_manifest_sha,
         ):
             _fail("TRANSFER_RECOVERY_REQUIRED")
-        _remove_tree(parent, name, expected_uid=uid)
+        # No directory means the crash happened before mkdir, or the proven
+        # directory was atomically renamed to the verified transfer candidate.
+        os.unlink(name, dir_fd=parent)
         removed = True
     if removed:
         os.fsync(parent)
 
 
+def _media_inventory_count(transfer: dict) -> int:
+    if transfer.get("version") == 1:
+        values = transfer.get("media_files")
+        if isinstance(values, list):
+            return len(values)
+    elif transfer.get("version") == 2:
+        spec = transfer.get("media_inventory")
+        if (isinstance(spec, dict) and spec.get("name") == "media_files.jsonl"
+                and type(spec.get("count")) is int and spec["count"] >= 0
+                and isinstance(spec.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", spec["sha256"])):
+            return spec["count"]
+    _fail("TRANSFER_MANIFEST_INVALID")
+
+
+def _iter_media_inventory(parent: int, transfer: dict, *, uid: int):
+    """Yield v1 inline or v2 streamed inventory and verify v2 bytes at EOF."""
+    if transfer.get("version") == 1:
+        values = transfer.get("media_files")
+        if not isinstance(values, list):
+            _fail("TRANSFER_MANIFEST_INVALID")
+        yield from values
+        return
+    count = _media_inventory_count(transfer)
+    spec = transfer["media_inventory"]
+    actual = 0
+    if count:
+        for item in _iter_jsonl(
+            parent, spec["name"], uid=uid, expected_sha256=spec["sha256"],
+        ):
+            actual += 1
+            yield item
+    elif spec["sha256"] != _sha(b""):
+        _fail("TRANSFER_MANIFEST_INVALID")
+    if actual != count:
+        _fail("TRANSFER_MANIFEST_INVALID")
+
+
 def _revision_compatible(previous: dict, candidate: dict, *, source_hashes: dict,
-                         media_manifest_sha: str | None) -> None:
+                         media_manifest_sha: str | None, parent: int,
+                         previous_name: str, candidate_name: str, uid: int) -> None:
     if previous.get("source_hashes") != source_hashes:
         _fail("DESTINATION_CONFLICT")
     if candidate.get("source_hashes") != source_hashes:
         _fail("DESTINATION_CONFLICT")
     if candidate.get("media_manifest_sha256") != media_manifest_sha:
         _fail("STAGING_REVISION_MISMATCH")
-    old = previous.get("media_files")
-    new = candidate.get("media_files")
-    if not isinstance(old, list) or not isinstance(new, list):
-        _fail("TRANSFER_MANIFEST_INVALID")
-    new_by_id = {item.get("message_id"): item for item in new if isinstance(item, dict)}
-    if len(new_by_id) != len(new):
-        _fail("TRANSFER_MANIFEST_INVALID")
-    for item in old:
-        if not isinstance(item, dict):
+    previous_dir = _open_child(parent, previous_name, uid=uid)
+    candidate_dir = _open_child(parent, candidate_name, uid=uid)
+    try:
+        def ordered(items):
+            previous_id = None
+            for item in items:
+                if not isinstance(item, dict):
+                    _fail("TRANSFER_MANIFEST_INVALID")
+                message_id = item.get("message_id")
+                if (type(message_id) is not int or message_id <= 0
+                        or (previous_id is not None and message_id >= previous_id)):
+                    _fail("TRANSFER_MANIFEST_INVALID")
+                previous_id = message_id
+                yield item
+
+        old_iter = iter(ordered(_iter_media_inventory(previous_dir, previous, uid=uid)))
+        new_iter = iter(ordered(_iter_media_inventory(candidate_dir, candidate, uid=uid)))
+        old_item = next(old_iter, None)
+        new_item = next(new_iter, None)
+        while old_item is not None:
+            if not isinstance(old_item, dict) or not isinstance(new_item, dict):
+                _fail("TRANSFER_MANIFEST_INVALID")
+            old_id, new_id = old_item.get("message_id"), new_item.get("message_id")
+            while new_item is not None and new_id > old_id:
+                new_item = next(new_iter, None)
+                if new_item is not None:
+                    new_id = new_item.get("message_id") if isinstance(new_item, dict) else None
+            keys = ("message_id", "path", "size", "sha256")
+            if new_item is None or new_id != old_id or any(
+                new_item.get(key) != old_item.get(key) for key in keys
+            ):
+                _fail("NON_ADDITIVE_MEDIA_REVISION")
+            old_item = next(old_iter, None)
+            new_item = next(new_iter, None)
+        # Exhaust both iterators so v2 inventory checksums/counts are verified.
+        for _item in old_iter:
             _fail("TRANSFER_MANIFEST_INVALID")
-        replacement = new_by_id.get(item.get("message_id"))
-        keys = ("message_id", "path", "size", "sha256")
-        if replacement is None or any(replacement.get(key) != item.get(key) for key in keys):
-            _fail("NON_ADDITIVE_MEDIA_REVISION")
+        for _item in new_iter:
+            pass
+    finally:
+        os.close(previous_dir)
+        os.close(candidate_dir)
 
 
 def _archive_displaced(parent: int, displaced_name: str, *, source_id: str, uid: int,
@@ -630,7 +766,8 @@ def _check_pipeline_storage(available: int, required: int) -> None:
         _fail("INSUFFICIENT_SHARED_STORAGE")
 
 
-def _iter_jsonl(parent: int, name: str, *, uid: int, maximum: int = MAX_CONTROL_BYTES):
+def _iter_jsonl(parent: int, name: str, *, uid: int, maximum: int = MAX_CONTROL_BYTES,
+                expected_sha256: str | None = None):
     """Read a control JSONL one bounded record at a time and verify file stability."""
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
                  dir_fd=parent)
@@ -641,11 +778,13 @@ def _iter_jsonl(parent: int, name: str, *, uid: int, maximum: int = MAX_CONTROL_
                 or before.st_size > maximum):
             _fail("CONTROL_FILE_UNSAFE")
         total = 0
+        digest = hashlib.sha256()
         with os.fdopen(os.dup(fd), "rb") as stream:
             while raw := stream.readline(MAX_JSONL_LINE_BYTES + 1):
                 total += len(raw)
                 if len(raw) > MAX_JSONL_LINE_BYTES or total > maximum:
                     _fail("CONTROL_FILE_TOO_LARGE")
+                digest.update(raw)
                 try:
                     value = json.loads(raw)
                 except (ValueError, UnicodeError):
@@ -656,6 +795,8 @@ def _iter_jsonl(parent: int, name: str, *, uid: int, maximum: int = MAX_CONTROL_
         after = os.fstat(fd)
         if (_file_token(before) != _file_token(after) or total != before.st_size):
             _fail("CONTROL_FILE_CHANGED")
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            _fail("MESSAGES_HASH_MISMATCH" if name == "messages.jsonl" else "SERVICES_HASH_MISMATCH")
     finally:
         os.close(fd)
 
@@ -666,10 +807,11 @@ def _file_token(info):
 
 
 def _validated_message_rows(parent: int, *, chat: str, topic: int | None,
-                            scope: str, uid: int):
+                            scope: str, uid: int, expected_sha256: str | None = None):
     count = 0
     previous_id = None
-    for row in _iter_jsonl(parent, "messages.jsonl", uid=uid):
+    for row in _iter_jsonl(parent, "messages.jsonl", uid=uid,
+                            expected_sha256=expected_sha256):
         message_id = row.get("message_id")
         row_topic = row.get("topic_id")
         if (type(message_id) is not int or message_id <= 0
@@ -884,6 +1026,7 @@ def _read_transfer_inputs(source: int, source_id: str, chat: str, scope_dir: str
         _fail("SERVICES_MANIFEST_MISMATCH")
     row_count = sum(1 for _row in _validated_message_rows(
         source, chat=chat, topic=topic, scope=scope, uid=source_uid,
+        expected_sha256=hashes["messages.jsonl"],
     ))
     if row_count != manifest["message_count"]:
         _fail("MESSAGE_COUNT_MISMATCH")
@@ -955,9 +1098,7 @@ def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
                                          maximum=MAX_METADATA_BYTES))
         if transfer.get("source_id") != source_id:
             _fail("DESTINATION_CONFLICT")
-        media_files = transfer.get("media_files")
-        if not isinstance(media_files, list):
-            _fail("TRANSFER_MANIFEST_INVALID")
+        inventory_count = _media_inventory_count(transfer)
         limit = transfer.get("max_file_bytes")
         message_count = transfer.get("message_count")
         service_count = transfer.get("service_event_count")
@@ -967,7 +1108,7 @@ def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
         if (type(limit) is not int or not 0 < limit <= MAX_FILE_BYTES
                 or type(message_count) is not int or message_count < 0
                 or type(service_count) is not int or service_count < 0
-                or type(downloaded) is not int or downloaded != len(media_files)
+                or type(downloaded) is not int or downloaded != inventory_count
                 or type(skipped) is not int or skipped < 0
                 or (media_manifest_sha is not None and
                     (not isinstance(media_manifest_sha, str)
@@ -978,6 +1119,8 @@ def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
         if not isinstance(staged_hashes, dict) or set(staged_hashes) != expected_files:
             _fail("TRANSFER_MANIFEST_INVALID")
         expected_entries = expected_files | {"telegram_transfer_manifest.json"}
+        if transfer.get("version") == 2 and inventory_count:
+            expected_entries.add("media_files.jsonl")
         if media_manifest_sha is not None:
             expected_entries.add("media_manifest.json")
             media_manifest = json.loads(_read_file(
@@ -990,7 +1133,7 @@ def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
             ).encode()
             if _sha(canonical_media_manifest) != media_manifest_sha:
                 _fail("MEDIA_MANIFEST_HASH_MISMATCH")
-        if media_files:
+        if inventory_count:
             expected_entries.add("media")
         if set(os.listdir(final)) != expected_entries:
             _fail("UNEXPECTED_STAGING_ENTRY")
@@ -1035,51 +1178,57 @@ def _staged_status(destination_chat: int, scope_dir: str, source_id: str,
                 or staged_services.get("services_sha256") != staged_hashes["services.jsonl"]
                 or staged_services.get("event_count") != service_count):
             _fail("STAGING_IDENTITY_MISMATCH")
-        seen_media = set()
-        for item in media_files:
-            if not isinstance(item, dict) or type(item.get("message_id")) is not int:
-                _fail("TRANSFER_MANIFEST_INVALID")
-            path = item.get("path")
-            parts = path.split("/") if isinstance(path, str) else []
-            size_expected = item.get("size")
-            sha_expected = item.get("sha256")
-            if (len(parts) != 3 or parts[0] != "media"
-                    or parts[1] != str(item["message_id"])
-                    or not isinstance(sha_expected, str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", sha_expected)
-                    or type(size_expected) is not int or not 0 < size_expected <= MAX_FILE_BYTES
-                    or size_expected > limit):
-                _fail("TRANSFER_MANIFEST_INVALID")
-            if item["message_id"] in seen_media:
-                _fail("TRANSFER_MANIFEST_INVALID")
-            seen_media.add(item["message_id"])
-            _component(parts[2])
-            media_root = _open_child(final, "media", uid=dest_uid)
-            try:
+        media_root = _open_child(final, "media", uid=dest_uid) if inventory_count else None
+        previous_media_id = None
+        validated_media = 0
+        validated_bytes = 0
+        try:
+            for item in _iter_media_inventory(final, transfer, uid=dest_uid):
+                if not isinstance(item, dict) or type(item.get("message_id")) is not int:
+                    _fail("TRANSFER_MANIFEST_INVALID")
+                message_id = item["message_id"]
+                if message_id <= 0 or (previous_media_id is not None and message_id >= previous_media_id):
+                    _fail("TRANSFER_MANIFEST_INVALID")
+                previous_media_id = message_id
+                path = item.get("path")
+                parts = path.split("/") if isinstance(path, str) else []
+                size_expected = item.get("size")
+                sha_expected = item.get("sha256")
+                if (len(parts) != 3 or parts[0] != "media"
+                        or parts[1] != str(message_id)
+                        or not isinstance(sha_expected, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", sha_expected)
+                        or type(size_expected) is not int or not 0 < size_expected <= MAX_FILE_BYTES
+                        or size_expected > limit):
+                    _fail("TRANSFER_MANIFEST_INVALID")
+                _component(parts[2])
                 media_dir = _open_child(media_root, parts[1], uid=dest_uid)
                 try:
+                    if set(os.listdir(media_dir)) != {parts[2]}:
+                        _fail("UNEXPECTED_STAGING_MEDIA_ENTRY")
                     size, digest = _digest_file(media_dir, parts[2], uid=dest_uid,
                                                 maximum=MAX_FILE_BYTES)
                 finally:
                     os.close(media_dir)
-            finally:
-                os.close(media_root)
-            if size != size_expected or digest != sha_expected:
-                _fail("STAGING_MEDIA_HASH_MISMATCH")
-        if media_files:
-            media_root = _open_child(final, "media", uid=dest_uid)
-            try:
-                if set(os.listdir(media_root)) != {str(item["message_id"]) for item in media_files}:
-                    _fail("UNEXPECTED_STAGING_MEDIA_ENTRY")
-                for item in media_files:
-                    media_dir = _open_child(media_root, str(item["message_id"]), uid=dest_uid)
-                    try:
-                        media_name = item["path"].split("/")[2]
-                        if set(os.listdir(media_dir)) != {media_name}:
+                if size != size_expected or digest != sha_expected:
+                    _fail("STAGING_MEDIA_HASH_MISMATCH")
+                validated_media += 1
+                validated_bytes += size
+            if validated_media != inventory_count:
+                _fail("TRANSFER_MANIFEST_INVALID")
+            if transfer.get("copied_bytes") != validated_bytes:
+                _fail("TRANSFER_MANIFEST_INVALID")
+            if media_root is not None:
+                directory_count = 0
+                with os.scandir(media_root) as entries:
+                    for entry in entries:
+                        if not entry.is_dir(follow_symlinks=False):
                             _fail("UNEXPECTED_STAGING_MEDIA_ENTRY")
-                    finally:
-                        os.close(media_dir)
-            finally:
+                        directory_count += 1
+                if directory_count != inventory_count:
+                    _fail("UNEXPECTED_STAGING_MEDIA_ENTRY")
+        finally:
+            if media_root is not None:
                 os.close(media_root)
         return {
             "source_id": source_id, "status": "ready",
@@ -1138,7 +1287,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
             record_map, max_file, media_manifest = _media_inputs(
                 source, _validated_message_rows(
                     source, chat=chat, topic=topic_id, scope=scope,
-                    uid=config["source_uid"],
+                    uid=config["source_uid"], expected_sha256=hashes["messages.jsonl"],
                 ), checkpoint, media_manifest, source_manifest,
                 source_uid=config["source_uid"],
             )
@@ -1156,6 +1305,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     destination_chat, uid=config["destination_uid"],
                     source_id=source_id, source_hashes=hashes,
                     media_manifest_sha=desired_media_sha,
+                    temp_name=temp_name,
                 )
                 final_status = _staged_status(destination_chat, scope_dir, source_id,
                                               dest_uid=config["destination_uid"])
@@ -1195,6 +1345,8 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                                 _revision_compatible(
                                     previous, temp_record, source_hashes=hashes,
                                     media_manifest_sha=desired_media_sha,
+                                    parent=destination_chat, previous_name=scope_dir,
+                                    candidate_name=temp_name, uid=config["destination_uid"],
                                 )
                                 _rename_exchange(destination_chat, temp_name, scope_dir)
                                 _archive_displaced(
@@ -1293,7 +1445,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                 skipped_media = 0
                 for row in _validated_message_rows(
                     source, chat=chat, topic=topic_id, scope=scope,
-                    uid=config["source_uid"],
+                    uid=config["source_uid"], expected_sha256=hashes["messages.jsonl"],
                 ):
                     staged_row, plan, skipped = transform(row)
                     transformed_bytes += len(json.dumps(
@@ -1312,6 +1464,11 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                 if temp_name in os.listdir(destination_chat):
                     _fail("TRANSFER_RECOVERY_REQUIRED")
                 init_name = ".publisher-init-" + uuid.uuid4().hex
+                _write_init_intent(
+                    destination_chat, init_name, uid=config["destination_uid"],
+                    gid=config["destination_gid"], source_id=source_id,
+                    source_hashes=hashes, media_manifest_sha=desired_media_sha,
+                )
                 init = _new_topic_dir(destination_chat, init_name,
                                       uid=config["destination_uid"], gid=config["destination_gid"])
                 try:
@@ -1326,9 +1483,14 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     os.close(init)
                 _rename_noreplace(destination_chat, init_name, destination_chat, temp_name)
                 os.fsync(destination_chat)
+                os.unlink(init_name + ".json", dir_fd=destination_chat)
+                os.fsync(destination_chat)
                 temp = _open_child(destination_chat, temp_name, uid=config["destination_uid"])
                 try:
-                    staged_media = []
+                    media_inventory_fd = None
+                    media_inventory_digest = hashlib.sha256()
+                    media_inventory_count = 0
+                    copied_bytes = 0
                     message_fd = os.open(
                         "messages.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL
                         | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=temp,
@@ -1340,7 +1502,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     try:
                         for row in _validated_message_rows(
                             source, chat=chat, topic=topic_id, scope=scope,
-                            uid=config["source_uid"],
+                            uid=config["source_uid"], expected_sha256=hashes["messages.jsonl"],
                         ):
                             staged_row, plan, skipped = transform(row)
                             encoded = (json.dumps(staged_row, ensure_ascii=False,
@@ -1363,11 +1525,38 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                                         or copied_size != checked["size"]
                                         or copied_digest != checked["sha256"]):
                                     _fail("STAGED_MEDIA_REFERENCE_INVALID")
-                                staged_media.append({"message_id": mid, "path": staged_path,
-                                                     "size": copied_size, "sha256": copied_digest})
+                                if media_inventory_fd is None:
+                                    media_inventory_fd = os.open(
+                                        "media_files.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                        | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=temp,
+                                    )
+                                    os.fchown(media_inventory_fd, config["destination_uid"],
+                                              config["destination_gid"])
+                                    os.fchmod(media_inventory_fd, 0o600)
+                                inventory_record = {
+                                    "message_id": mid, "path": staged_path,
+                                    "size": copied_size, "sha256": copied_digest,
+                                }
+                                inventory_line = (json.dumps(
+                                    inventory_record, sort_keys=True, separators=(",", ":"),
+                                ) + "\n").encode()
+                                view = memoryview(inventory_line)
+                                while view:
+                                    written = os.write(media_inventory_fd, view)
+                                    view = view[written:]
+                                media_inventory_digest.update(inventory_line)
+                                media_inventory_count += 1
+                                copied_bytes += copied_size
                         os.fsync(message_fd)
                     finally:
                         os.close(message_fd)
+                    if media_inventory_fd is not None:
+                        os.fsync(media_inventory_fd)
+                        os.close(media_inventory_fd)
+                        media_inventory_fd = None
+                        os.fsync(temp)
+                    if media_inventory_count != copied_media:
+                        _fail("STAGED_MEDIA_REFERENCE_INVALID")
                     if actual_count != source_manifest["message_count"]:
                         _fail("MESSAGE_COUNT_MISMATCH")
                     staged_message_sha = message_digest.hexdigest()
@@ -1415,18 +1604,21 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                         "services_manifest.json": _sha(services_bytes),
                     }
                     transfer = {
-                        "version": 1, "source_id": source_id, "source_hashes": hashes,
+                        "version": 2, "source_id": source_id, "source_hashes": hashes,
                         "staged_hashes": staged_hashes,
                         "message_count": source_manifest["message_count"],
                         "service_event_count": service_count,
                         "downloaded_media": copied_media, "skipped_media": skipped_media,
                         "max_file_bytes": limit_bytes,
                         "max_file_size_unit": "bytes",
-                        "media_files": staged_media,
+                        "media_inventory": {
+                            "name": "media_files.jsonl", "count": media_inventory_count,
+                            "sha256": media_inventory_digest.hexdigest(),
+                        },
                         "media_manifest_sha256": _sha(json.dumps(
                             media_manifest, sort_keys=True, separators=(",", ":"),
                         ).encode()) if media_manifest else None,
-                        "copied_bytes": sum(item["size"] for item in staged_media),
+                        "copied_bytes": copied_bytes,
                         "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
                     }
                     _write_file(temp, "telegram_transfer_manifest.json",
@@ -1435,6 +1627,9 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     os.unlink(".publisher-temp.json", dir_fd=temp)
                     os.fsync(temp)
                 except BaseException:
+                    if media_inventory_fd is not None:
+                        with contextlib.suppress(OSError):
+                            os.close(media_inventory_fd)
                     os.close(temp)
                     _remove_tree(destination_chat, temp_name, expected_uid=config["destination_uid"])
                     raise
@@ -1455,6 +1650,8 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     _revision_compatible(
                         previous, candidate, source_hashes=hashes,
                         media_manifest_sha=desired_media_sha,
+                        parent=destination_chat, previous_name=scope_dir,
+                        candidate_name=temp_name, uid=config["destination_uid"],
                     )
                     _rename_exchange(destination_chat, temp_name, scope_dir)
                     _archive_displaced(
@@ -1472,7 +1669,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     "downloaded_media": copied_media, "skipped_media": skipped_media,
                     "max_file_bytes": limit_bytes,
                     "messages_sha256": staged_message_sha,
-                    "copied_bytes": sum(item["size"] for item in staged_media),
+                    "copied_bytes": copied_bytes,
                     "shared_free_bytes": free, "shared_used_bytes": used + required,
                 }
             finally:
