@@ -103,6 +103,16 @@ SHA-256.
 отнесёнными к теме до сверки. См.
 [Telegram messageReplyHeader](https://core.telegram.org/constructor/messageReplyHeader).
 
+У `messageActionTopicCreate` нет поля с topic ID: действие содержит название и
+параметры значка. При экспорте всех служебных событий форума создание темы
+остаётся `topic_id=null` / `unknown`, если API не даёт совпадающий
+`replyToTopId`; оно не приписывается General по умолчанию. При экспорте одной
+темы событие принимается только при точном совпадении ID события с запрошенным
+topic ID либо при совпадающем `replyToTopId`. Противоречащий корень делает
+принадлежность неизвестной, и событие не включается в конкретную тему. См.
+[Telegram messageActionTopicCreate](https://core.telegram.org/constructor/messageActionTopicCreate)
+и [ForumTopic](https://core.telegram.org/constructor/forumTopic).
+
 Аргументы `export` после `MEDIA`:
 
 ```text
@@ -153,6 +163,11 @@ kiber-analyst-telegram-export export-transfer CHAT_ID GROUP
 размера и SHA-256. Предыдущий staging snapshot сохраняется под `.revisions/`.
 При несовместимом или неполном snapshot передача прекращается с безопасным
 кодом ошибки, не заменяя текущую ревизию.
+
+Receipt checkpoint v1/v2 может ссылаться на `media/<message_id>/<file>` или
+`media-resume/<message_id>/<file>`. Broker принимает только эти два корня,
+проверяет размер и SHA-256 исходного файла и сохраняет тот же относительный
+путь в неизменяемой staging-ревизии; произвольные пути отклоняются.
 
 Повтор `export-transfer` под эксклюзивной блокировкой проверяет оставшиеся
 временные кандидаты. Частичный каталог удаляется только при совпадении

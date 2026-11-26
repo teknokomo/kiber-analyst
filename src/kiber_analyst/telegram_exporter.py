@@ -712,7 +712,7 @@ def belongs(message, topic, forum=False):
     full = message.get('full')
     reply_header = full.get('replyTo') if isinstance(full, dict) else None
     reply = reply_header if isinstance(reply_header, dict) else {}
-    top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id') if isinstance(reply, dict) else None
+    top = _first(reply, 'replyToTopId', 'topMsgId', 'top_msg_id', 'reply_to_top_id') if isinstance(reply, dict) else None
     if topic == 1:
         forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
         # Telegram's forumTopic flag distinguishes non-General forum messages.
@@ -743,7 +743,7 @@ def record(message, topic, forum=False):
     topic_status = 'known' if topic is not None else 'not_applicable'
     if topic is None:
         reply = (message.get('full') or {}).get('replyTo') or {}
-        top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id') if isinstance(reply, dict) else None
+        top = _reply_top_id(reply)
         forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
         if forum and forum_topic is True and type(top) is int and top > 0:
             actual_topic = top
@@ -795,6 +795,12 @@ def _first(mapping, *keys):
         if key in mapping and mapping[key] is not None:
             return mapping[key]
     return None
+
+
+def _reply_top_id(reply):
+    if not isinstance(reply, dict):
+        return None
+    return _first(reply, 'replyToTopId', 'topMsgId', 'top_msg_id', 'reply_to_top_id')
 
 
 def _identifier(value):
@@ -962,19 +968,38 @@ def service_event(message, topic, forum=False):
         limits.add('target_name_unavailable')
     actual_topic = topic
     topic_status = 'known' if topic is not None else 'not_applicable'
-    if topic is None:
-        reply = _first(message, 'replyTo', 'reply_to') or {}
-        top = _first(reply, 'topMsgId', 'top_msg_id') if isinstance(reply, dict) else None
-        forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
+    reply = _first(message, 'replyTo', 'reply_to') or {}
+    top = _reply_top_id(reply)
+    forum_topic = _first(reply, 'forumTopic', 'forum_topic') if isinstance(reply, dict) else None
+    if action_name == 'message_action_topic_create':
+        # The action constructor has no topic ID. Only a matching top-message
+        # ID or an exact topic-scoped lookup of the create message proves it.
+        # A different reply root is contradictory, and an unscoped event with
+        # no root must remain unresolved rather than being assigned to General.
+        if top is not None:
+            if type(top) is int and top > 0 and top == event_id:
+                actual_topic = top
+                topic_status = 'known'
+            else:
+                actual_topic = None
+                topic_status = 'unknown'
+                limits.add(
+                    'topic_assignment_conflict' if type(top) is int and top > 0
+                    else 'topic_assignment_unknown'
+                )
+        elif topic is not None and topic > 1 and event_id == topic:
+            actual_topic = topic
+            topic_status = 'known'
+        else:
+            actual_topic = None
+            topic_status = 'unknown'
+            limits.add('topic_assignment_unknown')
+    elif topic is None:
         if forum and forum_topic is True and type(top) is int and top > 0:
             actual_topic = top
             topic_status = 'known'
         elif forum and forum_topic is True:
             topic_status = 'unknown'
-        elif action_name == 'message_action_topic_create':
-            # Telegram assigns each non-General topic the ID of its create event.
-            actual_topic = event_id
-            topic_status = 'known'
         elif forum and forum_topic is not True:
             actual_topic = 1
             topic_status = 'known'
@@ -1055,13 +1080,19 @@ def _unsupported_service_event(message_id, topic, error_code):
 def service_belongs(message, topic, forum=False):
     if topic is None:
         return True
-    if message.get('id') == topic and _action_name(message.get('action')) == 'message_action_topic_create':
-        return True
+    action_name = _action_name(message.get('action'))
     reply_header = _first(message, 'replyTo', 'reply_to')
     if reply_header is not None and not isinstance(reply_header, dict):
         return False
     reply = reply_header if isinstance(reply_header, dict) else {}
-    top = _first(reply, 'topMsgId', 'top_msg_id', 'reply_to_top_id')
+    top = _reply_top_id(reply)
+    if action_name == 'message_action_topic_create':
+        message_id = message.get('id')
+        if type(top) is int and top > 0:
+            return topic > 1 and top == message_id == topic
+        if top is not None:
+            return False
+        return topic > 1 and type(message_id) is int and message_id == topic
     if topic == 1:
         return forum and _first(reply, 'forumTopic', 'forum_topic') is not True
     forum_topic = _first(reply, 'forumTopic', 'forum_topic')

@@ -335,6 +335,167 @@ def test_group_export_refuses_overlapping_topic_in_another_project_without_mutat
         ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("media_root", ["media", "media-resume"])
+@pytest.mark.parametrize("checkpoint_version", [1, 2])
+def test_broker_stages_each_checkpoint_media_root_and_repeat_ingest_is_idempotent(
+    tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    media_root: str,
+    checkpoint_version: int,
+) -> None:
+    from kiber_analyst import broker
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    monkeypatch.setattr(broker, "RESERVE", 0)
+    project_slug = f"kiber-resume-root-{uuid.uuid4().hex[:10]}"
+    owner = "synthetic-resume-root-owner"
+    app_root = tmp_path / "application"
+    imports_root = app_root / "imports"
+    app_root.mkdir(mode=0o700)
+    (app_root / "broker").mkdir(mode=0o700)
+    imports_root.mkdir(mode=0o700)
+    (imports_root / ".broker").mkdir(mode=0o700)
+    source = _fixture(imports_root)
+    source.parent.chmod(0o700)
+    chat_id = json.loads((source / "manifest.json").read_text(encoding="utf-8"))["chat_id"]
+    source_id = f"telegram:{chat_id}:topic:1"
+
+    message_path = source / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    media_bytes = b"recovered media root fixture"
+    media_sha = hashlib.sha256(media_bytes).hexdigest()
+    message["media"] = {
+        "type": "photo", "path": None, "size": len(media_bytes),
+        "sha256": None, "size_source": "synthetic",
+        "max_file_bytes": 4096, "export_status": "skipped",
+        "reason": "unknown_size",
+    }
+    message_bytes = _json_bytes(message)
+    _write_private(message_path, message_bytes)
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        messages_sha256=hashlib.sha256(message_bytes).hexdigest(),
+        max_file_bytes=4096,
+    )
+    manifest_bytes = _json_bytes(manifest)
+    _write_private(manifest_path, manifest_bytes)
+    services_bytes = (source / "services.jsonl").read_bytes()
+    services_manifest_bytes = (source / "services_manifest.json").read_bytes()
+    checkpoint_inputs = {
+        "messages.jsonl": hashlib.sha256(message_bytes).hexdigest(),
+        "services.jsonl": hashlib.sha256(services_bytes).hexdigest(),
+        "manifest.json": hashlib.sha256(manifest_bytes).hexdigest(),
+        "services_manifest.json": hashlib.sha256(services_manifest_bytes).hexdigest(),
+    }
+    if checkpoint_version == 1:
+        checkpoint_inputs.pop("services_manifest.json")
+    relative_media = f"{media_root}/101/recovered.bin"
+    _write_private(source / relative_media, media_bytes)
+    (source / media_root).chmod(0o700)
+    (source / media_root / "101").chmod(0o700)
+    checkpoint = _json_bytes({
+        "version": checkpoint_version,
+        "source_id": source_id,
+        "inputs": checkpoint_inputs,
+        "requested_max_file_bytes": 4096,
+        "records": {"101": {
+            "path": relative_media,
+            "size": len(media_bytes),
+            "sha256": media_sha,
+            "type": "photo",
+            "max_file_bytes": 4096,
+            "export_status": "downloaded",
+        }},
+    })
+    _write_private(source / "media-resume" / "status.json", checkpoint)
+    (source / "media-resume").chmod(0o700)
+
+    submitted: list[list[str]] = []
+
+    def worker_api(action: str, **kwargs):
+        if action == "project-catalog":
+            return {"projects": [{"slug": project_slug, "title": "Resume root test"}]}
+        raise AssertionError(f"unexpected worker API operation: {action}")
+
+    def submit(argv: list[str], *, idempotency_key: str):
+        submitted.append(list(argv))
+        return {"job_id": str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key))}
+
+    app = broker.Broker(
+        app_root, {}, worker_api=worker_api, submit=submit,
+        authorized_projects={project_slug},
+    )
+    try:
+        assert app.handle(owner, "source-add", source_id, project_slug)["registered"]
+        request = app.handle(owner, "ingest", source_id, project_slug)
+        staged = Path(submitted[-1][submitted[-1].index("--job") + 1])
+        assert request["job_id"]
+        staged_file = staged / relative_media
+        assert staged_file.read_bytes() == media_bytes
+        assert hashlib.sha256(staged_file.read_bytes()).hexdigest() == media_sha
+
+        first = load_telegram_export(
+            staged, tmp_path / "artifacts" / f"first-{media_root}-{checkpoint_version}",
+            env_path=Path(TEST_ENV), project_slug=project_slug, root=imports_root,
+        )
+        assert (first["inserted"], first["media_missing"], first["service_events_inserted"]) == (1, 0, 1)
+
+        with _connect(disposable_postgres_credentials) as conn:
+            project_id = conn.execute(
+                "SELECT id FROM projects WHERE slug=%s", (project_slug,),
+            ).fetchone()[0]
+            source_db_id = conn.execute(
+                "SELECT id FROM sources WHERE project_id=%s AND external_id=%s",
+                (project_id, chat_id),
+            ).fetchone()[0]
+            segment_id = conn.execute(
+                "SELECT id FROM segments WHERE external_ref=%s", (f"tg:{chat_id}:101",),
+            ).fetchone()[0]
+            vector = "[" + ",".join(["0"] * 1536) + "]"
+            conn.execute(
+                """INSERT INTO embeddings
+                   (project_id, owner_table, owner_id, model, embedding)
+                   VALUES (%s::uuid, 'segments', %s, 'gemini-embedding-2:1536', %s::vector)""",
+                (project_id, str(segment_id), vector),
+            )
+            embedding_before = conn.execute(
+                "SELECT id, owner_id, model, embedding::text FROM embeddings "
+                "WHERE owner_table='segments' AND owner_id=%s", (str(segment_id),),
+            ).fetchone()
+
+        entry, fingerprint, parsed = app._managed_source_entry(owner, source_id, project_slug)
+        assert parsed == (chat_id, "1")
+        revision = hashlib.sha256(checkpoint).hexdigest()
+        repeated_stage = app.stage(source_id, entry, fingerprint, chat_id, "1", revision)
+        assert repeated_stage == staged
+        repeated = load_telegram_export(
+            repeated_stage,
+            tmp_path / "artifacts" / f"repeat-{media_root}-{checkpoint_version}",
+            env_path=Path(TEST_ENV), project_slug=project_slug, root=imports_root,
+        )
+        assert (repeated["inserted"], repeated["media_missing"],
+                repeated["service_events_skipped"]) == (0, 0, 1)
+        assert (repeated_stage / relative_media).read_bytes() == media_bytes
+
+        with _connect(disposable_postgres_credentials) as conn:
+            assert conn.execute(
+                "SELECT count(*) FROM segments WHERE external_ref=%s", (f"tg:{chat_id}:101",),
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT count(*) FROM telegram_service_events WHERE source_id=%s",
+                (source_db_id,),
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT id, owner_id, model, embedding::text FROM embeddings "
+                "WHERE owner_table='segments' AND owner_id=%s", (str(segment_id),),
+            ).fetchone() == embedding_before
+    finally:
+        app.db.close()
+
+
 def test_telegram_topic_cannot_move_between_projects_and_dry_runs_rollback(
     tmp_path: Path,
     disposable_postgres_credentials: dict[str, str],

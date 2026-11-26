@@ -459,26 +459,59 @@ def media_items(data: bytes | BinaryIO, manifest_limit=DEFAULT_TELEGRAM_MEDIA_BY
         yield rel, size, digest
 
 
-def publish_resume(source, output, checkpoint, records, *, owner=None, publish_owner=None):
-    """Publish only recovered files. Inputs and existing results stay immutable."""
-    files = [(parts(r['path'])[1:], r['size'], r['sha256']) for r in records.values()]
+def publish_resume(source, output, checkpoint, records, *, owner=None, publish_owner=None,
+                   media_source=None):
+    """Publish recovered files at the roots declared by their checkpoint receipts."""
+    files_by_root = {'media': [], 'media-resume': []}
+    for receipt in records.values():
+        relative = parts(receipt['path'])
+        if len(relative) != 3 or relative[0] not in files_by_root:
+            raise Refused('RESUME_PATH_UNSAFE')
+        item = (relative, receipt['size'], receipt['sha256'])
+        files_by_root[relative[0]].append(item)
+    if files_by_root['media'] and media_source is None:
+        raise Refused('RESUME_SOURCE_UNAVAILABLE')
+    output_files = [item for group in files_by_root.values() for item in group]
     existing_owner = publish_owner[0] if publish_owner else None
     try:
         with descend(output, ['media-resume'], owner=existing_owner) as existing:
             if read_input(existing, 'status.json', owner=existing_owner) != checkpoint:
                 raise Refused('RESUME_REVISION_CONFLICT')
-            verify_media_files(existing, files, owner=existing_owner)
+            verify_media_files(output, output_files, owner=existing_owner)
             return
     except FileNotFoundError:
         if 'media-resume' in os.listdir(output):
             raise Refused('RESUME_REVISION_CONFLICT') from None
     free = os.fstatvfs(output)
-    if free.f_bavail * free.f_frsize < RESERVE + sum(size for _, size, _ in files):
+    if free.f_bavail * free.f_frsize < RESERVE + sum(size for _, size, _ in output_files):
         raise Refused('INSUFFICIENT_SPACE')
+
+    def publish_existing_or_copy(items, *, source_root, target_root):
+        missing = []
+        for item in items:
+            try:
+                verify_media_files(target_root, [item], owner=existing_owner)
+            except FileNotFoundError:
+                missing.append(item)
+        if missing:
+            copy_media(source_root, target_root, missing, owner=owner)
+        verify_media_files(target_root, items, owner=existing_owner)
+
+    # These paths are inside an unpublished .stage directory in broker use.
+    # Write media-root receipts first; retries verify and reuse an already
+    # copied file instead of replacing it. The checkpoint is published only
+    # after every declared file has passed its size/hash check.
+    publish_existing_or_copy(
+        files_by_root['media'], source_root=media_source, target_root=output,
+    )
     temp = '.resume-' + uuid.uuid4().hex
     try:
         with descend(output, [temp], create=True) as target:
-            copy_media(source, target, files, owner=owner)
+            resume_files = [
+                (item[0][1:], item[1], item[2])
+                for item in files_by_root['media-resume']
+            ]
+            copy_media(source, target, resume_files, owner=owner)
             write_file(target, 'status.json', checkpoint)
             if publish_owner:
                 for _, dirs, names, fd in os.fwalk('.', topdown=False, dir_fd=target):
@@ -488,6 +521,7 @@ def publish_resume(source, output, checkpoint, records, *, owner=None, publish_o
             os.fsync(target)
         os.rename(temp, 'media-resume', src_dir_fd=output, dst_dir_fd=output)
         os.fsync(output)
+        verify_media_files(output, output_files, owner=existing_owner)
     finally:
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(temp, dir_fd=output)
@@ -1038,7 +1072,10 @@ class Broker:
                         'services_manifest.json': services_manifest_sha,
                     }
                     records = resumed_photos(checkpoint, resume_hashes, rows_at(final))
-                    publish_resume(resumed, final, checkpoint, records)
+                    publish_resume(
+                        resumed, final, checkpoint, records,
+                        media_source=source,
+                    )
 
             destination = self.root / 'imports' / '.broker' / staging_fingerprint / chat / topic
             try:

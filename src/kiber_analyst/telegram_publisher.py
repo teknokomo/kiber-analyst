@@ -52,6 +52,13 @@ class TransferError(Exception):
         self.code = code
 
 
+class IncompleteTransferCandidate(TransferError):
+    """A source-bound candidate is missing its final transfer manifest."""
+
+    def __init__(self):
+        super().__init__("TRANSFER_CANDIDATE_INCOMPLETE")
+
+
 def _fail(code: str):
     raise TransferError(code)
 
@@ -321,8 +328,14 @@ def _rename_exchange(parent: int, first: str, second: str) -> None:
 def _transfer_record(parent: int, name: str, *, uid: int, allow_temp_marker: bool = False):
     directory = _open_child(parent, name, uid=uid)
     try:
-        raw = _read_file(directory, "telegram_transfer_manifest.json", uid=uid,
-                         maximum=MAX_METADATA_BYTES)
+        try:
+            raw = _read_file(directory, "telegram_transfer_manifest.json", uid=uid,
+                             maximum=MAX_METADATA_BYTES)
+        except FileNotFoundError as exc:
+            # Only this precise state proves the candidate never reached its
+            # durable completion record. EIO, permission errors, malformed
+            # metadata, and failures while validating contents are ambiguous.
+            raise IncompleteTransferCandidate() from exc
         record = json.loads(raw)
         if not isinstance(record, dict) or not isinstance(record.get("source_id"), str):
             _fail("TRANSFER_MANIFEST_INVALID")
@@ -443,13 +456,20 @@ def _read_temp_marker(parent: int, name: str, *, uid: int) -> dict | None:
     try:
         directory = _open_child(parent, name, uid=uid, mode=0o700)
     except (OSError, TransferError):
-        return None
+        _fail("TRANSFER_RECOVERY_REQUIRED")
     try:
-        marker = json.loads(_read_file(
-            directory, ".publisher-temp.json", uid=uid, maximum=MAX_METADATA_BYTES,
-        ))
-    except (OSError, TransferError, ValueError, UnicodeError):
-        return None
+        try:
+            raw = _read_file(
+                directory, ".publisher-temp.json", uid=uid, maximum=MAX_METADATA_BYTES,
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, TransferError):
+            _fail("TRANSFER_RECOVERY_REQUIRED")
+        try:
+            marker = json.loads(raw)
+        except (ValueError, UnicodeError):
+            _fail("TRANSFER_RECOVERY_REQUIRED")
     finally:
         os.close(directory)
     hashes = marker.get("source_hashes") if isinstance(marker, dict) else None
@@ -464,7 +484,7 @@ def _read_temp_marker(parent: int, name: str, *, uid: int) -> dict | None:
                    for value in hashes.values())
             or (marker["media_manifest_sha256"] is not None
                 and not re.fullmatch(r"[0-9a-f]{64}", str(marker["media_manifest_sha256"])) )):
-        return None
+        _fail("TRANSFER_RECOVERY_REQUIRED")
     return marker
 
 
@@ -619,8 +639,12 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
                     record, transfer_sha = _transfer_record(
                         parent, candidate_name, uid=uid, allow_temp_marker=True,
                     )
-                except (TransferError, OSError, ValueError, UnicodeError):
+                except IncompleteTransferCandidate:
+                    _remove_recovery_tree(parent, candidate_name, uid=uid, summary=summary)
+                    processed_candidates.add(candidate_name)
                     record = None
+                except (TransferError, OSError, ValueError, UnicodeError):
+                    _fail("TRANSFER_RECOVERY_REQUIRED")
                 if record is not None:
                     if (record.get("source_id") != intent["source_id"]
                             or record.get("source_hashes") != intent["source_hashes"]
@@ -635,29 +659,31 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
                             transfer_sha=transfer_sha, summary=summary,
                         )
                         processed_candidates.add(candidate_name)
-                elif candidate_name != temp_name:
-                    _remove_recovery_tree(
-                        parent, candidate_name, uid=uid, summary=summary,
-                    )
-                    processed_candidates.add(candidate_name)
             else:
                 try:
                     record, transfer_sha = _transfer_record(parent, candidate_name, uid=uid)
-                except (TransferError, OSError):
-                    _preserve_recovery_item(summary, "unverified_candidate")
-                    continue
-                if (record.get("source_id") != intent["source_id"]
-                        or record.get("source_hashes") != intent["source_hashes"]
-                        or record.get("media_manifest_sha256")
-                        != intent["media_manifest_sha256"]):
-                    _preserve_recovery_item(summary, "candidate_intent_mismatch")
-                    continue
-                if candidate_name != temp_name:
-                    _archive_recovery_candidate(
-                        parent, candidate_name, uid=uid, transfer=record,
-                        transfer_sha=transfer_sha, summary=summary,
-                    )
+                except IncompleteTransferCandidate:
+                    # The durable sidecar and deterministic candidate name
+                    # establish ownership even if the crash preceded writing
+                    # the in-directory marker. Only a missing final manifest
+                    # proves that this owned candidate is incomplete.
+                    _remove_recovery_tree(parent, candidate_name, uid=uid, summary=summary)
                     processed_candidates.add(candidate_name)
+                except (TransferError, OSError, ValueError, UnicodeError):
+                    _fail("TRANSFER_RECOVERY_REQUIRED")
+                else:
+                    if (record.get("source_id") != intent["source_id"]
+                            or record.get("source_hashes") != intent["source_hashes"]
+                            or record.get("media_manifest_sha256")
+                            != intent["media_manifest_sha256"]):
+                        _preserve_recovery_item(summary, "candidate_intent_mismatch")
+                        _fail("TRANSFER_RECOVERY_REQUIRED")
+                    if candidate_name != temp_name:
+                        _archive_recovery_candidate(
+                            parent, candidate_name, uid=uid, transfer=record,
+                            transfer_sha=transfer_sha, summary=summary,
+                        )
+                        processed_candidates.add(candidate_name)
         sidecar_info = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if (not stat.S_ISREG(sidecar_info.st_mode) or sidecar_info.st_nlink != 1
                 or sidecar_info.st_uid != uid or stat.S_IMODE(sidecar_info.st_mode) != 0o600
@@ -690,16 +716,17 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
                     record, transfer_sha = _transfer_record(
                         parent, name, uid=uid, allow_temp_marker=True,
                     )
-                except (TransferError, OSError, ValueError, UnicodeError):
-                    record = None
-                if record is None:
+                except IncompleteTransferCandidate:
                     _remove_recovery_tree(parent, name, uid=uid, summary=summary)
-                elif (record.get("source_id") != marker["source_id"]
+                except (TransferError, OSError, ValueError, UnicodeError):
+                    _fail("TRANSFER_RECOVERY_REQUIRED")
+                else:
+                    if (record.get("source_id") != marker["source_id"]
                       or record.get("source_hashes") != marker["source_hashes"]
                       or record.get("media_manifest_sha256")
                       != marker["media_manifest_sha256"]):
-                    _preserve_recovery_item(summary, "candidate_marker_mismatch")
-                else:
+                        _preserve_recovery_item(summary, "candidate_marker_mismatch")
+                        _fail("TRANSFER_RECOVERY_REQUIRED")
                     _remove_temp_marker(parent, name, uid=uid)
                     if name != temp_name:
                         _archive_recovery_candidate(
@@ -709,17 +736,19 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
             continue
         try:
             record, transfer_sha = _transfer_record(parent, name, uid=uid)
-        except (TransferError, OSError):
+        except (TransferError, OSError, ValueError, UnicodeError):
             _preserve_recovery_item(summary, "unverified_candidate")
-            continue
+            _fail("TRANSFER_RECOVERY_REQUIRED")
         record_source = record.get("source_id")
         record_hashes = record.get("source_hashes")
         record_media_sha = record.get("media_manifest_sha256")
         if (not isinstance(record_source, str) or not isinstance(record_hashes, dict)
                 or _transfer_candidate_name(record_source, record_hashes, record_media_sha) != name):
             _preserve_recovery_item(summary, "candidate_name_mismatch")
+            _fail("TRANSFER_RECOVERY_REQUIRED")
         elif record_source != source_id:
             _preserve_recovery_item(summary, "other_source_candidate")
+            _fail("TRANSFER_RECOVERY_REQUIRED")
         else:
             _archive_recovery_candidate(
                 parent, name, uid=uid, transfer=record, transfer_sha=transfer_sha,
@@ -1589,13 +1618,16 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
             try:
                 desired_media_sha = _media_manifest_sha(media_manifest)
                 temp_name = _transfer_candidate_name(source_id, hashes, desired_media_sha)
-                recovery = _recover_initialization_directories(
-                    destination_chat, uid=config["destination_uid"],
-                    gid=config["destination_gid"],
-                    source_id=source_id, source_hashes=hashes,
-                    media_manifest_sha=desired_media_sha,
-                    temp_name=temp_name,
-                )
+                try:
+                    recovery = _recover_initialization_directories(
+                        destination_chat, uid=config["destination_uid"],
+                        gid=config["destination_gid"],
+                        source_id=source_id, source_hashes=hashes,
+                        media_manifest_sha=desired_media_sha,
+                        temp_name=temp_name,
+                    )
+                except (TransferError, OSError, ValueError, UnicodeError):
+                    _fail("TRANSFER_RECOVERY_REQUIRED")
 
                 def recovery_result(value):
                     return {**value, "recovery_cleanup": recovery}
@@ -1611,12 +1643,16 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                         temp_record, _temp_sha = _transfer_record(
                             destination_chat, temp_name, uid=config["destination_uid"],
                         )
-                    except (TransferError, OSError):
-                        if not _temp_marker_matches(
-                            destination_chat, temp_name, uid=config["destination_uid"],
-                            source_id=source_id, source_hashes=hashes,
-                            media_manifest_sha=desired_media_sha,
-                        ):
+                    except IncompleteTransferCandidate:
+                        try:
+                            marker_matches = _temp_marker_matches(
+                                destination_chat, temp_name, uid=config["destination_uid"],
+                                source_id=source_id, source_hashes=hashes,
+                                media_manifest_sha=desired_media_sha,
+                            )
+                        except (TransferError, OSError, ValueError, UnicodeError):
+                            _fail("TRANSFER_RECOVERY_REQUIRED")
+                        if not marker_matches:
                             _fail("TRANSFER_RECOVERY_REQUIRED")
                         _remove_tree(destination_chat, temp_name,
                                      expected_uid=config["destination_uid"])
@@ -1627,6 +1663,8 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                             destination_chat, scope_dir, source_id,
                             dest_uid=config["destination_uid"],
                         )
+                    except (TransferError, OSError, ValueError, UnicodeError):
+                        _fail("TRANSFER_RECOVERY_REQUIRED")
                     else:
                         if (temp_record.get("source_hashes") != hashes):
                             _fail("TRANSFER_RECOVERY_REQUIRED")

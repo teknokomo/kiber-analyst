@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from kiber_analyst import broker, telegram_publisher
+from kiber_analyst import broker, telegram_exporter, telegram_publisher
 from kiber_analyst.telegram_exporter import (
     Budget,
     Dir,
@@ -376,6 +377,50 @@ def test_forum_general_provenance_precedes_reply_root_for_messages_and_services(
     assert not service_belongs(general_event_without_flag, 420, forum=True)
     assert service_belongs(topic_event, 420, forum=True)
     assert not service_belongs(topic_event, 1, forum=True)
+
+
+def test_service_topic_create_never_falls_into_general_and_respects_reply_top_id():
+    create = {
+        "id": 420,
+        "action": {"_": "messageActionTopicCreate", "title": "New topic"},
+    }
+    normalized, _ = telegram_exporter.service_event(create, None, forum=True)
+    assert normalized["topic_id"] is None
+    assert normalized["topic_id_status"] == "unknown"
+    assert not service_belongs(create, 1, forum=True)
+    assert service_belongs(create, 420, forum=True)
+    scoped, _ = telegram_exporter.service_event(create, 420, forum=True)
+    assert scoped["topic_id"] == 420
+    assert scoped["topic_id_status"] == "known"
+
+    matching_root = {
+        **create,
+        "replyTo": {"forumTopic": True, "replyToTopId": 420},
+    }
+    normalized, _ = telegram_exporter.service_event(matching_root, None, forum=True)
+    assert normalized["topic_id"] == 420
+    assert normalized["topic_id_status"] == "known"
+    assert service_belongs(matching_root, 420, forum=True)
+
+    conflicting = {
+        **create,
+        "replyTo": {"forumTopic": True, "replyToTopId": 900},
+    }
+    normalized, limitations = telegram_exporter.service_event(
+        conflicting, None, forum=True,
+    )
+    assert normalized["topic_id"] is None
+    assert normalized["topic_id_status"] == "unknown"
+    assert "topic_assignment_conflict" in limitations
+    assert not service_belongs(conflicting, 1, forum=True)
+    assert not service_belongs(conflicting, 420, forum=True)
+    assert not service_belongs(conflicting, 900, forum=True)
+
+    # A conflicting reply root stays unknown even when a caller passes that
+    # root as the requested topic.
+    scoped, _ = telegram_exporter.service_event(conflicting, 900, forum=True)
+    assert scoped["topic_id"] is None
+    assert scoped["topic_id_status"] == "unknown"
 
 
 def test_service_snapshot_budget_replaces_prior_revision_reservation(tmp_path: Path):
@@ -944,6 +989,89 @@ def test_publisher_recovers_old_revision_before_publishing_new_resume(
     assert repeated["status"] == "already_ready"
     assert sorted(path.name for path in (parent / ".revisions").iterdir()) == before_revisions
     assert repeated["recovery_cleanup"]["removed_artifacts"] == 0
+
+
+@pytest.mark.parametrize("scenario", ["orphan_marker", "init_intent", "current_temp"])
+@pytest.mark.parametrize("failure", ["eio", "access"])
+@pytest.mark.parametrize("failure_point", ["transfer_manifest", "temp_marker"])
+def test_publisher_preserves_candidates_when_recovery_read_is_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    failure: str,
+    failure_point: str,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    parent = stage.parent
+    source_id = result["source_id"]
+    old_transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    source_hashes = old_transfer["source_hashes"]
+
+    if scenario in {"orphan_marker", "init_intent"}:
+        kind = "partial_candidate" if scenario == "orphan_marker" else "complete_candidate"
+        candidate_name, _ = _add_interrupted_revision(
+            parent, kind=kind, source_id=source_id,
+            source_hashes=source_hashes, stage=stage,
+        )
+        expected_media_sha = None
+    else:
+        expected_media_sha = _add_empty_media_resume_revision(
+            result["export_dir"], source_id,
+        )
+        candidate_name = telegram_publisher._transfer_candidate_name(
+            source_id, source_hashes, expected_media_sha,
+        )
+        candidate = parent / candidate_name
+        candidate.mkdir(mode=0o700)
+        marker = {
+            "source_id": source_id,
+            "source_hashes": source_hashes,
+            "media_manifest_sha256": expected_media_sha,
+        }
+        (candidate / ".publisher-temp.json").write_text(
+            json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8",
+        )
+        (candidate / ".publisher-temp.json").chmod(0o600)
+        (candidate / "messages.jsonl").write_bytes(b"partial-current-candidate")
+        (candidate / "messages.jsonl").chmod(0o600)
+    candidate = parent / candidate_name
+    candidate_info = candidate.stat()
+    candidate_message_before = (candidate / "messages.jsonl").read_bytes()
+    previous_manifest = (stage / "telegram_transfer_manifest.json").read_bytes()
+    original_read_file = telegram_publisher._read_file
+
+    target_file = (
+        "telegram_transfer_manifest.json"
+        if failure_point == "transfer_manifest" else ".publisher-temp.json"
+    )
+
+    def fail_recovery_read(directory_fd, name, **kwargs):
+        info = os.fstat(directory_fd)
+        if (name == target_file
+                and (info.st_dev, info.st_ino)
+                == (candidate_info.st_dev, candidate_info.st_ino)):
+            if failure == "eio":
+                raise OSError(errno.EIO, "synthetic read failure")
+            raise PermissionError(errno.EACCES, "synthetic access failure")
+        return original_read_file(directory_fd, name, **kwargs)
+
+    monkeypatch.setattr(telegram_publisher, "_read_file", fail_recovery_read)
+    with pytest.raises(telegram_publisher.TransferError, match="TRANSFER_RECOVERY_REQUIRED"):
+        telegram_publisher.handle(
+            "copy", source_id, config_path=str(result["publisher_config"]),
+        )
+
+    assert candidate.is_dir()
+    assert (candidate / "messages.jsonl").read_bytes() == candidate_message_before
+    assert (stage / "telegram_transfer_manifest.json").read_bytes() == previous_manifest
+    if scenario == "init_intent":
+        assert list(parent.glob(".publisher-init-*.json"))
 
 
 def test_publisher_keeps_previous_ready_revision_if_new_candidate_fails(
