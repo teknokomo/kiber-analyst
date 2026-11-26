@@ -256,11 +256,32 @@ def write_file(fd, name, data):
         os.fsync(stream.fileno())
 
 
+def _media_stat_token(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def verify_media_files(root, items, *, owner=None):
+    """Stream-check staged media each time an immutable revision is reused."""
+    for rel, size, digest in items:
+        with descend(root, rel[:-1], owner=owner) as parent:
+            with open_input(parent, rel[-1], owner=owner) as stream:
+                before = os.fstat(stream.fileno())
+                if before.st_size != size:
+                    raise Refused('DATA_MISMATCH')
+                actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+                after = os.fstat(stream.fileno())
+                if (_media_stat_token(before) != _media_stat_token(after)
+                        or actual != digest):
+                    raise Refused('DATA_MISMATCH')
+
+
 def copy_media(source, output, items, *, owner=None):
     for rel, size, digest in items:
         with descend(source, rel[:-1], owner=owner) as old, descend(output, rel[:-1], create=True) as new:
             with open_input(old, rel[-1], owner=owner) as src:
-                if os.fstat(src.fileno()).st_size != size:
+                before = os.fstat(src.fileno())
+                if before.st_size != size:
                     raise Refused('DATA_MISMATCH')
                 dest = os.open(rel[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                0o600, dir_fd=new)
@@ -274,9 +295,13 @@ def copy_media(source, output, items, *, owner=None):
                         dst.write(data)
                         actual.update(data)
                         left -= len(data)
-                    if src.read(1) or actual.hexdigest() != digest:
+                    after = os.fstat(src.fileno())
+                    if (src.read(1) or actual.hexdigest() != digest
+                            or _media_stat_token(before) != _media_stat_token(after)):
                         raise Refused('DATA_MISMATCH')
                     dst.flush()
+                    if os.fstat(dst.fileno()).st_size != size:
+                        raise Refused('DATA_MISMATCH')
                     os.fsync(dst.fileno())
             os.fsync(new)
 
@@ -299,8 +324,17 @@ def media_items(data, manifest_limit=DEFAULT_TELEGRAM_MEDIA_BYTES):
     result = []
     seen = set()
     for line in data.splitlines():
-        row = json.loads(line)
-        media = row.get('media') or {}
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeError):
+            raise Refused('UNSAFE_MEDIA') from None
+        if not isinstance(row, dict) or type(row.get('message_id')) is not int or row['message_id'] <= 0:
+            raise Refused('UNSAFE_MEDIA')
+        media = row.get('media')
+        if media is None:
+            continue
+        if not isinstance(media, dict):
+            raise Refused('UNSAFE_MEDIA')
         value = media.get('path')
         if value is None:
             continue
@@ -327,12 +361,7 @@ def publish_resume(source, output, checkpoint, records, *, owner=None, publish_o
         with descend(output, ['media-resume'], owner=existing_owner) as existing:
             if read_input(existing, 'status.json', owner=existing_owner) != checkpoint:
                 raise Refused('RESUME_REVISION_CONFLICT')
-            for rel, size, digest in files:
-                with descend(existing, rel[:-1], owner=existing_owner) as parent:
-                    with open_input(parent, rel[-1], owner=existing_owner) as stream:
-                        if (os.fstat(stream.fileno()).st_size != size
-                                or hashlib.file_digest(stream, 'sha256').hexdigest() != digest):
-                            raise Refused('DATA_MISMATCH')
+            verify_media_files(existing, files, owner=existing_owner)
             return
     except FileNotFoundError:
         if 'media-resume' in os.listdir(output):
@@ -822,6 +851,7 @@ class Broker:
             if json.loads(data['manifest.json']).get('source_id') != source_id:
                 raise Refused('DATA_MISMATCH')
             manifest_limit = _manifest_media_limit(data['manifest.json'])
+            files = media_items(data['messages.jsonl'], manifest_limit)
             data['services_manifest.json'] = services
             base = stack.enter_context(descend(fd, ['imports', '.broker']))
             def merge(final):
@@ -840,13 +870,13 @@ class Broker:
                 with descend(base, [staging_fingerprint, chat, topic]) as final:
                     if any(read_input(final, n) != v for n, v in data.items()):
                         raise Refused('HASH_MISMATCH')
+                    verify_media_files(final, files)
                     merge(final)
                     return destination
             except FileNotFoundError:
                 # A partially missing existing final directory is never replaced.
                 if staging_fingerprint in os.listdir(base):
                     raise Refused('DATA_MISMATCH') from None
-            files = media_items(data['messages.jsonl'], manifest_limit)
             free = os.fstatvfs(base)
             required = sum(size for _, size, _ in files) + sum(map(len, data.values()))
             if free.f_bavail * free.f_frsize < required + RESERVE:

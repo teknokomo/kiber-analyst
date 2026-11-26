@@ -120,3 +120,48 @@ def test_media_resume_rejects_receipt_type_conflicting_with_source():
 
     with pytest.raises(LoadError, match="unsafe path or checksum"):
         resumed_media(checkpoint, hashes, messages)
+
+
+@pytest.mark.parametrize("source_media", [
+    ...,
+    None,
+    {},
+    [],
+    "voice_message",
+    {"type": "voice_message", "kind": "document", "reason": "over_limit"},
+])
+def test_media_resume_rejects_absent_or_malformed_source_attachment(source_media):
+    hashes = {"messages.jsonl": "1" * 64}
+    checkpoint = json.dumps({
+        "inputs": hashes,
+        "requested_max_file_bytes": 101,
+        "records": {"7": {
+            "export_status": "downloaded", "path": "media-resume/7/file.ogg",
+            "size": 3, "sha256": hashlib.sha256(b"abc").hexdigest(),
+            "type": "voice_message", "max_file_bytes": 101,
+        }},
+    }).encode()
+    message = {"message_id": 7}
+    if source_media is not ...:
+        message["media"] = source_media
+
+    with pytest.raises(LoadError):
+        resumed_media(checkpoint, hashes, [message])
+
+
+def test_media_resume_accepts_a_valid_skipped_source_attachment():
+    hashes = {"messages.jsonl": "2" * 64}
+    checkpoint = json.dumps({
+        "inputs": hashes,
+        "requested_max_file_bytes": 101,
+        "records": {"7": {
+            "export_status": "downloaded", "path": "media-resume/7/file.ogg",
+            "size": 3, "sha256": hashlib.sha256(b"abc").hexdigest(),
+            "max_file_bytes": 101,
+        }},
+    }).encode()
+    messages = [{"message_id": 7, "media": {
+        "type": "voice_message", "export_status": "skipped", "reason": "over_limit",
+    }}]
+
+    assert resumed_media(checkpoint, hashes, messages)[7]["type"] == "voice_message"

@@ -11,6 +11,7 @@ This release covers:
 - A single normalized discussion model on top of `documents` + `segments`, with thread/item references, parent links, item kinds, revisions, and soft-deletion markers.
 - Incremental sync with checkpoints and a five-minute overlap window; repeated runs are idempotent.
 - Embeddings for non-empty discussion text, hybrid/FTS search, MCP search with provenance, and broker allowlisting for external sources.
+- A configurable Telegram topic exporter and atomic publisher, including resumable media up to 4,000,000,000 bytes per file; Telegram CLI installation/session setup remains operator-managed.
 
 Everything stays **read-only** against the providers: Kiber-analyst never creates issues, comments, reviews, labels, or merges. Diff analysis, attachments, OCR, webhooks, cross-provider deduplication, and UI are out of scope for 0.2.0.
 
@@ -65,6 +66,9 @@ The prepared example records are in `examples/synthetic/telegram-topic/`. They d
 5. Optionally create embeddings and run hybrid search.
 6. Use the read-only MCP process or restricted broker when an agent needs bounded access.
 
+For Telegram account setup, per-file media limits, export resume, staging, and the
+handoff to the restricted broker, see [Telegram export and transfer](docs/telegram-export.md).
+
 ## External discussions (GitHub, GitLab, GitVerse)
 
 Set a read-only provider token in the environment (`KIBER_GITHUB_TOKEN`,
@@ -112,7 +116,7 @@ PostgreSQL integration tests are skipped unless an isolated disposable test data
 
 ## Architecture and security
 
-- `src/kiber_analyst/` contains the CLI, parser, loader, search core, job worker, and restricted broker.
+- `src/kiber_analyst/` contains the CLI, parser, loader, search core, job worker, restricted broker, Telegram exporter, and publisher.
 - `src/kiber_analyst_mcp/` exposes read-only tools and does not import write paths.
 - `migrations/` defines the required database objects and reader permissions.
 - `docs/` describes the data flow, schema, installation, search, and security boundaries.

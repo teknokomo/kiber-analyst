@@ -1,0 +1,11 @@
+{
+  "export_root": "/var/lib/kiber-analyst/telegram/exports",
+  "storage_root": "/var/lib/kiber-analyst/telegram",
+  "telegram_cli": "/usr/local/bin/telegram-cli-compatible",
+  "telegram_home": "/var/lib/kiber-analyst/telegram/account-home",
+  "publisher_executable": "/usr/local/bin/kiber-analyst-telegram-publish",
+  "publisher_config": "/etc/kiber-analyst/telegram-publisher.json",
+  "storage_limit_bytes": 53687091200,
+  "min_free_bytes": 1073741824,
+  "expected_mount_uuid": null
+}

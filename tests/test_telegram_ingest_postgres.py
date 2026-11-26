@@ -391,3 +391,248 @@ def test_concurrent_same_chat_import_keeps_project_a_unchanged(
             limit=5, source_id=f"telegram:{chat_id}:topic:1",
         )
         assert search_after == search_before
+
+
+def test_sequential_export_revisions_keep_both_media_and_loaded_data(
+    tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
+) -> None:
+    from telegram_pipeline_support import build_partial_media_revisions
+
+    from kiber_analyst import broker
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    project_slug = f"kiber-media-revision-{uuid.uuid4().hex[:10]}"
+    chat_id = f"-100{uuid.uuid4().int % 10**15 + 1}"
+    package: dict[str, object] = {}
+    jobs: dict[str, dict] = {}
+    submitted: list[tuple[str, list[str]]] = []
+    owner = "synthetic-pipeline-owner"
+
+    def worker_api(action: str, **kwargs):
+        if action == "project-catalog":
+            return {"projects": [{"slug": project_slug, "title": "Synthetic media revisions"}]}
+        if action == "status":
+            return jobs[kwargs["job_id"]]
+        if action == "result":
+            return jobs[kwargs["job_id"]].get("result", {})
+        if action == "source-overview":
+            return {"messages": 2, "service_events": 1}
+        raise AssertionError(f"unexpected worker operation: {action}")
+
+    def submit(argv: list[str], *, idempotency_key: str):
+        job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key))
+        jobs.setdefault(job_id, {"state": "queued", "progress": {}})
+        submitted.append((job_id, list(argv)))
+        return {"job_id": job_id}
+
+    def stage_from_last_submission() -> Path:
+        argv = submitted[-1][1]
+        assert argv[:2] == ["telegram", "ingest"]
+        return Path(argv[argv.index("--job") + 1])
+
+    def complete_job(request: dict, result: dict) -> None:
+        jobs[request["job_id"]] = {
+            "state": "done", "progress": {}, "result": result,
+        }
+
+    def process_first_published_revision(stage: Path) -> None:
+        application_root = tmp_path / "pipeline-data" / "application"
+        (application_root / "broker").mkdir(mode=0o700, parents=True, exist_ok=True)
+        (application_root / "imports" / ".broker").mkdir(mode=0o700, parents=True, exist_ok=True)
+        app = broker.Broker(
+            application_root, {}, worker_api=worker_api, submit=submit,
+            authorized_projects={project_slug},
+        )
+        package["broker"] = app
+        package["application_root"] = application_root
+        package["source_id"] = f"telegram:{chat_id}:topic:17"
+
+        source_id = package["source_id"]
+        registration = app.handle(owner, "source-add", source_id, project_slug)
+        assert registration["registered"] is True
+        dry_request = app.handle(owner, "ingest-dry-run", source_id, project_slug)
+        dry_stage = stage_from_last_submission()
+        dry = load_telegram_export(
+            dry_stage,
+            tmp_path / "artifacts" / "first-dry-run",
+            env_path=Path(TEST_ENV), project_slug=project_slug, dry_run=True,
+            root=application_root / "imports",
+        )
+        assert dry["status"] == "dry_run" and dry["rollback_confirmed"] is True
+        assert dry["inserted"] == 2 and dry["service_events_inserted"] == 1
+        assert dry["media_missing"] == 1
+        with _connect(disposable_postgres_credentials) as conn:
+            assert conn.execute(
+                "SELECT count(*) FROM projects WHERE slug=%s", (project_slug,),
+            ).fetchone()[0] == 0
+        complete_job(dry_request, {"status": "dry_run", "counts": {"inserted": 2}})
+
+        real_request = app.handle(owner, "ingest", source_id, project_slug)
+        first_real_stage = stage_from_last_submission()
+        first = load_telegram_export(
+            first_real_stage,
+            tmp_path / "artifacts" / "first-real-load",
+            env_path=Path(TEST_ENV), project_slug=project_slug,
+            root=application_root / "imports",
+        )
+        assert first["status"] == "done" and first["media_missing"] == 1
+        assert (first["inserted"], first["service_events_inserted"]) == (2, 1)
+        complete_job(real_request, {"status": "done", "counts": {"inserted": 2}})
+        package["first_stage"] = first_real_stage
+        package["first_request"] = real_request
+
+        repeated_request = app.handle(owner, "ingest", source_id, project_slug)
+        assert repeated_request == real_request
+        repeated = load_telegram_export(
+            first_real_stage,
+            tmp_path / "artifacts" / "first-repeat",
+            env_path=Path(TEST_ENV), project_slug=project_slug,
+            root=application_root / "imports",
+        )
+        assert (repeated["inserted"], repeated["skipped"]) == (0, 2)
+        assert repeated["service_events_skipped"] == 1
+
+        with _connect(disposable_postgres_credentials) as conn:
+            project_id = conn.execute(
+                "SELECT id FROM projects WHERE slug=%s", (project_slug,),
+            ).fetchone()[0]
+            segment_rows = conn.execute(
+                """SELECT seg.id, seg.external_ref, seg.text, seg.content_hash,
+                          seg.meta->>'media_path',
+                          (seg.meta->'media_export'->>'size')::bigint,
+                          seg.meta->'media_export'->>'sha256'
+                   FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+                   JOIN sources src ON src.id=doc.source_id
+                   WHERE src.project_id=%s ORDER BY seg.external_ref""",
+                (project_id,),
+            ).fetchall()
+            assert [row[1] for row in segment_rows] == [
+                f"tg:{chat_id}:501", f"tg:{chat_id}:502",
+            ]
+            assert segment_rows[0][4] == "media/501/item-501.bin"
+            assert segment_rows[1][4] is None
+            embedded_segment_id = segment_rows[0][0]
+            vector = "[" + ",".join(["0"] * 1536) + "]"
+            conn.execute(
+                """INSERT INTO embeddings
+                   (project_id, owner_table, owner_id, model, embedding)
+                   VALUES (%s::uuid, 'segments', %s, 'gemini-embedding-2:1536', %s::vector)""",
+                (project_id, str(embedded_segment_id), vector),
+            )
+            package["baseline_segments"] = segment_rows
+            package["project_id"] = str(project_id)
+            package["embedding_id"] = conn.execute(
+                "SELECT id FROM embeddings WHERE owner_table='segments' AND owner_id=%s",
+                (str(embedded_segment_id),),
+            ).fetchone()[0]
+            package["baseline_event"] = conn.execute(
+                """SELECT event_id, event_type, payload::text
+                   FROM telegram_service_events ev JOIN sources src ON src.id=ev.source_id
+                   WHERE src.project_id=%s""",
+                (project_id,),
+            ).fetchone()
+
+    try:
+        package.update(build_partial_media_revisions(
+            tmp_path, after_first_stage=process_first_published_revision, chat_id=chat_id,
+        ))
+        app = package["broker"]
+        application_root = package["application_root"]
+        source_id = package["source_id"]
+        project_id = package["project_id"]
+        assert (package["final_stage"] / "media/501/item-501.bin").is_file()
+        assert (package["final_stage"] / "media/502/item-502.bin").is_file()
+        first_media = package["final_stage"] / "media/501/item-501.bin"
+        with first_media.open("rb") as stream:
+            first_media_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        large_media = package["final_stage"] / "media/502/item-502.bin"
+        assert large_media.stat().st_size == 100 * 1024**2 + 1
+        with large_media.open("rb") as stream:
+            large_media_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+
+        app.handle(owner, "source-add", source_id, project_slug)
+        dry_request = app.handle(owner, "ingest-dry-run", source_id, project_slug)
+        dry_stage = stage_from_last_submission()
+        before_dry = load_telegram_export(
+            dry_stage, tmp_path / "artifacts" / "second-dry-run",
+            env_path=Path(TEST_ENV), project_slug=project_slug, dry_run=True,
+            root=application_root / "imports",
+        )
+        assert before_dry["status"] == "dry_run"
+        assert before_dry["rollback_confirmed"] is True and before_dry["media_missing"] == 0
+        with _connect(disposable_postgres_credentials) as conn:
+            assert conn.execute(
+                "SELECT count(*) FROM segments seg JOIN documents d ON d.id=seg.document_id "
+                "JOIN sources s ON s.id=d.source_id WHERE s.project_id=%s", (project_id,),
+            ).fetchone()[0] == 2
+            assert conn.execute(
+                "SELECT count(*) FROM telegram_service_events ev JOIN sources s ON s.id=ev.source_id "
+                "WHERE s.project_id=%s", (project_id,),
+            ).fetchone()[0] == 1
+        complete_job(dry_request, {"status": "dry_run", "counts": {"inserted": 0}})
+
+        second_request = app.handle(owner, "ingest", source_id, project_slug)
+        second_stage = stage_from_last_submission()
+        second = load_telegram_export(
+            second_stage, tmp_path / "artifacts" / "second-real-load",
+            env_path=Path(TEST_ENV), project_slug=project_slug,
+            root=application_root / "imports",
+        )
+        assert second["status"] == "done" and second["media_missing"] == 0
+        assert second["inserted"] == 0
+        assert (second["service_events_inserted"] + second["service_events_updated"]
+                + second["service_events_skipped"]) == 1
+        complete_job(second_request, {"status": "done", "counts": {"updated": second["updated"]}})
+        assert app.handle(owner, "ingest", source_id, project_slug) == second_request
+
+        repeated = load_telegram_export(
+            second_stage, tmp_path / "artifacts" / "second-repeat",
+            env_path=Path(TEST_ENV), project_slug=project_slug,
+            root=application_root / "imports",
+        )
+        assert repeated["inserted"] == 0 and repeated["service_events_skipped"] == 1
+
+        with _connect(disposable_postgres_credentials) as conn:
+            final_rows = conn.execute(
+                """SELECT seg.id, seg.external_ref, seg.text, seg.content_hash,
+                          seg.meta->>'media_path',
+                          (seg.meta->'media_export'->>'size')::bigint,
+                          seg.meta->'media_export'->>'sha256'
+                   FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+                   JOIN sources src ON src.id=doc.source_id
+                   WHERE src.project_id=%s ORDER BY seg.external_ref""",
+                (project_id,),
+            ).fetchall()
+            assert len(final_rows) == 2
+            assert [row[2:4] for row in final_rows] == [
+                row[2:4] for row in package["baseline_segments"]
+            ]
+            assert final_rows[0][4] == "media/501/item-501.bin"
+            assert final_rows[1][4] == "media/502/item-502.bin"
+            assert final_rows[0][5] == 2
+            assert final_rows[0][6] == first_media_sha256
+            assert final_rows[1][5] == 100 * 1024**2 + 1
+            assert final_rows[1][6] == large_media_sha256
+            event = conn.execute(
+                """SELECT event_id, event_type, payload::text
+                   FROM telegram_service_events ev JOIN sources src ON src.id=ev.source_id
+                   WHERE src.project_id=%s""",
+                (project_id,),
+            ).fetchone()
+            assert event == package["baseline_event"]
+            assert conn.execute(
+                "SELECT count(*) FROM telegram_service_events ev JOIN sources src ON src.id=ev.source_id "
+                "WHERE src.project_id=%s", (project_id,),
+            ).fetchone()[0] == 1
+            embedding = conn.execute(
+                "SELECT id, owner_id, model, embedding::text FROM embeddings "
+                "WHERE id=%s", (package["embedding_id"],),
+            ).fetchone()
+            assert embedding is not None
+            assert embedding[1:3] == (str(final_rows[0][0]), "gemini-embedding-2:1536")
+            assert embedding[0] == package["embedding_id"]
+    finally:
+        if package.get("broker") is not None:
+            package["broker"].db.close()

@@ -107,6 +107,65 @@ def _open_private(path: Path):
     return os.fdopen(fd, "rb")
 
 
+def _open_export_media(directory: Path, parts: tuple[str, ...]):
+    """Open exported media by directory descriptors, refusing path replacement."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open(directory, flags)
+    try:
+        info = os.fstat(current)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+            raise LoadError("Telegram export directory is unsafe")
+        for component in parts[:-1]:
+            child = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = child
+            info = os.fstat(current)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+                raise LoadError("Telegram media directory is unsafe")
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(parts[-1], file_flags, dir_fd=current)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            os.close(fd)
+            raise LoadError("Telegram media files must be regular, singly linked, mode 0600")
+        return os.fdopen(fd, "rb")
+    finally:
+        os.close(current)
+
+
+def _stat_token(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _verify_media_stream(
+    stream,
+    *,
+    declared_size: int,
+    limit: int,
+    declared_sha256: str | None,
+) -> tuple[int, str]:
+    before = os.fstat(stream.fileno())
+    if before.st_size != declared_size or before.st_size > limit:
+        raise LoadError("Telegram media size does not match its declared size or selected limit")
+    digest = hashlib.sha256()
+    total = 0
+    while chunk := stream.read(1024 * 1024):
+        total += len(chunk)
+        if total > limit or total > declared_size:
+            raise LoadError("Telegram media changed or exceeds its selected limit")
+        digest.update(chunk)
+    after = os.fstat(stream.fileno())
+    actual_sha256 = digest.hexdigest()
+    if (_stat_token(before) != _stat_token(after) or total != declared_size
+            or (declared_sha256 is not None and actual_sha256 != declared_sha256)):
+        raise LoadError("Telegram media size or SHA-256 does not match its export metadata")
+    return total, actual_sha256
+
+
 def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
         with _open_private(path) as stream:
@@ -335,14 +394,23 @@ def _media_info(
     if not isinstance(relative, str):
         raise LoadError("Telegram message media path is invalid")
     parsed = PurePosixPath(relative)
-    if parsed.is_absolute() or not parsed.parts or parsed.parts[0] != ("media-resume" if resumed else "media") or ".." in parsed.parts:
+    if (parsed.is_absolute() or not parsed.parts
+            or parsed.parts[0] != ("media-resume" if resumed else "media")
+            or ".." in parsed.parts or "\\" in relative or "\x00" in relative):
         raise LoadError("Telegram media path contains traversal")
-    if len(parsed.parts) < 3 or parsed.parts[1] != str(message_id):
+    if len(parsed.parts) != 3 or parsed.parts[1] != str(message_id):
         raise LoadError("Telegram media path does not match its message")
     size = value.get("size", value.get("size_bytes"))
+    alternate_size = value.get("size_bytes")
+    if ("size" in value and "size_bytes" in value
+            and (type(value["size"]) is not int or type(alternate_size) is not int
+                 or value["size"] != alternate_size)):
+        raise LoadError("Telegram media size fields disagree")
     limit = value.get("max_file_bytes", export.max_file_bytes)
     try:
         validate_telegram_media_limit(limit)
+        if selected_limit is not None:
+            validate_telegram_media_limit(selected_limit)
     except ValueError:
         raise LoadError("Telegram media size limit is invalid") from None
     limit_ceiling = export.max_file_bytes if selected_limit is None else selected_limit
@@ -350,27 +418,34 @@ def _media_info(
         raise LoadError("Telegram media size limit exceeds its manifest")
     if type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES or size > limit:
         raise LoadError("Telegram media size is outside the supported limit")
-    candidate = export.path.joinpath(*parsed.parts)
-    current = export.path
-    for part in parsed.parts[:-1]:
-        current /= part
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            return media_type, None, True, safe_meta
-        except OSError:
-            raise LoadError("Telegram media path is unavailable") from None
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise LoadError("Telegram media path contains a symbolic link or non-directory")
+    declared_sha256 = value.get("sha256")
+    if declared_sha256 is not None and (
+        not isinstance(declared_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", declared_sha256)
+    ):
+        raise LoadError("Telegram media SHA-256 is invalid")
     try:
-        with _open_private(candidate) as stream:
-            if resumed and (os.fstat(stream.fileno()).st_size != value["size"]
-                            or hashlib.file_digest(stream, "sha256").hexdigest() != value["sha256"]):
-                raise LoadError("Media resume file does not match its checksum")
-    except LoadError as exc:
-        if not candidate.exists() and not candidate.is_symlink():
-            return media_type, None, True, safe_meta
-        raise exc
+        with _open_export_media(export.path, parsed.parts) as stream:
+            actual_size, actual_sha256 = _verify_media_stream(
+                stream,
+                declared_size=size,
+                limit=limit,
+                declared_sha256=declared_sha256,
+            )
+    except FileNotFoundError:
+        return media_type, None, True, safe_meta
+    except LoadError:
+        raise
+    except OSError:
+        raise LoadError("Telegram media path is unavailable or unsafe") from None
+    if resumed and (actual_size != value.get("size") or actual_sha256 != value.get("sha256")):
+        raise LoadError("Media resume file does not match its checksum")
+    safe_meta.update({
+        "size": actual_size,
+        "size_bytes": actual_size,
+        "sha256": actual_sha256,
+        "max_file_bytes": limit,
+    })
     return media_type, relative, False, safe_meta
 
 

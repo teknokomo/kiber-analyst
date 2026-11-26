@@ -60,3 +60,15 @@ the first external ingest.
 ## Fetching an archive
 
 Pass an explicit archive URI, chat identifier, and topic scope. The application does not embed a remote, source ID, topic, or checksum. Review all generated manifests before loading data.
+
+## Telegram exporter and publisher
+
+The Python package installs `kiber-analyst-telegram-export` and
+`kiber-analyst-telegram-publish`. They require an operator-installed compatible
+Telegram CLI and an account already authorized on that machine. Configure the
+private file paths, storage quota, and optional mounted-filesystem UUID from
+[`config/telegram-export.example.json`](../config/telegram-export.example.json)
+and [`config/telegram-publisher.example.json`](../config/telegram-publisher.example.json).
+Keep the Telegram CLI account home private (`0700`) and never copy its session
+between servers. The generic workflow, limits, resume behavior, and secure
+staging commands are documented in [Telegram export and transfer](telegram-export.md).

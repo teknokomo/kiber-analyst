@@ -36,11 +36,16 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
     missing = {}
     over_limit = []
     for row in messages:
-        media = row.get("media") or {}
+        if not isinstance(row, dict):
+            raise LoadError("Media resume source message is invalid")
+        message_id = row.get("message_id")
+        if type(message_id) is not int or message_id <= 0:
+            raise LoadError("Media resume source message ID is invalid")
+        media = row.get("media")
         if isinstance(media, dict) and media.get("path") is None:
-            missing[str(row["message_id"])] = media
+            missing[str(message_id)] = media
         if isinstance(media, dict) and media.get("reason") in {"over_100_MiB", "over_limit"}:
-            over_limit.append(row["message_id"])
+            over_limit.append(message_id)
     recorded_over_limit = data.get("over_limit_message_ids")
     if (not records.keys() <= missing.keys()
             or (recorded_over_limit is not None
@@ -50,6 +55,17 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
     for mid, receipt in records.items():
         if not re.fullmatch(r"[1-9][0-9]{0,18}", mid) or not isinstance(receipt, dict):
             raise LoadError("Media resume receipt is invalid")
+        source_media = missing[mid]
+        if not source_media:
+            raise LoadError("Media resume source attachment is empty")
+        source_type = _media_type(source_media)
+        source_status = source_media.get("export_status")
+        source_reason = source_media.get("reason")
+        if (source_type is None
+                or source_status not in {None, "skipped", "not_requested"}
+                or (source_status == "skipped" and source_reason not in _SKIP_REASONS)
+                or (source_reason is not None and source_reason not in _SKIP_REASONS)):
+            raise LoadError("Media resume source attachment is not a valid missing export")
         status = receipt.get("export_status")
         if status in {"skipped", "already_present"}:
             if receipt.get("reason") not in _SKIP_REASONS or receipt.get("path") is not None:
@@ -58,17 +74,8 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
         filename = receipt.get("path")
         size, digest = receipt.get("size"), receipt.get("sha256")
         limit = receipt.get("max_file_bytes", requested_limit)
-        source_media = missing[mid]
-        source_type = next(
-            (source_media[key] for key in ("type", "media_type", "kind")
-             if source_media.get(key) is not None),
-            None,
-        )
-        media_type = next(
-            (receipt[key] for key in ("type", "media_type", "kind")
-             if receipt.get(key) is not None),
-            source_type,
-        )
+        receipt_type = _media_type(receipt, allow_missing=True)
+        media_type = receipt_type or source_type
         if (
             status != "downloaded"
             or not isinstance(filename, str)
@@ -80,9 +87,7 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
             or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
             or (media_type is not None and (not isinstance(media_type, str)
                 or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", media_type)))
-            or (source_type is not None
-                and media_type is not None
-                and source_type != media_type)
+            or media_type != source_type
         ):
             raise LoadError("Media resume receipt has an unsafe path or checksum")
         result[int(mid)] = {
@@ -91,6 +96,20 @@ def resumed_media(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[i
             "export_status": "downloaded",
         }
     return result
+
+
+def _media_type(value: dict, *, allow_missing: bool = False) -> str | None:
+    """Read legacy media type aliases while rejecting conflicting metadata."""
+    kinds = [value[key] for key in ("type", "media_type", "kind")
+             if value.get(key) is not None]
+    if not kinds and allow_missing:
+        return None
+    if (not kinds or any(not isinstance(kind, str)
+                         or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", kind)
+                         for kind in kinds)
+            or len(set(kinds)) != 1):
+        raise LoadError("Media resume source and receipt types are invalid")
+    return kinds[0]
 
 
 def resumed_photos(checkpoint: bytes, hashes: dict[str, str], messages) -> dict[int, dict]:

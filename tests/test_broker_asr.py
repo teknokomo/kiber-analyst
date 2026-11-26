@@ -273,13 +273,15 @@ def test_asr_workspace_skips_missing_oversize_and_provider_limit_without_mutatin
             os.ftruncate(fd, size)
         finally:
             os.close(fd)
+        with path.open('rb') as media_stream:
+            media_sha256 = hashlib.file_digest(media_stream, 'sha256').hexdigest()
         records.append({
             'message_id': message_id, 'topic_id': 1,
             'date': '2020-01-02T12:00:00+03:00', 'text': '',
             'sender_name': 'Example Author', 'chat_id': '-1009000',
             'media': {'type': 'voice_message', 'path': f'media/{message_id}/audio.ogg',
                       'size': size, 'max_file_bytes': 4_000_000_000,
-                      'sha256': 'a' * 64},
+                      'sha256': media_sha256},
         })
     records.append({
         'message_id': 7, 'topic_id': 1,

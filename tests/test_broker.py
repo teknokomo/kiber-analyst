@@ -77,6 +77,18 @@ def test_owned_chain_and_idempotency(setup):
     assert argv[-1][0] == 'embed' and first['job_id'] in argv[-1][2]
 
 
+def test_staging_reuse_rechecks_media_bytes(setup):
+    app, _source_dir, _jobs, _argv = setup
+    entry, fingerprint, chat, topic = app.source(SOURCE)
+    staged = app.stage(SOURCE, entry, fingerprint, chat, topic)
+    media_file = staged / 'media/1/a.ogg'
+    media_file.write_bytes(b'synthetic audix')
+    media_file.chmod(0o600)
+
+    with pytest.raises(broker.Refused, match='DATA_MISMATCH'):
+        app.stage(SOURCE, entry, fingerprint, chat, topic)
+
+
 @pytest.mark.parametrize("size", [100 * 1024**2, 100 * 1024**2 + 1, 4_000_000_000])
 def test_media_items_enforces_export_ceiling_not_asr_ceiling(size):
     row = {

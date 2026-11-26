@@ -36,6 +36,8 @@ def _make_export(root: Path, *, media: bool = False) -> Path:
     if media:
         media_path = "media/101/audio.ogg"
         _write_private(topic / media_path, b"fixture audio")
+        (topic / "media").chmod(0o700)
+        (topic / "media/101").chmod(0o700)
         message_media = {
             "type": "voice_message",
             "path": media_path,
@@ -217,7 +219,84 @@ def test_media_metadata_is_checked_and_missing_media_counted(tmp_path: Path) -> 
     assert media_missing == 0
     assert record["media_type"] == "voice_message"
     assert record["media_path"] == "media/101/audio.ogg"
+    assert record["meta"]["media_export"]["size"] == len(b"fixture audio")
+    assert record["meta"]["media_export"]["sha256"] == hashlib.sha256(b"fixture audio").hexdigest()
     assert _source_hashes(topic) == before
+
+
+@pytest.mark.parametrize("replacement", [b"fixture audix", b"fixture audio!"])
+def test_regular_media_actual_bytes_must_match_export_size_and_hash(
+    tmp_path: Path, replacement: bytes,
+) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    media_file = topic / "media/101/audio.ogg"
+    _write_private(media_file, replacement)
+
+    with pytest.raises(LoadError, match="size|SHA-256"):
+        prepare_export(topic, tmp_path / "artifacts" / "modified-media", root=root)
+
+
+def test_regular_media_rejects_a_false_declared_sha256(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    message = json.loads((topic / "messages.jsonl").read_text(encoding="utf-8"))
+    message["media"]["sha256"] = "a" * 64
+    messages = _json_bytes(message)
+    _write_private(topic / "messages.jsonl", messages)
+    manifest = json.loads((topic / "manifest.json").read_text(encoding="utf-8"))
+    manifest["messages_sha256"] = hashlib.sha256(messages).hexdigest()
+    _write_private(topic / "manifest.json", _json_bytes(manifest))
+
+    with pytest.raises(LoadError, match="SHA-256"):
+        prepare_export(topic, tmp_path / "artifacts" / "bad-media-hash", root=root)
+
+
+def test_legacy_regular_media_without_declared_hash_remains_supported(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    message_path = topic / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"].pop("sha256")
+    messages = _json_bytes(message)
+    _write_private(message_path, messages)
+    manifest_path = topic / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["messages_sha256"] = hashlib.sha256(messages).hexdigest()
+    _write_private(manifest_path, _json_bytes(manifest))
+
+    artifact_dir, _, missing = prepare_export(
+        topic, tmp_path / "artifacts" / "legacy-media", root=root,
+    )
+    normalized = json.loads(
+        (artifact_dir / "normalized" / "messages.jsonl").read_text(encoding="utf-8")
+    )
+
+    assert missing == 0
+    assert normalized["meta"]["media_export"]["sha256"] == hashlib.sha256(
+        b"fixture audio"
+    ).hexdigest()
+
+
+def test_media_changed_after_open_is_rejected_before_normalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kiber_analyst.telegram_ingest as ingest
+
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    verify = ingest._verify_media_stream
+    media_file = topic / "media/101/audio.ogg"
+
+    def mutate_open_file(stream, **kwargs):
+        with media_file.open("r+b") as writable:
+            writable.write(b"X")
+            writable.flush()
+        return verify(stream, **kwargs)
+
+    monkeypatch.setattr(ingest, "_verify_media_stream", mutate_open_file)
+    with pytest.raises(LoadError, match="SHA-256"):
+        prepare_export(topic, tmp_path / "artifacts" / "changed-after-open", root=root)
 
 
 def test_media_record_cannot_exceed_manifest_selected_limit(tmp_path: Path) -> None:
