@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.3.0 — 2026-11-27
+
+Project-scoped source control and the Telegram export pipeline as product
+components.
+
+- Managed source control: the broker exposes project and source discovery,
+  project creation, source registration, dry-run, ingest, embeddings, status,
+  retry, cancel and search, scoped per project. Existing projects require a
+  root-owned policy entry; unregistered projects are refused.
+- Queue schema v4 with a documented upgrade and rollback runbook that updates
+  worker and broker as a compatible pair and refuses a mixed runtime.
+- The Telegram exporter and publisher ship with the package as
+  `kiber-analyst-telegram-export` and `kiber-analyst-telegram-publish`:
+  ordinary groups, whole forum groups and individual topics, service events,
+  and media downloads with a per-file limit of 100 MiB by default and a
+  selectable maximum of 4,000,000,000 bytes.
+- Resumable media: checkpoints, per-file size and SHA-256 verification,
+  storage quota and free-space checks, bounded streaming, and explicit
+  refusals instead of silent truncation. Files above the selected limit stay
+  reported with their reason and can be fetched later by raising the limit.
+- Atomic publication with durable markers, crash recovery that preserves data
+  of uncertain provenance, immutable staging revisions, and reindex support
+  for both `media/` and `media-resume/` roots.
+- Managed Telegram imports accept complete prepared topic exports, attach
+  recovered media to existing messages idempotently, and reject cross-project
+  topic collisions before writing.
+- Search accepts a whole Telegram group scope in addition to a single topic
+  and returns results from the same chat only.
+- Large histories are read with bounded line and buffer limits; subprocess
+  output and JSONL records are size-capped.
+
+Export and storage are independent of ASR: a stored file is not transcribed or
+analysed. Audio extraction from video and chunked transcription of large files
+are not part of 0.3.0.
+
+Still out of scope: standalone documents (TXT, Markdown, PDF, DOCX, OCR),
+write operations against providers, webhooks, diff analysis, cross-provider
+deduplication, and UI.
+
 ## 0.2.0 — 2026-11-23
 
 Read-only discussion connectors for GitHub, GitLab, and GitVerse.
