@@ -2465,13 +2465,21 @@ class Broker:
                 raise Refused('DATA_MISMATCH')
             if command == 'reindex' and resume is not None:
                 for receipt in recovered.values():
-                    rel = parts(receipt['path'])[1:]
-                    with descend(resume, rel[:-1]) as parent:
-                        with open_input(parent, rel[-1]) as media_stream:
-                            if (os.fstat(media_stream.fileno()).st_size != receipt['size']
-                                    or hashlib.file_digest(media_stream, 'sha256').hexdigest()
-                                    != receipt['sha256']):
-                                raise Refused('DATA_MISMATCH')
+                    try:
+                        rel = parts(receipt['path'])
+                    except Refused:
+                        raise Refused('MEDIA_CHECKPOINT_MISMATCH') from None
+                    if (len(rel) != 3 or rel[0] not in {'media', 'media-resume'}):
+                        raise Refused('MEDIA_CHECKPOINT_MISMATCH')
+                    media_root = source if rel[0] == 'media' else resume
+                    media_dirs = rel[:-1] if rel[0] == 'media' else rel[1:-1]
+                    try:
+                        with descend(media_root, media_dirs) as parent:
+                            size, digest = _hash_input(parent, rel[-1], receipt['size'])
+                    except OSError:
+                        raise Refused('DATA_MISMATCH') from None
+                    if size != receipt['size'] or digest != receipt['sha256']:
+                        raise Refused('DATA_MISMATCH')
             service_count = sum(1 for _ in _iter_jsonl_input(source, 'services.jsonl'))
         media = {'total': downloaded_count + len(recovered) + missing_count,
                  'recovered': len(recovered), 'missing': missing_count,

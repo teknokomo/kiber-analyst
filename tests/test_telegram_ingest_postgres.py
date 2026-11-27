@@ -31,6 +31,22 @@ def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, str | None]]:
+    snapshot = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        mode = path.lstat().st_mode & 0o777
+        if path.is_symlink():
+            snapshot[relative] = ("symlink", mode, os.readlink(path))
+        elif path.is_dir():
+            snapshot[relative] = ("directory", mode, None)
+        else:
+            snapshot[relative] = (
+                "file", mode, hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+    return snapshot
+
+
 def _connect(
     credentials: dict[str, str],
     *,
@@ -418,6 +434,15 @@ def test_broker_stages_each_checkpoint_media_root_and_repeat_ingest_is_idempoten
     def worker_api(action: str, **kwargs):
         if action == "project-catalog":
             return {"projects": [{"slug": project_slug, "title": "Resume root test"}]}
+        if action == "source-overview":
+            return {
+                "documents": 1, "messages": 1, "unique_messages": 1,
+                "service_events": 1, "messages_with_media": 1,
+            }
+        if action == "status":
+            return {"state": "done"}
+        if action == "result":
+            return {"inserted": 1, "service_events_inserted": 1}
         raise AssertionError(f"unexpected worker API operation: {action}")
 
     def submit(argv: list[str], *, idempotency_key: str):
@@ -428,6 +453,13 @@ def test_broker_stages_each_checkpoint_media_root_and_repeat_ingest_is_idempoten
         app_root, {}, worker_api=worker_api, submit=submit,
         authorized_projects={project_slug},
     )
+    app.sources[source_id] = {
+        "project": project_slug,
+        "hashes": {
+            name: checkpoint_inputs[name]
+            for name in ("manifest.json", "messages.jsonl", "services.jsonl")
+        },
+    }
     try:
         assert app.handle(owner, "source-add", source_id, project_slug)["registered"]
         request = app.handle(owner, "ingest", source_id, project_slug)
@@ -488,6 +520,43 @@ def test_broker_stages_each_checkpoint_media_root_and_repeat_ingest_is_idempoten
                 "SELECT count(*) FROM telegram_service_events WHERE source_id=%s",
                 (source_db_id,),
             ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT id, owner_id, model, embedding::text FROM embeddings "
+                "WHERE owner_table='segments' AND owner_id=%s", (str(segment_id),),
+            ).fetchone() == embedding_before
+
+            segment_before = conn.execute(
+                "SELECT id, external_ref, text, meta::text FROM segments WHERE id=%s",
+                (segment_id,),
+            ).fetchone()
+            events_before = conn.execute(
+                """SELECT external_ref, event_id, topic_id, event_type, payload::text,
+                          provenance::text, event_sha256
+                   FROM telegram_service_events WHERE source_id=%s ORDER BY event_id""",
+                (source_db_id,),
+            ).fetchall()
+        files_before = _tree_snapshot(source)
+
+        reindex_first = app.handle(owner, "reindex", source_id)
+        reindex_repeat = app.handle(owner, "reindex", source_id)
+        assert reindex_first == reindex_repeat
+        assert reindex_first["integrity"] == {
+            "media_sha256_verified": 1, "messages_match": True,
+            "service_events_match": True, "ingested_media_match": True,
+        }
+        assert _tree_snapshot(source) == files_before
+
+        with _connect(disposable_postgres_credentials) as conn:
+            assert conn.execute(
+                "SELECT id, external_ref, text, meta::text FROM segments WHERE id=%s",
+                (segment_id,),
+            ).fetchone() == segment_before
+            assert conn.execute(
+                """SELECT external_ref, event_id, topic_id, event_type, payload::text,
+                          provenance::text, event_sha256
+                   FROM telegram_service_events WHERE source_id=%s ORDER BY event_id""",
+                (source_db_id,),
+            ).fetchall() == events_before
             assert conn.execute(
                 "SELECT id, owner_id, model, embedding::text FROM embeddings "
                 "WHERE owner_table='segments' AND owner_id=%s", (str(segment_id),),

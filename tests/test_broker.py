@@ -133,6 +133,156 @@ def _write_resume_checkpoint(src: Path, app: broker.Broker, *, version: int = 2)
     return checkpoint
 
 
+def _write_recovered_media_fixture(
+    app: broker.Broker,
+    src: Path,
+    *,
+    media_root: str = 'media-resume',
+    receipt_path: str | None = None,
+) -> Path:
+    """Turn the fixture attachment into a skipped source with one receipt."""
+    message_path = src / 'messages.jsonl'
+    message = json.loads(message_path.read_bytes())
+    payload = b'recovered fixture audio'
+    digest = hashlib.sha256(payload).hexdigest()
+    message['media'] = {
+        'path': None, 'size': None, 'sha256': None, 'type': 'voice_message',
+        'size_bytes': None, 'max_file_bytes': broker.DEFAULT_TELEGRAM_MEDIA_BYTES,
+        'export_status': 'skipped', 'reason': 'unknown_size',
+    }
+    message_bytes = (json.dumps(message, separators=(',', ':')) + '\n').encode()
+    message_path.write_bytes(message_bytes)
+    message_path.chmod(0o600)
+
+    manifest_path = src / 'manifest.json'
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest['messages_sha256'] = hashlib.sha256(message_bytes).hexdigest()
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + '\n').encode()
+    manifest_path.write_bytes(manifest_bytes)
+    manifest_path.chmod(0o600)
+
+    hashes = {
+        'manifest.json': hashlib.sha256(manifest_bytes).hexdigest(),
+        'messages.jsonl': hashlib.sha256(message_bytes).hexdigest(),
+        'services.jsonl': hashlib.sha256((src / 'services.jsonl').read_bytes()).hexdigest(),
+    }
+    services_manifest_sha = hashlib.sha256(
+        (src / 'services_manifest.json').read_bytes()
+    ).hexdigest()
+    filename = receipt_path or f'{media_root}/1/a.ogg'
+    media_file = src / filename
+    media_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    media_file.parent.chmod(0o700)
+    media_file.write_bytes(payload)
+    media_file.chmod(0o600)
+
+    resume = src / 'media-resume'
+    resume.mkdir(mode=0o700, exist_ok=True)
+    resume.chmod(0o700)
+    checkpoint = {
+        'version': 2,
+        'source_id': SOURCE,
+        'inputs': {**hashes, 'services_manifest.json': services_manifest_sha},
+        'requested_max_file_bytes': broker.DEFAULT_TELEGRAM_MEDIA_BYTES,
+        'over_limit_message_ids': [],
+        'records': {'1': {
+            'path': filename, 'size': len(payload), 'sha256': digest,
+            'type': 'voice_message', 'max_file_bytes': broker.DEFAULT_TELEGRAM_MEDIA_BYTES,
+            'export_status': 'downloaded',
+        }},
+    }
+    status_path = resume / 'status.json'
+    status_path.write_text(json.dumps(checkpoint, sort_keys=True) + '\n', encoding='utf-8')
+    status_path.chmod(0o600)
+    app.sources[SOURCE] = {'project': 'fixture', 'hashes': hashes}
+    return media_file
+
+
+def _source_tree_snapshot(root: Path) -> dict[str, tuple[str, int, str | None]]:
+    snapshot = {}
+    for path in sorted(root.rglob('*')):
+        relative = path.relative_to(root).as_posix()
+        mode = path.lstat().st_mode & 0o777
+        if path.is_symlink():
+            snapshot[relative] = ('symlink', mode, os.readlink(path))
+        elif path.is_dir():
+            snapshot[relative] = ('directory', mode, None)
+        else:
+            snapshot[relative] = (
+                'file', mode, hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+    return snapshot
+
+
+@pytest.mark.parametrize('media_root', ['media', 'media-resume'])
+def test_reindex_verifies_recovered_media_at_its_recorded_root(setup, media_root):
+    app, src, _jobs, _argv = setup
+    _write_recovered_media_fixture(app, src, media_root=media_root)
+    app.worker_api = lambda action, **_kwargs: {
+        'messages': 1, 'unique_messages': 1, 'service_events': 0,
+        'documents': 1, 'messages_with_media': 1,
+    }
+    before = _source_tree_snapshot(src)
+
+    first = app.handle('client', 'reindex', SOURCE)
+    second = app.handle('client', 'reindex', SOURCE)
+
+    assert first == second
+    assert first['integrity'] == {
+        'media_sha256_verified': 1, 'messages_match': True,
+        'service_events_match': True, 'ingested_media_match': True,
+    }
+    assert _source_tree_snapshot(src) == before
+
+
+@pytest.mark.parametrize('media_root', ['media', 'media-resume'])
+@pytest.mark.parametrize('damage', ['missing', 'changed', 'symlink'])
+def test_reindex_rejects_missing_changed_or_symlinked_recovered_media(
+    setup, tmp_path, media_root, damage,
+):
+    app, src, _jobs, _argv = setup
+    media_file = _write_recovered_media_fixture(app, src, media_root=media_root)
+    if damage == 'missing':
+        media_file.unlink()
+    elif damage == 'changed':
+        media_file.write_bytes(b'modified fixture audio')
+        media_file.chmod(0o600)
+    else:
+        target = tmp_path / 'outside-file.ogg'
+        target.write_bytes(b'recovered fixture audio')
+        target.chmod(0o600)
+        media_file.unlink()
+        media_file.symlink_to(target)
+    app.worker_api = lambda action, **_kwargs: {
+        'messages': 1, 'unique_messages': 1, 'service_events': 0,
+        'documents': 1, 'messages_with_media': 1,
+    }
+    before = _source_tree_snapshot(src)
+
+    with pytest.raises(broker.Refused, match='DATA_MISMATCH'):
+        app.handle('client', 'reindex', SOURCE)
+
+    assert _source_tree_snapshot(src) == before
+
+
+def test_reindex_rejects_traversal_in_recovered_media_receipt(setup):
+    app, src, _jobs, _argv = setup
+    _write_recovered_media_fixture(
+        app, src, media_root='media-resume',
+        receipt_path='media-resume/1/../a.ogg',
+    )
+    app.worker_api = lambda action, **_kwargs: {
+        'messages': 1, 'unique_messages': 1, 'service_events': 0,
+        'documents': 1, 'messages_with_media': 1,
+    }
+    before = _source_tree_snapshot(src)
+
+    with pytest.raises(broker.Refused, match='MEDIA_CHECKPOINT_MISMATCH'):
+        app.handle('client', 'reindex', SOURCE)
+
+    assert _source_tree_snapshot(src) == before
+
+
 @pytest.mark.parametrize('version', [1, 2])
 def test_inspect_source_accepts_legacy_and_v2_resume_hash_sets(setup, version):
     app, src, _jobs, _argv = setup
