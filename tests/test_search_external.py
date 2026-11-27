@@ -88,6 +88,21 @@ def test_external_source_ids_validate_and_pass_existence_check() -> None:
     assert existence[0][1] == ("demo", "github", "o/r")
 
 
+@pytest.mark.parametrize("chat_id", ["-10012345", "12345"])
+def test_telegram_group_search_sql_matches_signed_chat_identity(chat_id: str) -> None:
+    conn = FakeConn({"SELECT id FROM projects": [("pid",)], "SELECT 1 FROM sources": [(1,)]})
+    execute_search(
+        conn, "query", project="demo", vector=None,
+        source_id=f"telegram:{chat_id}:group", limit=5,
+    )
+    search_sql, params = next(
+        (query, params) for query, params in conn._cursor.statements
+        if "WITH query_args" in query
+    )
+    assert "^telegram:-?[1-9][0-9]{0,18}:group$" in search_sql
+    assert params["source_id"] == f"telegram:{chat_id}:group"
+
+
 @pytest.mark.parametrize(
     "source_id",
     ["github:owner", "gitlab:group/project", "gitverse:owner/a/b", "github:o/r:issue:1"],

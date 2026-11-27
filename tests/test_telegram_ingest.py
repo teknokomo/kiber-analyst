@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,8 @@ def _make_export(root: Path, *, media: bool = False) -> Path:
     if media:
         media_path = "media/101/audio.ogg"
         _write_private(topic / media_path, b"fixture audio")
+        (topic / "media").chmod(0o700)
+        (topic / "media/101").chmod(0o700)
         message_media = {
             "type": "voice_message",
             "path": media_path,
@@ -205,6 +208,30 @@ def test_inspect_export_checks_jsonl_size_before_scanning_and_accepts_exact_limi
     assert len(scanned_streams) == expected_scanned_files
 
 
+def test_jsonl_reader_bounds_a_newline_free_record_before_allocation() -> None:
+    import kiber_analyst.telegram_ingest as telegram_ingest
+
+    class UnboundedInput:
+        def __init__(self):
+            self.requested = []
+
+        def readline(self, size: int) -> bytes:
+            self.requested.append(size)
+            return b"x" * size
+
+    stream = UnboundedInput()
+    tracemalloc.start()
+    try:
+        with pytest.raises(LoadError, match="record 1 is oversized"):
+            next(telegram_ingest._iter_jsonl_stream(stream))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert stream.requested == [telegram_ingest._MAX_LINE_BYTES + 1]
+    assert peak < 8 * 1024**2
+
+
 def test_media_metadata_is_checked_and_missing_media_counted(tmp_path: Path) -> None:
     root = tmp_path / "telegram"
     topic = _make_export(root, media=True)
@@ -217,7 +244,169 @@ def test_media_metadata_is_checked_and_missing_media_counted(tmp_path: Path) -> 
     assert media_missing == 0
     assert record["media_type"] == "voice_message"
     assert record["media_path"] == "media/101/audio.ogg"
+    assert record["meta"]["media_export"]["size"] == len(b"fixture audio")
+    assert record["meta"]["media_export"]["sha256"] == hashlib.sha256(b"fixture audio").hexdigest()
     assert _source_hashes(topic) == before
+
+
+@pytest.mark.parametrize("replacement", [b"fixture audix", b"fixture audio!"])
+def test_regular_media_actual_bytes_must_match_export_size_and_hash(
+    tmp_path: Path, replacement: bytes,
+) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    media_file = topic / "media/101/audio.ogg"
+    _write_private(media_file, replacement)
+
+    with pytest.raises(LoadError, match="size|SHA-256"):
+        prepare_export(topic, tmp_path / "artifacts" / "modified-media", root=root)
+
+
+def test_regular_media_rejects_a_false_declared_sha256(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    message = json.loads((topic / "messages.jsonl").read_text(encoding="utf-8"))
+    message["media"]["sha256"] = "a" * 64
+    messages = _json_bytes(message)
+    _write_private(topic / "messages.jsonl", messages)
+    manifest = json.loads((topic / "manifest.json").read_text(encoding="utf-8"))
+    manifest["messages_sha256"] = hashlib.sha256(messages).hexdigest()
+    _write_private(topic / "manifest.json", _json_bytes(manifest))
+
+    with pytest.raises(LoadError, match="SHA-256"):
+        prepare_export(topic, tmp_path / "artifacts" / "bad-media-hash", root=root)
+
+
+def test_legacy_regular_media_without_declared_hash_remains_supported(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    message_path = topic / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"].pop("sha256")
+    messages = _json_bytes(message)
+    _write_private(message_path, messages)
+    manifest_path = topic / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["messages_sha256"] = hashlib.sha256(messages).hexdigest()
+    _write_private(manifest_path, _json_bytes(manifest))
+
+    artifact_dir, _, missing = prepare_export(
+        topic, tmp_path / "artifacts" / "legacy-media", root=root,
+    )
+    normalized = json.loads(
+        (artifact_dir / "normalized" / "messages.jsonl").read_text(encoding="utf-8")
+    )
+
+    assert missing == 0
+    assert normalized["meta"]["media_export"]["sha256"] == hashlib.sha256(
+        b"fixture audio"
+    ).hexdigest()
+
+
+def test_media_changed_after_open_is_rejected_before_normalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kiber_analyst.telegram_ingest as ingest
+
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    verify = ingest._verify_media_stream
+    media_file = topic / "media/101/audio.ogg"
+
+    def mutate_open_file(stream, **kwargs):
+        with media_file.open("r+b") as writable:
+            writable.write(b"X")
+            writable.flush()
+        return verify(stream, **kwargs)
+
+    monkeypatch.setattr(ingest, "_verify_media_stream", mutate_open_file)
+    with pytest.raises(LoadError, match="SHA-256"):
+        prepare_export(topic, tmp_path / "artifacts" / "changed-after-open", root=root)
+
+
+def test_media_record_cannot_exceed_manifest_selected_limit(tmp_path: Path) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root, media=True)
+    message_path = topic / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"]["size"] = 101
+    message["media"]["max_file_bytes"] = 101
+    messages = _json_bytes(message)
+    _write_private(message_path, messages)
+    manifest_path = topic / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(messages_sha256=hashlib.sha256(messages).hexdigest(), max_file_bytes=100)
+    _write_private(manifest_path, _json_bytes(manifest))
+
+    with pytest.raises(LoadError, match="exceeds its manifest"):
+        prepare_export(topic, tmp_path / "artifacts" / "too-large-media-limit", root=root)
+
+
+@pytest.mark.parametrize("media_root", ["media-resume", "media"])
+@pytest.mark.parametrize("version", [1, 2])
+def test_resumed_media_uses_checkpoint_limit_and_preserves_voice_type(
+    tmp_path: Path, media_root: str, version: int,
+) -> None:
+    root = tmp_path / "telegram"
+    topic = _make_export(root)
+    message_path = topic / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"] = {
+        "type": "voice_message", "size": 101, "max_file_bytes": 100,
+        "export_status": "skipped", "reason": "over_limit",
+    }
+    messages = _json_bytes(message)
+    _write_private(message_path, messages)
+    manifest_path = topic / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        messages_sha256=hashlib.sha256(messages).hexdigest(),
+        max_file_bytes=100,
+    )
+    manifest_bytes = _json_bytes(manifest)
+    _write_private(manifest_path, manifest_bytes)
+
+    resume_dir = topic / media_root
+    resume_dir.mkdir(mode=0o700)
+    media_dir = resume_dir / "101"
+    media_dir.mkdir(mode=0o700)
+    payload = b"x" * 101
+    _write_private(media_dir / "audio.ogg", payload)
+    checkpoint_inputs = {
+        "messages.jsonl": hashlib.sha256(messages).hexdigest(),
+        "services.jsonl": hashlib.sha256((topic / "services.jsonl").read_bytes()).hexdigest(),
+        "manifest.json": hashlib.sha256(manifest_bytes).hexdigest(),
+        "services_manifest.json": hashlib.sha256(
+            (topic / "services_manifest.json").read_bytes()
+        ).hexdigest(),
+    }
+    if version == 1:
+        checkpoint_inputs.pop("services_manifest.json")
+    checkpoint = {
+        "version": version,
+        "source_id": SOURCE_ID,
+        "inputs": checkpoint_inputs,
+        "requested_max_file_bytes": 101,
+        "records": {"101": {
+            "export_status": "downloaded", "path": f"{media_root}/101/audio.ogg",
+            "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            "max_file_bytes": 101,
+        }},
+    }
+    _write_private(resume_dir / "status.json", _json_bytes(checkpoint))
+    (resume_dir / "status.json").chmod(0o600)
+
+    artifact_dir, _, media_missing = prepare_export(
+        topic, tmp_path / "artifacts" / "resumed-large-voice", root=root,
+    )
+    normalized = json.loads(
+        (artifact_dir / "normalized" / "messages.jsonl").read_text(encoding="utf-8")
+    )
+
+    assert media_missing == 0
+    assert normalized["media_type"] == "voice_message"
+    assert normalized["media_path"] == f"{media_root}/101/audio.ogg"
+    assert normalized["meta"]["media_export"]["max_file_bytes"] == 101
 
 
 def test_exporter_media_kind_is_normalized_to_media_type(tmp_path: Path) -> None:

@@ -48,6 +48,8 @@ kiber-analyst-queue-backup = "kiber_analyst.queue_backup:main"
 kiber-analyst-backup = "kiber_analyst.backup:main"
 kiber-analyst-queue-restore = "kiber_analyst.queue_restore:main"
 kiber-analyst-migrate = "kiber_analyst.migrate:main"
+kiber-analyst-telegram-export = "kiber_analyst.telegram_exporter:main"
+kiber-analyst-telegram-publish = "kiber_analyst.telegram_publisher:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

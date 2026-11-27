@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import tracemalloc
 import uuid
 from pathlib import Path
 
@@ -22,7 +23,9 @@ def private_write(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 
 @pytest.fixture
-def asr_setup(tmp_path):
+def asr_setup(tmp_path, monkeypatch):
+    # Synthetic ASR tests exercise staging behavior, not the production disk reserve.
+    monkeypatch.setattr(broker, 'RESERVE', 0)
     src = tmp_path / 'imports' / '-1009000' / '1'
     payloads = {message_id: f'voice-{message_id}'.encode() for message_id in range(1, 4)}
     payloads[4] = b'audio-4'
@@ -273,25 +276,30 @@ def test_asr_workspace_skips_missing_oversize_and_provider_limit_without_mutatin
             os.ftruncate(fd, size)
         finally:
             os.close(fd)
+        with path.open('rb') as media_stream:
+            media_sha256 = hashlib.file_digest(media_stream, 'sha256').hexdigest()
         records.append({
             'message_id': message_id, 'topic_id': 1,
             'date': '2020-01-02T12:00:00+03:00', 'text': '',
             'sender_name': 'Example Author', 'chat_id': '-1009000',
             'media': {'type': 'voice_message', 'path': f'media/{message_id}/audio.ogg',
-                      'size': size, 'sha256': 'a' * 64},
+                      'size': size, 'max_file_bytes': 4_000_000_000,
+                      'sha256': media_sha256},
         })
     records.append({
         'message_id': 7, 'topic_id': 1,
         'date': '2020-01-02T12:00:00+03:00', 'text': '',
         'sender_name': 'Example Author', 'chat_id': '-1009000',
         'media': {'type': 'audio_file', 'path': 'media/7/missing.ogg',
-                  'size': 1234, 'sha256': 'b' * 64},
+                  'size': 1234, 'max_file_bytes': 4_000_000_000,
+                  'sha256': 'b' * 64},
     })
     messages = ''.join(json.dumps(item) + '\n' for item in records).encode()
     private_write(source_dir / 'messages.jsonl', messages)
     message_hash = hashlib.sha256(messages).hexdigest()
     manifest = json.loads((source_dir / 'manifest.json').read_text())
-    manifest.update(message_count=len(records), messages_sha256=message_hash)
+    manifest.update(message_count=len(records), messages_sha256=message_hash,
+                    max_file_bytes=4_000_000_000, max_file_size_unit='bytes')
     manifest_data = json.dumps(manifest, sort_keys=True).encode()
     private_write(source_dir / 'manifest.json', manifest_data)
     app.sources[SOURCE]['hashes']['messages.jsonl'] = message_hash
@@ -317,3 +325,77 @@ def test_asr_workspace_skips_missing_oversize_and_provider_limit_without_mutatin
     assert {
         name: (source_dir / name).read_bytes() for name in source_before
     } == source_before
+
+
+def test_large_asr_workspace_is_streamed_and_reopens_with_the_same_limit(asr_setup):
+    app, source_dir, _jobs, _argv, _overview, _original = asr_setup
+    message_count = 4000
+    payload = b"a"
+    media_sha = hashlib.sha256(payload).hexdigest()
+    messages_path = source_dir / "messages.jsonl"
+    digest = hashlib.sha256()
+    with messages_path.open("wb") as stream:
+        for message_id in range(message_count, 0, -1):
+            media_dir = source_dir / "media" / str(message_id)
+            media_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            media_dir.chmod(0o700)
+            private_write(media_dir / "audio.ogg", payload)
+            record = {
+                "message_id": message_id,
+                "topic_id": 1,
+                "topic_id_status": "known",
+                "date": "2020-01-02T12:00:00+03:00",
+                "text": "x" * 10_000,
+                "sender_name": "Example Author",
+                "sender_id": 42,
+                "chat_id": "-1009000",
+                "media": {
+                    "type": "voice_message", "path": f"media/{message_id}/audio.ogg",
+                    "size": 1, "size_bytes": 1, "max_file_bytes": 4_000_000_000,
+                    "sha256": media_sha, "export_status": "downloaded",
+                },
+            }
+            encoded = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+            stream.write(encoded)
+            digest.update(encoded)
+    messages_path.chmod(0o600)
+    message_hash = digest.hexdigest()
+    manifest_path = source_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(message_count=message_count, messages_sha256=message_hash,
+                    max_file_bytes=4_000_000_000)
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    private_write(manifest_path, manifest_bytes)
+    app.sources[SOURCE]["hashes"]["messages.jsonl"] = message_hash
+    app.sources[SOURCE]["hashes"]["manifest.json"] = hashlib.sha256(manifest_bytes).hexdigest()
+
+    tracemalloc.start()
+    try:
+        plan, workspace = app.asr_workspace(
+            SOURCE, app.sources[SOURCE], source_dir, "f" * 64, "",
+        )
+        normalized = workspace / "normalized" / "messages.jsonl"
+        assert normalized.stat().st_size > 38 * 1024**2
+        again, reused = app.asr_workspace(
+            SOURCE, app.sources[SOURCE], source_dir, "f" * 64, "",
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert reused == workspace
+    assert again == plan
+    assert plan["files_eligible"] == message_count
+    assert plan["files_total"] == message_count
+    assert peak < 64 * 1024**2
+
+
+def test_asr_workspace_writer_and_reader_share_the_same_plan_limit(asr_setup, monkeypatch):
+    app, source_dir, _jobs, _argv, _overview, _original = asr_setup
+    monkeypatch.setattr(broker, "ASR_PLAN_MAX_BYTES", 64)
+
+    with pytest.raises(broker.Refused, match="ASR_PLAN_TOO_LARGE"):
+        app.asr_workspace(SOURCE, app.sources[SOURCE], source_dir, "e" * 64, "")
+
+    assert not list(source_dir.glob("asr-input-*"))
+    assert not list(source_dir.glob(".asr-*"))

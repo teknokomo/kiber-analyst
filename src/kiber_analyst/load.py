@@ -29,6 +29,10 @@ class TelegramProjectConflict(LoadError):
     """A Telegram message reference is already owned by another project."""
 
 
+class TelegramScopeConflict(LoadError):
+    """A Telegram group/topic scope would overlap existing imported data."""
+
+
 def document_title_for(topic_id: str | None, topic_title: str | None) -> str | None:
     return topic_title if topic_id is not None else NO_TOPIC_TITLE
 
@@ -85,6 +89,8 @@ def _connect(config: dict[str, str]) -> Any:
 def _safe_error(exc: Exception, config: dict[str, str] | None) -> str:
     if isinstance(exc, TelegramProjectConflict):
         return "TELEGRAM_PROJECT_CONFLICT"
+    if isinstance(exc, TelegramScopeConflict):
+        return "TELEGRAM_SCOPE_CONFLICT"
     state = getattr(exc, "sqlstate", None)
     if not isinstance(state, str) or not re.fullmatch(r"[0-9A-Z]{5}", state):
         state = None
@@ -129,20 +135,39 @@ def _precount_messages(path: Path) -> tuple[Counter[str | None], int]:
 
 
 def _assert_telegram_refs_project(
-    cursor: Any, path: Path, project_slug: str, chat_id: str
+    cursor: Any, path: Path, project_slug: str, chat_id: str,
+    scope: str, scope_topic_id: str | None,
 ) -> None:
-    """Reject cross-project Telegram refs before creating any knowledge rows."""
+    """Reject mixed overlapping scopes and exact refs owned by another project."""
     cursor.execute(
-        """SELECT 1
-           FROM sources src
+        """SELECT doc.meta->>'export_scope', doc.meta->>'topic_id'
+           FROM documents doc
+           JOIN sources src ON src.id = doc.source_id
            JOIN projects project ON project.id = src.project_id
            WHERE src.kind = 'telegram' AND src.external_id = %s
-             AND project.slug IS DISTINCT FROM %s
-           LIMIT 1""",
+             AND project.slug = %s AND doc.doc_type = 'export'""",
         (chat_id, project_slug),
     )
-    if cursor.fetchone() is not None:
-        raise TelegramProjectConflict("Telegram source is already assigned to another project")
+    previous_scopes = cursor.fetchall()
+    cursor.execute(
+        """SELECT snapshot.scope, snapshot.meta->>'topic_id'
+           FROM snapshots snapshot
+           JOIN sources src ON src.id = snapshot.source_id
+           JOIN projects project ON project.id = src.project_id
+           WHERE src.kind = 'telegram' AND src.external_id = %s
+             AND project.slug = %s""",
+        (chat_id, project_slug),
+    )
+    previous_scopes.extend(cursor.fetchall())
+    for prior_scope, prior_topic in previous_scopes:
+        # Legacy topic documents have a topic_id but no explicit scope. A null
+        # topic on a legacy row is ambiguous, so refuse a potentially mixed set.
+        if prior_scope not in {"topic", "chat"}:
+            prior_scope = "topic" if prior_topic is not None else "unknown"
+        if prior_scope != scope or (scope == "topic" and prior_topic is None):
+            raise TelegramScopeConflict(
+                "Telegram group and topic scopes cannot share one project source"
+            )
 
     references: list[str] = []
 
@@ -182,6 +207,79 @@ def _assert_telegram_refs_project(
     check_batch()
 
 
+def _assert_telegram_service_refs_project(
+    cursor: Any, path: Path, project_slug: str, chat_id: str,
+) -> None:
+    """Prevent service-event identity from being reused across projects."""
+    from kiber_analyst.telegram_ingest import _iter_jsonl
+
+    references: list[str] = []
+
+    def check_batch() -> None:
+        if not references:
+            return
+        cursor.execute(
+            """SELECT 1
+               FROM telegram_service_events event
+               JOIN sources src ON src.id = event.source_id
+               JOIN projects project ON project.id = src.project_id
+               WHERE event.external_ref = ANY(%s)
+                 AND project.slug IS DISTINCT FROM %s
+               LIMIT 1""",
+            (references, project_slug),
+        )
+        if cursor.fetchone() is not None:
+            raise TelegramProjectConflict(
+                "Telegram service event is already assigned to another project"
+            )
+        references.clear()
+
+    for _raw, event in _iter_jsonl(path):
+        event_id = event.get("event_id")
+        if type(event_id) is not int or event_id <= 0:
+            raise LoadError("Telegram service event identity is invalid")
+        references.append(f"tg:{chat_id}:service:{event_id}")
+        if len(references) == 500:
+            check_batch()
+    check_batch()
+
+
+def _assert_snapshot_scope(
+    cursor: Any, source_id: str, sha256: str, scope: str, topic_id: str | None,
+) -> None:
+    cursor.execute(
+        "SELECT scope, meta->>'topic_id' FROM snapshots WHERE source_id=%s::uuid AND sha256=%s",
+        (source_id, sha256),
+    )
+    row = cursor.fetchone()
+    if row is not None and (row[0] != scope or row[1] != topic_id):
+        raise TelegramScopeConflict("Telegram snapshot hash is already recorded for another scope")
+
+
+def _snapshot_identity(
+    cursor: Any, source_id: str, content_sha256: str, scope: str, topic_id: str | None,
+) -> tuple[str, bool]:
+    """Keep the historical raw hash unless it already identifies another scope."""
+    cursor.execute(
+        "SELECT scope, meta->>'topic_id' FROM snapshots WHERE source_id=%s::uuid AND sha256=%s",
+        (source_id, content_sha256),
+    )
+    previous = cursor.fetchone()
+    if previous is None or (previous[0] == scope and previous[1] == topic_id):
+        return content_sha256, False
+    qualified = hashlib.sha256(
+        f"telegram-scope-v1\0{scope}\0{topic_id or ''}\0{content_sha256}".encode()
+    ).hexdigest()
+    cursor.execute(
+        "SELECT scope, meta->>'topic_id' FROM snapshots WHERE source_id=%s::uuid AND sha256=%s",
+        (source_id, qualified),
+    )
+    existing = cursor.fetchone()
+    if existing is not None and (existing[0] != scope or existing[1] != topic_id):
+        raise TelegramScopeConflict("Telegram scoped snapshot identity conflicts with another scope")
+    return qualified, True
+
+
 def _project_id(cursor: Any, project_slug: str = PROJECT_SLUG) -> str:
     project_title = PROJECT_TITLE if project_slug == PROJECT_SLUG else project_slug.replace("-", " ").title()
     cursor.execute(
@@ -201,13 +299,13 @@ def _source_id(cursor: Any, project_id: str, manifest: dict[str, Any]) -> str:
     chat_title = parse.get("chat_title") if isinstance(parse, dict) else None
     archive_name = str(manifest.get("archive_name") or "")
     archive_date_match = re.search(r"\d{4}-\d{2}-\d{2}", archive_name)
-    scope_topic_id = manifest.get("scope_topic_id")
     chat_value = manifest.get("chat_id")
     if chat_value is None or not str(chat_value):
         raise LoadError("manifest.json is missing chat_id")
     chat_id = str(chat_value)
     internal_chat_id = chat_id.removeprefix("-100").removeprefix("-")
-    url = f"https://t.me/c/{internal_chat_id}/{scope_topic_id}" if scope_topic_id is not None else None
+    # A source row represents the group; per-topic provenance belongs to documents.
+    url = f"https://t.me/c/{internal_chat_id}"
     source_meta = {
         "snapshot_date": archive_date_match.group(0) if archive_date_match else None,
         "archive_md5": manifest.get("archive_md5"),
@@ -241,8 +339,15 @@ def _snapshot_id(
     uri: str,
     scope: str,
     topic_id: str | None,
+    *,
+    content_sha256: str | None = None,
+    scope_qualified: bool = False,
 ) -> str:
     meta = {"topic_id": topic_id}
+    if content_sha256 is not None:
+        meta["content_sha256"] = content_sha256
+    if scope_qualified:
+        meta["scope_key_version"] = 1
     cursor.execute(
         """INSERT INTO snapshots (source_id, sha256, size_bytes, uri, scope, meta)
            VALUES (%s::uuid, %s, %s, %s, %s, %s::jsonb)
@@ -266,6 +371,7 @@ def _document_id(
     snapshot_id: str,
     message_count: int,
     uri: str,
+    scope: str,
 ) -> str:
     title = document_title_for(topic_id, topic_title)
     cursor.execute(
@@ -283,6 +389,7 @@ def _document_id(
         "topic_title": title,
         "snapshot_id": snapshot_id,
         "message_count": message_count,
+        "export_scope": scope,
     }
     meta_json = json.dumps(meta, ensure_ascii=False)
     if rows:
@@ -368,7 +475,7 @@ def _upsert_service_event(
         key: event.get(key)
         for key in (
             "actor_id", "actor_name", "target_id", "target_name", "message_id",
-            "old_value", "new_value", "raw_action", "error_code",
+            "old_value", "new_value", "raw_action", "error_code", "topic_id_status",
         )
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -394,6 +501,13 @@ def _upsert_service_event(
     if existing:
         old_id, old_snapshot, old_sha, old_provenance_value = existing
         old_provenance = _db_json(old_provenance_value)
+        cursor.execute(
+            "SELECT topic_id FROM telegram_service_events WHERE id=%s FOR UPDATE",
+            (old_id,),
+        )
+        old_topic = cursor.fetchone()
+        if old_topic is not None and str(old_topic[0]) != topic_id:
+            raise TelegramScopeConflict("Telegram service event identity changed topic scope")
         if str(old_snapshot) == snapshot_id and old_sha == event_sha256 and old_provenance == provenance:
             return "skipped"
         cursor.execute(
@@ -424,14 +538,30 @@ def _upsert_service_event(
 def _service_file_info(path: Path, service_manifest: dict[str, Any]) -> tuple[str, int]:
     from kiber_analyst.telegram_ingest import _EVENT_TYPES, _iter_jsonl
 
+    scope = service_manifest.get("scope", "topic")
+    if scope not in {"topic", "chat"}:
+        raise LoadError("Telegram service event scope is invalid")
     digest = hashlib.sha256()
     count = 0
     seen: set[int] = set()
     for raw, event in _iter_jsonl(path):
         event_id = event.get("event_id")
+        topic_id = event.get("topic_id")
+        topic_status = event.get("topic_id_status")
         if type(event_id) is not int or event_id <= 0 or event_id in seen:
             raise LoadError("Telegram service event IDs are invalid or duplicated")
-        if event.get("type") not in _EVENT_TYPES or type(event.get("topic_id")) is not int:
+        valid_topic = (
+            type(topic_id) is int and topic_id > 0
+            if scope == "topic"
+            else topic_id is None or (type(topic_id) is int and topic_id > 0)
+        )
+        if (event.get("type") not in _EVENT_TYPES or not valid_topic
+                or (topic_status is not None and topic_status not in {
+                    "known", "unknown", "not_applicable",
+                })
+                or (scope == "topic" and topic_status not in {None, "known"})
+                or (scope == "chat" and topic_id is None and topic_status == "unknown"
+                    and service_manifest.get("forum") is not True)):
             raise LoadError("Telegram service event fields are invalid")
         seen.add(event_id)
         digest.update(raw)
@@ -489,6 +619,8 @@ def _upsert_segment(
                 "Telegram source is already assigned to another project"
             )
         old_meta = _db_json(old_meta_value)
+        if old_meta.get("topic_id") != incoming_meta.get("topic_id"):
+            raise TelegramScopeConflict("Telegram message identity changed topic scope")
         text_changed = old_hash != content_hash
         was_absent = old_meta.get("presence") == "absent_in_snapshot"
         placement_changed = str(old_doc) != document_id or int(old_seq) != seq
@@ -671,6 +803,8 @@ def load_job(
     if service_events_path is not None and service_manifest is not None:
         if service_manifest.get("complete") is not True or service_manifest.get("range_complete") is not True:
             raise LoadError("Telegram service export is incomplete")
+        if service_manifest.get("scope", "topic") != manifest.get("scope", "topic"):
+            raise LoadError("Telegram service export scope does not match the message snapshot")
         service_sha256, service_event_count = _service_file_info(service_events_path, service_manifest)
         if manifest.get("service_events_sha256") != service_sha256:
             raise LoadError("Telegram service snapshot does not match the normalized manifest")
@@ -709,12 +843,21 @@ def load_job(
                     (f"telegram-project-import:{chat_id}",),
                 )
                 _assert_telegram_refs_project(
-                    cursor, paths["messages"], project_slug, chat_id,
+                    cursor, paths["messages"], project_slug, chat_id, scope, scope_topic_id,
                 )
+                if service_events_path is not None:
+                    _assert_telegram_service_refs_project(
+                        cursor, service_events_path, project_slug, chat_id,
+                    )
                 project_id = _project_id(cursor, project_slug)
                 source_id = _source_id(cursor, project_id, manifest)
+                snapshot_sha256, scope_qualified = _snapshot_identity(
+                    cursor, source_id, sha256, scope, scope_topic_id,
+                )
+                _assert_snapshot_scope(cursor, source_id, snapshot_sha256, scope, scope_topic_id)
                 snapshot_id = _snapshot_id(
-                    cursor, source_id, sha256, size, uri, scope, scope_topic_id
+                    cursor, source_id, snapshot_sha256, size, uri, scope, scope_topic_id,
+                    content_sha256=sha256, scope_qualified=scope_qualified,
                 )
                 import_key = manifest.get("telegram_import_key")
                 topic_data = {
@@ -736,6 +879,7 @@ def load_job(
                         snapshot_id,
                         message_count,
                         uri,
+                        scope,
                     )
                     doc_ids[topic_id] = doc_id
                 prior_run = None
@@ -755,8 +899,17 @@ def load_job(
                     if manifest.get("media_resume_count", 0):
                         for record in iter_messages(paths["messages"]):
                             relative = record.get("media_path")
-                            if not isinstance(relative, str) or not relative.startswith("media-resume/"):
+                            if not isinstance(relative, str):
                                 continue
+                            media_parts = relative.split("/")
+                            if (
+                                len(media_parts) != 3
+                                or media_parts[0] not in {"media", "media-resume"}
+                                or media_parts[1] != str(record.get("message_id"))
+                                or media_parts[2] in {"", ".", ".."}
+                                or any("\\" in part or "\x00" in part for part in media_parts)
+                            ):
+                                raise LoadError("Media resume segment has an invalid media path")
                             media_meta = record["meta"]["media_export"]
                             identity = (doc_ids[_group_key(record)],
                                         f"tg:{record['chat_id']}:{record['message_id']}",
@@ -828,11 +981,17 @@ def load_job(
                             raise LoadError("manifest.json is missing chat_id")
                         chat_id = str(chat_value)
                         for _raw, event in _iter_jsonl(service_events_path):
-                            if str(event.get("topic_id")) != str(scope_topic_id):
+                            event_topic = event.get("topic_id")
+                            if (scope == "topic" and str(event_topic) != str(scope_topic_id)):
                                 raise LoadError("Telegram service event is outside the exported topic")
+                            if (scope == "chat" and event_topic is not None
+                                    and (type(event_topic) is not int or event_topic <= 0)):
+                                raise LoadError("Telegram service event has an invalid topic ID")
                             service_counters[_upsert_service_event(
                                 cursor, event, source_id=source_id, snapshot_id=snapshot_id,
-                                chat_id=chat_id, topic_id=str(scope_topic_id), provenance=provenance,
+                                chat_id=chat_id,
+                                topic_id=str(event_topic) if event_topic is not None else "0",
+                                provenance=provenance,
                             )] += 1
 
                     absent_count = _mark_absent_in_scope(

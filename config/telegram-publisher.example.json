@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "data_root": "/var/lib/kiber-analyst/telegram",
+  "source_root": "/var/lib/kiber-analyst/telegram/exports",
+  "destination_root": "/var/lib/kiber-analyst/telegram/imports",
+  "export_config": "/etc/kiber-analyst/telegram-export.json",
+  "lock_path": "/run/lock/kiber-analyst-telegram-publisher.lock",
+  "expected_data_uuid": null,
+  "require_mount": false,
+  "storage_limit_bytes": 53687091200,
+  "min_free_bytes": 1073741824,
+  "source_uid": 1001,
+  "source_gid": 1001,
+  "destination_uid": 1001,
+  "destination_gid": 1001
+}

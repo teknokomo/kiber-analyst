@@ -37,6 +37,40 @@ jobs:
           KIBER_ANALYST_MIGRATION_TEST_ADMIN_DSN: postgresql://postgres:postgres@127.0.0.1:5433/postgres
         run: pytest -v tests/test_migration_runner_postgres.py tests/test_external_check_constraints_postgres.py
 
+  telegram-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 55433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package and PostgreSQL test dependencies
+        run: python -m pip install -e '.[test,db,connectors]'
+      - name: Bootstrap disposable Telegram database
+        env:
+          KIBER_ANALYST_TELEGRAM_TEST_ADMIN_DSN: postgresql://postgres:postgres@127.0.0.1:55433/postgres
+          KIBER_ANALYST_TELEGRAM_TEST_ENV_OUTPUT: ${{ runner.temp }}/telegram-knowledge.env
+        run: python tests/prepare_telegram_postgres.py
+      - name: Run Telegram PostgreSQL integration tests
+        env:
+          KIBER_ANALYST_INGEST_TEST_ENV: ${{ runner.temp }}/telegram-knowledge.env
+        run: pytest -v tests/test_telegram_ingest_postgres.py tests/test_telegram_scope_pipeline.py
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -45,15 +79,32 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Expose pinned Node on the Telegram service PATH
+        run: |
+          node_path="$(command -v node)"
+          node_version="$(node --version)"
+          case "$node_version" in
+            v20.*) ;;
+            *) echo "Expected Node 20 from setup-node" >&2; exit 1 ;;
+          esac
+          sudo ln -sfn "$node_path" /usr/bin/node
+          test "$(PATH=/usr/bin:/bin /usr/bin/node --version)" = "$node_version"
       - name: Install package and test dependencies
         run: |
           python -m pip install -e .
           python -m pip install -e '.[test,db,providers,mcp]'
+      - name: Install the pinned Telegram CLI for its isolated mock test
+        run: npm install --prefix "$RUNNER_TEMP/kiber-better-tg-cli" --no-save --ignore-scripts better-tg-cli@0.41.2
       - name: Public release and secret scan
         run: python scripts/public_release_scan.py
       - name: Ruff
         run: ruff check .
       - name: Tests
+        env:
+          KIBER_BETTER_TG_CLI_BIN: ${{ runner.temp }}/kiber-better-tg-cli/node_modules/.bin/telegram
         run: pytest -q
       - name: Compile
         run: python -m compileall -q src

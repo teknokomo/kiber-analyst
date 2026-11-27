@@ -11,9 +11,16 @@ from typing import Any, Iterator
 
 from kiber_analyst.config_paths import data_path
 from kiber_analyst.errors import LoadError
-from kiber_analyst.media_resume import resumed_photos
+from kiber_analyst.media_limits import (
+    DEFAULT_TELEGRAM_MEDIA_BYTES,
+    MAX_TELEGRAM_EXPORT_BYTES,
+    MAX_TELEGRAM_MEDIA_BYTES,
+    validate_telegram_media_limit,
+)
+from kiber_analyst.media_resume import resumed_media
 from kiber_analyst.parse import _make_url, normalized_content_hash
 from kiber_analyst.paths import job_paths, write_json_atomic
+from kiber_analyst.telegram_source import format_telegram_source, telegram_scope_directory
 
 TELEGRAM_ROOT = Path(
     os.environ.get("KIBER_ANALYST_TELEGRAM_ROOT", str(data_path("imports")))
@@ -32,25 +39,30 @@ _EVENT_TYPES = {
 class TelegramExport:
     path: Path
     chat_id: str
-    topic_id: int
+    topic_id: int | None
+    scope: str
     topic_title: str | None
     message_count: int
     service_event_count: int
     message_sha256: str
     service_sha256: str
     manifest_sha256: str
+    services_manifest_sha256: str
     messages_size: int
     services_size: int
     manifest_size: int
     services_manifest_size: int
     chat_title: str | None
+    max_file_bytes: int
     services_manifest: dict[str, Any]
+    forum: bool | None = None
 
     @property
     def import_key(self) -> str:
         payload = {
             "chat_id": self.chat_id,
             "topic_id": self.topic_id,
+            "scope": self.scope,
             "messages_sha256": self.message_sha256,
             "services_sha256": self.service_sha256,
         }
@@ -101,6 +113,65 @@ def _open_private(path: Path):
     return os.fdopen(fd, "rb")
 
 
+def _open_export_media(directory: Path, parts: tuple[str, ...]):
+    """Open exported media by directory descriptors, refusing path replacement."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open(directory, flags)
+    try:
+        info = os.fstat(current)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+            raise LoadError("Telegram export directory is unsafe")
+        for component in parts[:-1]:
+            child = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = child
+            info = os.fstat(current)
+            if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+                raise LoadError("Telegram media directory is unsafe")
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fd = os.open(parts[-1], file_flags, dir_fd=current)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            os.close(fd)
+            raise LoadError("Telegram media files must be regular, singly linked, mode 0600")
+        return os.fdopen(fd, "rb")
+    finally:
+        os.close(current)
+
+
+def _stat_token(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _verify_media_stream(
+    stream,
+    *,
+    declared_size: int,
+    limit: int,
+    declared_sha256: str | None,
+) -> tuple[int, str]:
+    before = os.fstat(stream.fileno())
+    if before.st_size != declared_size or before.st_size > limit:
+        raise LoadError("Telegram media size does not match its declared size or selected limit")
+    digest = hashlib.sha256()
+    total = 0
+    while chunk := stream.read(1024 * 1024):
+        total += len(chunk)
+        if total > limit or total > declared_size:
+            raise LoadError("Telegram media changed or exceeds its selected limit")
+        digest.update(chunk)
+    after = os.fstat(stream.fileno())
+    actual_sha256 = digest.hexdigest()
+    if (_stat_token(before) != _stat_token(after) or total != declared_size
+            or (declared_sha256 is not None and actual_sha256 != declared_sha256)):
+        raise LoadError("Telegram media size or SHA-256 does not match its export metadata")
+    return total, actual_sha256
+
+
 def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
         with _open_private(path) as stream:
@@ -119,7 +190,15 @@ def _read_json(path: Path) -> tuple[dict[str, Any], bytes]:
 
 
 def _iter_jsonl_stream(stream) -> Iterator[tuple[bytes, dict[str, Any]]]:
-    for number, raw in enumerate(stream, 1):
+    number = 0
+    while True:
+        # readline(size) bounds allocation even when an attacker supplies a
+        # newline-free record.  The extra byte distinguishes an exact-limit
+        # record from an oversized one without buffering the rest of the file.
+        raw = stream.readline(_MAX_LINE_BYTES + 1)
+        if not raw:
+            break
+        number += 1
         if len(raw) > _MAX_LINE_BYTES:
             raise LoadError(f"Telegram JSONL record {number} is oversized")
         try:
@@ -149,18 +228,38 @@ def _chat_id(value: Any) -> str:
     return result
 
 
-def _topic_id(value: Any) -> int:
+def _topic_id(value: Any, scope: str = "topic") -> int | None:
+    if scope == "chat" and value is None:
+        return None
     if type(value) is not int or value <= 0:
         raise LoadError("Telegram export has an invalid topic ID")
     return value
 
 
-def _validate_message(value: dict[str, Any], chat_id: str, topic_id: int) -> None:
+def _validate_message(
+    value: dict[str, Any], chat_id: str, topic_id: int | None, scope: str = "topic",
+) -> None:
     message_id = value.get("message_id")
     if type(message_id) is not int or message_id <= 0:
         raise LoadError("Telegram export contains an invalid message ID")
-    if value.get("topic_id") != topic_id:
+    row_topic = value.get("topic_id")
+    if scope == "topic" and row_topic != topic_id:
         raise LoadError("Telegram message is outside the exported topic")
+    if scope == "chat" and row_topic is not None and (type(row_topic) is not int or row_topic <= 0):
+        raise LoadError("Telegram message has an invalid forum topic ID")
+    topic_status = value.get("topic_id_status")
+    if topic_status is not None and (
+        not isinstance(topic_status, str)
+        or topic_status not in {"known", "unknown", "not_applicable"}
+    ):
+        raise LoadError("Telegram message has an invalid topic provenance status")
+    if scope == "topic" and topic_status not in (None, "known"):
+        raise LoadError("Topic export has inconsistent topic provenance")
+    if scope == "chat":
+        if topic_status == "known" and row_topic is None:
+            raise LoadError("Known topic provenance has no topic ID")
+        if topic_status in {"unknown", "not_applicable"} and row_topic is not None:
+            raise LoadError("Unassigned topic provenance has a topic ID")
     if not isinstance(value.get("date"), str) or not isinstance(value.get("text"), str):
         raise LoadError("Telegram message is missing its date or text")
     if "sender_name" in value and value["sender_name"] is not None and not isinstance(value["sender_name"], str):
@@ -212,6 +311,8 @@ def inspect_export(
     root: Path = TELEGRAM_ROOT,
     max_jsonl_bytes: int | None = None,
 ) -> TelegramExport:
+    if max_jsonl_bytes is None:
+        max_jsonl_bytes = MAX_TELEGRAM_EXPORT_BYTES
     if max_jsonl_bytes is not None and (
         type(max_jsonl_bytes) is not int or max_jsonl_bytes <= 0
     ):
@@ -224,18 +325,30 @@ def inspect_export(
     if manifest.get("scope_before") is not None:
         raise LoadError("Telegram ingestion requires a complete, unbounded topic export")
     chat_id = _chat_id(manifest.get("chat_id"))
-    topic_id = _topic_id(manifest.get("topic_id"))
-    expected_source = f"telegram:{chat_id}:topic:{topic_id}"
+    scope = manifest.get("scope", "topic")
+    if scope not in {"topic", "chat"}:
+        raise LoadError("Telegram export has an invalid scope")
+    topic_id = _topic_id(manifest.get("topic_id"), scope)
+    if scope == "chat" and topic_id is not None:
+        raise LoadError("Whole-group Telegram export cannot declare one topic ID")
+    expected_source = format_telegram_source(chat_id, topic_id)
     if manifest.get("source_id") != expected_source:
         raise LoadError("Telegram export source identity does not match its directory")
-    if str(export_dir.parent.name) != chat_id or export_dir.name != str(topic_id):
+    expected_dir = telegram_scope_directory(topic_id)
+    if str(export_dir.parent.name) != chat_id or export_dir.name != expected_dir:
         raise LoadError("Telegram export directory does not match its manifest")
     expected_messages_sha = manifest.get("messages_sha256")
     if not isinstance(expected_messages_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_messages_sha):
         raise LoadError("Telegram message manifest has no valid SHA-256")
+    try:
+        max_file_bytes = validate_telegram_media_limit(
+            manifest.get("max_file_bytes", DEFAULT_TELEGRAM_MEDIA_BYTES)
+        )
+    except ValueError:
+        raise LoadError("Telegram manifest has an invalid media size limit") from None
     message_sha, message_count, messages_size = _scan_file(
         export_dir / "messages.jsonl",
-        lambda item: _validate_message(item, chat_id, topic_id),
+        lambda item: _validate_message(item, chat_id, topic_id, scope),
         max_bytes=max_jsonl_bytes,
     )
     if message_sha != expected_messages_sha:
@@ -246,6 +359,7 @@ def inspect_export(
         services.get("source_id") != expected_source
         or services.get("chat_id") != int(chat_id)
         or services.get("topic_id") != topic_id
+        or services.get("scope", scope) != scope
         or services.get("complete") is not True
         or services.get("range_complete") is not True
         or services.get("scope_before") is not None
@@ -258,7 +372,11 @@ def inspect_export(
 
     def validate_event(item: dict[str, Any]) -> None:
         event_id = item.get("event_id")
-        if type(event_id) is not int or event_id <= 0 or item.get("topic_id") != topic_id:
+        event_topic = item.get("topic_id")
+        if (type(event_id) is not int or event_id <= 0
+                or (scope == "topic" and event_topic != topic_id)
+                or (scope == "chat" and event_topic is not None
+                    and (type(event_topic) is not int or event_topic <= 0))):
             raise LoadError("Telegram service export contains an invalid event identity")
         if item.get("type") not in _EVENT_TYPES:
             raise LoadError("Telegram service export contains an unsupported event type")
@@ -274,22 +392,33 @@ def inspect_export(
         path=export_dir,
         chat_id=chat_id,
         topic_id=topic_id,
+        scope=scope,
         topic_title=manifest.get("topic_title") if isinstance(manifest.get("topic_title"), str) else None,
         message_count=message_count,
         service_event_count=service_count,
         message_sha256=message_sha,
         service_sha256=service_sha,
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        services_manifest_sha256=hashlib.sha256(service_manifest_bytes).hexdigest(),
         messages_size=messages_size,
         services_size=service_size,
         manifest_size=len(manifest_bytes),
         services_manifest_size=len(service_manifest_bytes),
         chat_title=manifest.get("chat_title") if isinstance(manifest.get("chat_title"), str) else None,
+        max_file_bytes=max_file_bytes,
         services_manifest=services,
+        forum=manifest.get("forum") if type(manifest.get("forum")) is bool else None,
     )
 
 
-def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed: bool = False) -> tuple[str | None, str | None, bool, dict[str, Any]]:
+def _media_info(
+    export: TelegramExport,
+    message_id: int,
+    value: Any,
+    *,
+    resumed: bool = False,
+    selected_limit: int | None = None,
+) -> tuple[str | None, str | None, bool, dict[str, Any]]:
     if value is None:
         return None, None, False, {}
     if not isinstance(value, dict):
@@ -306,7 +435,8 @@ def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed:
     relative = value.get("path")
     safe_meta = {
         key: value[key]
-        for key in ("export_status", "reason", "sha256", "size")
+        for key in ("export_status", "reason", "sha256", "size", "size_bytes",
+                    "size_source", "max_file_bytes")
         if key in value and isinstance(value[key], (str, int, bool, type(None)))
     }
     if relative is None:
@@ -314,49 +444,104 @@ def _media_info(export: TelegramExport, message_id: int, value: Any, *, resumed:
     if not isinstance(relative, str):
         raise LoadError("Telegram message media path is invalid")
     parsed = PurePosixPath(relative)
-    if parsed.is_absolute() or not parsed.parts or parsed.parts[0] != ("media-resume" if resumed else "media") or ".." in parsed.parts:
+    allowed_roots = {"media", "media-resume"} if resumed else {"media"}
+    if (parsed.is_absolute() or not parsed.parts
+            or parsed.parts[0] not in allowed_roots
+            or ".." in parsed.parts or "\\" in relative or "\x00" in relative):
         raise LoadError("Telegram media path contains traversal")
-    if len(parsed.parts) < 3 or parsed.parts[1] != str(message_id):
+    if len(parsed.parts) != 3 or parsed.parts[1] != str(message_id):
         raise LoadError("Telegram media path does not match its message")
-    candidate = export.path.joinpath(*parsed.parts)
-    current = export.path
-    for part in parsed.parts[:-1]:
-        current /= part
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            return media_type, None, True, safe_meta
-        except OSError:
-            raise LoadError("Telegram media path is unavailable") from None
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise LoadError("Telegram media path contains a symbolic link or non-directory")
+    size = value.get("size", value.get("size_bytes"))
+    alternate_size = value.get("size_bytes")
+    if ("size" in value and "size_bytes" in value
+            and (type(value["size"]) is not int or type(alternate_size) is not int
+                 or value["size"] != alternate_size)):
+        raise LoadError("Telegram media size fields disagree")
+    limit = value.get("max_file_bytes", export.max_file_bytes)
     try:
-        with _open_private(candidate) as stream:
-            if resumed and (os.fstat(stream.fileno()).st_size != value["size"]
-                            or hashlib.file_digest(stream, "sha256").hexdigest() != value["sha256"]):
-                raise LoadError("Media resume file does not match its checksum")
-    except LoadError as exc:
-        if not candidate.exists() and not candidate.is_symlink():
-            return media_type, None, True, safe_meta
-        raise exc
+        validate_telegram_media_limit(limit)
+        if selected_limit is not None:
+            validate_telegram_media_limit(selected_limit)
+    except ValueError:
+        raise LoadError("Telegram media size limit is invalid") from None
+    limit_ceiling = export.max_file_bytes if selected_limit is None else selected_limit
+    if not resumed and limit > limit_ceiling:
+        raise LoadError("Telegram media size limit exceeds its manifest")
+    if type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES or size > limit:
+        raise LoadError("Telegram media size is outside the supported limit")
+    declared_sha256 = value.get("sha256")
+    if declared_sha256 is not None and (
+        not isinstance(declared_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", declared_sha256)
+    ):
+        raise LoadError("Telegram media SHA-256 is invalid")
+    try:
+        with _open_export_media(export.path, parsed.parts) as stream:
+            actual_size, actual_sha256 = _verify_media_stream(
+                stream,
+                declared_size=size,
+                limit=limit,
+                declared_sha256=declared_sha256,
+            )
+    except FileNotFoundError:
+        return media_type, None, True, safe_meta
+    except LoadError:
+        raise
+    except OSError:
+        raise LoadError("Telegram media path is unavailable or unsafe") from None
+    if resumed and (actual_size != value.get("size") or actual_sha256 != value.get("sha256")):
+        raise LoadError("Media resume file does not match its checksum")
+    safe_meta.update({
+        "size": actual_size,
+        "size_bytes": actual_size,
+        "sha256": actual_sha256,
+        "max_file_bytes": limit,
+    })
     return media_type, relative, False, safe_meta
 
 
-def _normalize_message(export: TelegramExport, value: dict[str, Any], resumed_media: dict | None = None) -> tuple[dict[str, Any], bool]:
+def _normalize_message(
+    export: TelegramExport,
+    value: dict[str, Any],
+    resumed_media: dict | None = None,
+    resumed_limit: int | None = None,
+) -> tuple[dict[str, Any], bool]:
     message_id = value["message_id"]
     media_type, media_path, media_missing, media_meta = _media_info(
         export, message_id, resumed_media if resumed_media is not None else value.get("media"),
         resumed=resumed_media is not None,
+        selected_limit=resumed_limit if resumed_media is not None else None,
     )
     if resumed_media is not None and media_missing:
         raise LoadError("Media resume file is missing")
     text = value["text"]
-    topic_id = str(export.topic_id)
+    source_topic = value.get("topic_id") if export.scope == "chat" else export.topic_id
+    topic_id = str(source_topic) if source_topic is not None else None
+    topic_status = value.get("topic_id_status")
+    if export.scope == "topic":
+        topic_status = "known"
+    elif topic_status is None:
+        if source_topic is not None:
+            topic_status = "known"
+        elif export.forum is True:
+            topic_status = "unknown"
+        else:
+            # Legacy full-group exports did not carry forum metadata. Do not
+            # infer a forum topic from an absent ID.
+            topic_status = "unknown" if export.forum is None else "not_applicable"
+    internal_chat_id = export.chat_id.removeprefix("-100").removeprefix("-")
+    message_url = (
+        _make_url(export.chat_id, topic_id, str(message_id))
+        if topic_id is not None
+        else f"https://t.me/c/{internal_chat_id}/{message_id}"
+    )
     return {
         "chat_id": export.chat_id,
         "message_id": str(message_id),
         "topic_id": topic_id,
         "topic_title": export.topic_title,
+        # Preserve the legacy attribution contract; scope is carried explicitly
+        # in metadata and in the manifest.
         "attribution": "scope",
         "date": value["date"],
         "date_raw": value["date"],
@@ -369,8 +554,12 @@ def _normalize_message(export: TelegramExport, value: dict[str, Any], resumed_me
         "media_path": media_path,
         "edited_at": None,
         "content_hash": normalized_content_hash(text),
-        "url": _make_url(export.chat_id, topic_id, str(message_id)),
-        "meta": {"media_export": media_meta} if media_meta else {},
+        "url": message_url,
+        "meta": {
+            "export_scope": export.scope,
+            "topic_id_status": topic_status,
+            **({"media_export": media_meta} if media_meta else {}),
+        },
         "_media_missing": media_missing,
     }, media_missing
 
@@ -378,20 +567,40 @@ def _normalize_message(export: TelegramExport, value: dict[str, Any], resumed_me
 def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_ROOT) -> tuple[Path, TelegramExport, int]:
     export = inspect_export(source, root=root)
     recovered = {}
-    resume = export.path / "media-resume"
-    if resume.exists() or resume.is_symlink():
-        info = resume.lstat()
-        if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+    media_limit_bytes = export.max_file_bytes
+    resume_dirs = [export.path / name for name in ("media-resume", "media")]
+    resume_candidates = [directory / "status.json" for directory in resume_dirs
+                         if (directory / "status.json").exists()
+                         or (directory / "status.json").is_symlink()]
+    if len(resume_candidates) > 1:
+        raise LoadError("Telegram export has ambiguous media resume checkpoints")
+    if resume_candidates:
+        checkpoint_path = resume_candidates[0]
+        resume = checkpoint_path.parent
+        try:
+            info = resume.lstat()
+        except OSError:
+            raise LoadError("Media resume directory is unsafe") from None
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != 0o700):
             raise LoadError("Media resume directory is unsafe")
-        with _open_private(resume / "status.json") as stream:
+        with _open_private(checkpoint_path) as stream:
             checkpoint = stream.read(4 * 1024**2 + 1)
         if len(checkpoint) > 4 * 1024**2:
             raise LoadError("Media resume checkpoint is too large")
-        recovered = resumed_photos(checkpoint, {
+        recovered = resumed_media(checkpoint, {
             "messages.jsonl": export.message_sha256,
             "services.jsonl": export.service_sha256,
             "manifest.json": export.manifest_sha256,
+            "services_manifest.json": export.services_manifest_sha256,
         }, (row for _, row in _iter_jsonl(export.path / "messages.jsonl")))
+        try:
+            resume_data = json.loads(checkpoint)
+            media_limit_bytes = validate_telegram_media_limit(
+                resume_data.get("requested_max_file_bytes", export.max_file_bytes)
+            )
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            raise LoadError("Media resume checkpoint has an invalid size limit") from None
     paths = job_paths(artifact_dir)
     paths["normalized"].mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(paths["normalized"], 0o700)
@@ -407,11 +616,28 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
     messages_digest = hashlib.sha256()
     normalized_count = 0
     media_missing = 0
+    topic_titles: dict[str, str | None] = {}
+    unknown_topic_ids: list[int] = []
+    unknown_topic_count = 0
     try:
         with os.fdopen(fd, "wb") as output:
             for raw, item in _iter_jsonl(export.path / "messages.jsonl"):
                 messages_digest.update(raw)
-                normalized, missing = _normalize_message(export, item, recovered.get(item["message_id"]))
+                normalized, missing = _normalize_message(
+                    export, item, recovered.get(item["message_id"]), media_limit_bytes,
+                )
+                if export.scope == "chat":
+                    topic_status = normalized["meta"].get("topic_id_status")
+                    if topic_status == "unknown":
+                        unknown_topic_count += 1
+                        if len(unknown_topic_ids) < 100:
+                            unknown_topic_ids.append(item["message_id"])
+                    topic = normalized.get("topic_id")
+                    if topic is not None:
+                        topic_titles.setdefault(
+                            str(topic), item.get("topic_title")
+                            if isinstance(item.get("topic_title"), str) else None,
+                        )
                 encoded = (json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
                 output.write(encoded)
                 normalized_count += 1
@@ -422,23 +648,39 @@ def prepare_export(source: Path, artifact_dir: Path, *, root: Path = TELEGRAM_RO
             raise LoadError("Telegram messages changed while preparing the ingest job")
         os.replace(temporary, paths["messages"])
         os.chmod(paths["messages"], 0o600)
-        uri = f"telegram-export://{export.chat_id}/{export.topic_id}/{export.message_sha256}"
+        scope_dir = telegram_scope_directory(export.topic_id)
+        source_id = format_telegram_source(export.chat_id, export.topic_id)
+        uri = f"telegram-export://{export.chat_id}/{scope_dir}/{export.message_sha256}"
+        archive_scope = export.scope
+        archive_topic = str(export.topic_id) if export.topic_id is not None else None
+        if export.scope != "chat":
+            topic_titles[archive_topic] = export.topic_title
         normalized_manifest = {
-            "source_id": f"telegram:{export.chat_id}:topic:{export.topic_id}",
+            "source_id": source_id,
             "snapshot_sha256": export.message_sha256,
             "archive_size_bytes": export.messages_size,
             "archive_uri": uri,
-            "archive_name": f"telegram-{export.chat_id}-{export.topic_id}-{export.message_sha256[:12]}",
-            "scope": "topic",
-            "scope_topic_id": str(export.topic_id),
+            "archive_name": f"telegram-{export.chat_id}-{scope_dir}-{export.message_sha256[:12]}",
+            "scope": archive_scope,
+            "scope_topic_id": archive_topic,
             "chat_id": export.chat_id,
             "telegram_import_key": export.import_key,
             "service_events_sha256": export.service_sha256,
             "media_missing_count": media_missing,
             "media_resume_count": len(recovered),
+            "media_max_file_bytes": media_limit_bytes,
+            "media_size_unit": "bytes",
+            "forum": export.forum,
+            "topic_assignment_complete": unknown_topic_count == 0,
+            "topic_assignment_unknown_count": unknown_topic_count,
+            "topic_assignment_unknown_message_ids": unknown_topic_ids,
+            "topic_assignment_unknown_sample_truncated": unknown_topic_count > len(unknown_topic_ids),
             "parse": {
                 "chat_title": export.chat_title,
-                "topics": [{"topic_id": str(export.topic_id), "topic_title": export.topic_title}],
+                "topics": [
+                    {"topic_id": topic_id, "topic_title": title}
+                    for topic_id, title in sorted(topic_titles.items(), key=lambda pair: int(pair[0]))
+                ],
             },
         }
         write_json_atomic(paths["manifest"], normalized_manifest)

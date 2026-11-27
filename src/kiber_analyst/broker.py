@@ -3,6 +3,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -16,22 +17,34 @@ import tempfile
 import time
 import uuid
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO, Iterator
 
 from kiber_analyst import __version__ as KIBER_ANALYST_VERSION
 from kiber_analyst.config_paths import config_path, data_path, runtime_path
 from kiber_analyst.connectors.source_ids import parse_source_id
+from kiber_analyst.errors import LoadError
 from kiber_analyst.jobapi import api_call, submit_command
 from kiber_analyst.jobqueue import JobsError
+from kiber_analyst.media_limits import (
+    DEFAULT_TELEGRAM_MEDIA_BYTES,
+    MAX_TELEGRAM_EXPORT_BYTES,
+    MAX_TELEGRAM_MEDIA_BYTES,
+    validate_telegram_media_limit,
+)
 from kiber_analyst.media_resume import resumed_photos
 from kiber_analyst.project_catalog import SLUG_RE, read_project_policy
 from kiber_analyst.project_catalog import request_key as project_request_key
+from kiber_analyst.telegram_source import parse_telegram_source, telegram_scope_directory
 
 ROOT = data_path()
 CONFIG = config_path("sources.json")
 PROJECT_ACCESS = config_path("project-access.json")
 SOCKET = runtime_path("broker.sock")
 CONTROLS = ('messages.jsonl', 'services.jsonl', 'manifest.json')
-CONTROL_FILE_MAX_BYTES = 32 * 1024**2
+# Bound control files by the product storage ceiling, not the former 32 MiB
+# in-memory IPC limit. JSONL is streamed below this bound.
+CONTROL_FILE_MAX_BYTES = MAX_TELEGRAM_EXPORT_BYTES
+ASR_PLAN_MAX_BYTES = 8 * 1024**2
 SERVICES_MANIFEST_MAX_BYTES = 1024**2
 TERMINAL = {'done', 'failed', 'timed_out', 'cancelled'}
 ACTIVE = {'queued', 'running', 'waiting_retry', 'waiting_quota', 'submitting'}
@@ -165,6 +178,11 @@ def telegram_topic_source(source_id):
     return (match.group('chat'), match.group('topic')) if match else None
 
 
+def telegram_export_source(source_id):
+    """Parse either a complete group export or one forum topic export."""
+    return parse_telegram_source(source_id)
+
+
 def private(info, directory=False, *, owner=None):
     mode = 0o700 if directory else 0o600
     valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
@@ -208,12 +226,98 @@ def open_input(fd, name, *, owner=None):
 
 def read_input(fd, name, maximum=32 * 1024**2, *, owner=None):
     with open_input(fd, name, owner=owner) as stream:
-        if os.fstat(stream.fileno()).st_size > maximum:
+        before = os.fstat(stream.fileno())
+        if before.st_size > maximum:
             raise Refused('INPUT_TOO_LARGE')
-        result = stream.read(maximum + 1)
-        if len(result) > maximum:
+        chunks = []
+        total = 0
+        while chunk := stream.read(min(1024 * 1024, maximum - total + 1)):
+            total += len(chunk)
+            if total > maximum:
+                raise Refused('INPUT_TOO_LARGE')
+            chunks.append(chunk)
+        after = os.fstat(stream.fileno())
+        if (_media_stat_token(before) != _media_stat_token(after)
+                or total != before.st_size):
+            raise Refused('DATA_MISMATCH')
+        return b''.join(chunks)
+
+
+def _copy_input(fd, name, destination_fd, expected_sha256, maximum, *, owner=None):
+    """Copy a control file with bounded memory and hash the exact staged bytes."""
+    with open_input(fd, name, owner=owner) as source:
+        before = os.fstat(source.fileno())
+        if before.st_size > maximum:
             raise Refused('INPUT_TOO_LARGE')
-        return result
+        output = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=destination_fd)
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with os.fdopen(output, 'wb') as target:
+                while chunk := source.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > maximum:
+                        raise Refused('INPUT_TOO_LARGE')
+                    digest.update(chunk)
+                    target.write(chunk)
+                after = os.fstat(source.fileno())
+                if (_media_stat_token(before) != _media_stat_token(after)
+                        or total != before.st_size or digest.hexdigest() != expected_sha256):
+                    raise Refused('HASH_MISMATCH')
+                target.flush()
+                os.fsync(target.fileno())
+        except BaseException:
+            try:
+                os.unlink(name, dir_fd=destination_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        return total
+
+
+def _hash_input(fd, name, maximum, *, owner=None):
+    try:
+        with open_input(fd, name, owner=owner) as stream:
+            before = os.fstat(stream.fileno())
+            if before.st_size > maximum:
+                raise Refused('INPUT_TOO_LARGE')
+            digest = hashlib.sha256()
+            total = 0
+            while chunk := stream.read(1024 * 1024):
+                total += len(chunk)
+                if total > maximum:
+                    raise Refused('INPUT_TOO_LARGE')
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+            if _media_stat_token(before) != _media_stat_token(after) or total != before.st_size:
+                raise Refused('DATA_MISMATCH')
+            return total, digest.hexdigest()
+    except OSError:
+        raise Refused('DATA_MISMATCH') from None
+
+
+def _iter_jsonl_input(fd, name, maximum=CONTROL_FILE_MAX_BYTES, *, owner=None):
+    """Yield one validated JSON object at a time from a stable private file."""
+    with open_input(fd, name, owner=owner) as stream:
+        before = os.fstat(stream.fileno())
+        if before.st_size > maximum:
+            raise Refused('INPUT_TOO_LARGE')
+        total = 0
+        while raw := stream.readline(4 * 1024**2 + 1):
+            total += len(raw)
+            if total > maximum or len(raw) > 4 * 1024**2:
+                raise Refused('INPUT_TOO_LARGE')
+            try:
+                row = json.loads(raw)
+            except (ValueError, UnicodeError):
+                raise Refused('DATA_MISMATCH') from None
+            if not isinstance(row, dict):
+                raise Refused('DATA_MISMATCH')
+            yield row
+        after = os.fstat(stream.fileno())
+        if _media_stat_token(before) != _media_stat_token(after) or total != before.st_size:
+            raise Refused('DATA_MISMATCH')
 
 
 def registry(path):
@@ -230,7 +334,7 @@ def registry(path):
                     r'[a-z0-9][a-z0-9-]{0,62}', entry['project']):
                 raise Refused('INVALID_REGISTRY')
             continue
-        if not re.fullmatch(r'telegram:-[1-9][0-9]{0,18}:topic:[1-9][0-9]{0,9}', source):
+        if telegram_export_source(source) is None:
             raise Refused('INVALID_REGISTRY')
         if (set(entry) not in ({'project', 'hashes'}, {'project', 'hashes', 'asr_enabled'})
                 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', entry['project'])
@@ -251,11 +355,32 @@ def write_file(fd, name, data):
         os.fsync(stream.fileno())
 
 
+def _media_stat_token(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def verify_media_files(root, items, *, owner=None):
+    """Stream-check staged media each time an immutable revision is reused."""
+    for rel, size, digest in items:
+        with descend(root, rel[:-1], owner=owner) as parent:
+            with open_input(parent, rel[-1], owner=owner) as stream:
+                before = os.fstat(stream.fileno())
+                if before.st_size != size:
+                    raise Refused('DATA_MISMATCH')
+                actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+                after = os.fstat(stream.fileno())
+                if (_media_stat_token(before) != _media_stat_token(after)
+                        or actual != digest):
+                    raise Refused('DATA_MISMATCH')
+
+
 def copy_media(source, output, items, *, owner=None):
     for rel, size, digest in items:
         with descend(source, rel[:-1], owner=owner) as old, descend(output, rel[:-1], create=True) as new:
             with open_input(old, rel[-1], owner=owner) as src:
-                if os.fstat(src.fileno()).st_size != size:
+                before = os.fstat(src.fileno())
+                if before.st_size != size:
                     raise Refused('DATA_MISMATCH')
                 dest = os.open(rel[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                0o600, dir_fd=new)
@@ -269,59 +394,124 @@ def copy_media(source, output, items, *, owner=None):
                         dst.write(data)
                         actual.update(data)
                         left -= len(data)
-                    if src.read(1) or actual.hexdigest() != digest:
+                    after = os.fstat(src.fileno())
+                    if (src.read(1) or actual.hexdigest() != digest
+                            or _media_stat_token(before) != _media_stat_token(after)):
                         raise Refused('DATA_MISMATCH')
                     dst.flush()
+                    if os.fstat(dst.fileno()).st_size != size:
+                        raise Refused('DATA_MISMATCH')
                     os.fsync(dst.fileno())
             os.fsync(new)
 
 
-def media_items(data):
-    result = []
-    seen = set()
-    for line in data.splitlines():
-        row = json.loads(line)
-        media = row.get('media') or {}
+def _manifest_media_limit(data):
+    try:
+        manifest = json.loads(data)
+        return validate_telegram_media_limit(
+            manifest.get("max_file_bytes", DEFAULT_TELEGRAM_MEDIA_BYTES)
+        )
+    except (ValueError, AttributeError):
+        raise Refused("UNSAFE_MEDIA") from None
+
+
+def media_items(data: bytes | BinaryIO, manifest_limit=DEFAULT_TELEGRAM_MEDIA_BYTES) -> Iterator[tuple[list[str], int, str]]:
+    try:
+        validate_telegram_media_limit(manifest_limit)
+    except ValueError:
+        raise Refused("UNSAFE_MEDIA") from None
+    stream = io.BytesIO(data) if isinstance(data, bytes) else data
+    def bounded_lines():
+        while True:
+            line = stream.readline(4 * 1024**2 + 1)
+            if not line:
+                return
+            yield line
+
+    lines = bounded_lines()
+    for line in lines:
+        if len(line) > 4 * 1024**2:
+            raise Refused('UNSAFE_MEDIA')
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeError):
+            raise Refused('UNSAFE_MEDIA') from None
+        if not isinstance(row, dict) or type(row.get('message_id')) is not int or row['message_id'] <= 0:
+            raise Refused('UNSAFE_MEDIA')
+        media = row.get('media')
+        if media is None:
+            continue
+        if not isinstance(media, dict):
+            raise Refused('UNSAFE_MEDIA')
         value = media.get('path')
         if value is None:
             continue
         rel = parts(value)
-        size = media.get('size')
+        size = media.get('size', media.get('size_bytes'))
         digest = media.get('sha256')
+        limit = media.get('max_file_bytes', manifest_limit)
         if (len(rel) != 3 or rel[:2] != ['media', str(row['message_id'])]
-                or value in seen or type(size) is not int or not 0 < size <= 100 * 1024**2
+                or type(size) is not int or not 0 < size <= MAX_TELEGRAM_MEDIA_BYTES
+                or type(limit) is not int or not 0 < limit <= MAX_TELEGRAM_MEDIA_BYTES
+                or limit > manifest_limit or size > limit
                 or not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)):
             raise Refused('UNSAFE_MEDIA')
-        result.append((rel, size, digest))
-        seen.add(value)
-    return result
+        yield rel, size, digest
 
 
-def publish_resume(source, output, checkpoint, records, *, owner=None, publish_owner=None):
-    """Publish only recovered files. Inputs and existing results stay immutable."""
-    files = [(parts(r['path'])[1:], r['size'], r['sha256']) for r in records.values()]
+def publish_resume(source, output, checkpoint, records, *, owner=None, publish_owner=None,
+                   media_source=None):
+    """Publish recovered files at the roots declared by their checkpoint receipts."""
+    files_by_root = {'media': [], 'media-resume': []}
+    for receipt in records.values():
+        relative = parts(receipt['path'])
+        if len(relative) != 3 or relative[0] not in files_by_root:
+            raise Refused('RESUME_PATH_UNSAFE')
+        item = (relative, receipt['size'], receipt['sha256'])
+        files_by_root[relative[0]].append(item)
+    if files_by_root['media'] and media_source is None:
+        raise Refused('RESUME_SOURCE_UNAVAILABLE')
+    output_files = [item for group in files_by_root.values() for item in group]
     existing_owner = publish_owner[0] if publish_owner else None
     try:
         with descend(output, ['media-resume'], owner=existing_owner) as existing:
             if read_input(existing, 'status.json', owner=existing_owner) != checkpoint:
                 raise Refused('RESUME_REVISION_CONFLICT')
-            for rel, size, digest in files:
-                with descend(existing, rel[:-1], owner=existing_owner) as parent:
-                    with open_input(parent, rel[-1], owner=existing_owner) as stream:
-                        if (os.fstat(stream.fileno()).st_size != size
-                                or hashlib.file_digest(stream, 'sha256').hexdigest() != digest):
-                            raise Refused('DATA_MISMATCH')
+            verify_media_files(output, output_files, owner=existing_owner)
             return
     except FileNotFoundError:
         if 'media-resume' in os.listdir(output):
             raise Refused('RESUME_REVISION_CONFLICT') from None
     free = os.fstatvfs(output)
-    if free.f_bavail * free.f_frsize < RESERVE + sum(size for _, size, _ in files):
+    if free.f_bavail * free.f_frsize < RESERVE + sum(size for _, size, _ in output_files):
         raise Refused('INSUFFICIENT_SPACE')
+
+    def publish_existing_or_copy(items, *, source_root, target_root):
+        missing = []
+        for item in items:
+            try:
+                verify_media_files(target_root, [item], owner=existing_owner)
+            except FileNotFoundError:
+                missing.append(item)
+        if missing:
+            copy_media(source_root, target_root, missing, owner=owner)
+        verify_media_files(target_root, items, owner=existing_owner)
+
+    # These paths are inside an unpublished .stage directory in broker use.
+    # Write media-root receipts first; retries verify and reuse an already
+    # copied file instead of replacing it. The checkpoint is published only
+    # after every declared file has passed its size/hash check.
+    publish_existing_or_copy(
+        files_by_root['media'], source_root=media_source, target_root=output,
+    )
     temp = '.resume-' + uuid.uuid4().hex
     try:
         with descend(output, [temp], create=True) as target:
-            copy_media(source, target, files, owner=owner)
+            resume_files = [
+                (item[0][1:], item[1], item[2])
+                for item in files_by_root['media-resume']
+            ]
+            copy_media(source, target, resume_files, owner=owner)
             write_file(target, 'status.json', checkpoint)
             if publish_owner:
                 for _, dirs, names, fd in os.fwalk('.', topdown=False, dir_fd=target):
@@ -331,6 +521,7 @@ def publish_resume(source, output, checkpoint, records, *, owner=None, publish_o
             os.fsync(target)
         os.rename(temp, 'media-resume', src_dir_fd=output, dst_dir_fd=output)
         os.fsync(output)
+        verify_media_files(output, output_files, owner=existing_owner)
     finally:
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(temp, dir_fd=output)
@@ -478,8 +669,11 @@ class Broker:
         if parse_source_id(source) is not None:
             # External sources have no staged import tree.
             return entry, fingerprint, None, None
-        _, chat, _, topic = source.split(':')
-        return entry, fingerprint, chat, topic
+        parsed_telegram = telegram_export_source(source)
+        if parsed_telegram is None:
+            raise Refused('UNSUPPORTED_SOURCE')
+        chat, topic = parsed_telegram
+        return entry, fingerprint, chat, telegram_scope_directory(topic)
 
     @staticmethod
     def _source_fingerprint_variants(source_id, entry):
@@ -540,6 +734,8 @@ class Broker:
                 chat, topic = parsed if isinstance(parsed, tuple) and len(parsed) == 2 else (None, None)
             else:
                 entry, fingerprint, chat, topic = candidate
+            if chat is not None:
+                topic = telegram_scope_directory(topic)
             if fingerprint not in seen:
                 seen.add(fingerprint)
                 unique.append((entry, fingerprint, chat, topic))
@@ -553,6 +749,31 @@ class Broker:
                     == self._base_fingerprint(expected_fingerprint)):
                 return candidate
         raise Refused('SOURCE_REVISION_CHANGED')
+
+    def _embed_row_matches_revision(self, row, revision_fingerprint):
+        """Match renewal requests to the original ingest-bound embed revision."""
+        if row['source_fingerprint'] == revision_fingerprint:
+            return True
+        request_id = row['id']
+        seen = set()
+        while request_id not in seen:
+            seen.add(request_id)
+            link = self.db.execute(
+                'SELECT previous_request_id FROM embed_renewals WHERE request_id=?',
+                (request_id,),
+            ).fetchone()
+            if link is None:
+                return False
+            previous = self.db.execute(
+                'SELECT fingerprint FROM requests WHERE id=? AND owner=? AND source=? AND operation=?',
+                (link['previous_request_id'], row['owner'], row['source'], 'embed'),
+            ).fetchone()
+            if previous is None:
+                return False
+            if previous['fingerprint'] == revision_fingerprint:
+                return True
+            request_id = link['previous_request_id']
+        return False
 
     def project_list(self, owner):
         catalog = self.worker_api('project-catalog', mode='list')
@@ -617,7 +838,7 @@ class Broker:
 
     def _managed_source_entry(self, owner, source_id, project):
         parsed_external = parse_source_id(source_id)
-        telegram_parts = telegram_topic_source(source_id)
+        telegram_parts = telegram_export_source(source_id)
         if parsed_external is None and telegram_parts is None:
             raise Refused('UNSUPPORTED_SOURCE')
         if not isinstance(project, str) or SLUG_RE.fullmatch(project) is None:
@@ -690,14 +911,14 @@ class Broker:
         if not any(isinstance(item, dict) and item.get('slug') == project for item in projects):
             raise Refused('PROJECT_NOT_FOUND')
         parsed = parse_source_id(source_id)
-        telegram_parts = telegram_topic_source(source_id)
+        telegram_parts = telegram_export_source(source_id)
         if parsed is None and telegram_parts is None:
             raise Refused('UNSUPPORTED_SOURCE')
         entry = {'project': project}
         if telegram_parts is not None:
             from kiber_analyst.telegram_ingest import inspect_export
 
-            export_path = self.root / 'imports' / telegram_parts[0] / telegram_parts[1]
+            export_path = self.root / 'imports' / telegram_parts[0] / telegram_scope_directory(telegram_parts[1])
             try:
                 export = inspect_export(
                     export_path,
@@ -706,8 +927,8 @@ class Broker:
                 )
             except Exception:
                 raise Refused('TELEGRAM_EXPORT_UNAVAILABLE') from None
-            if (export.chat_id != telegram_parts[0]
-                    or str(export.topic_id) != telegram_parts[1]):
+            expected_topic = int(telegram_parts[1]) if telegram_parts[1] is not None else None
+            if (export.chat_id != telegram_parts[0] or export.topic_id != expected_topic):
                 raise Refused('TELEGRAM_EXPORT_MISMATCH')
             if (export.messages_size > CONTROL_FILE_MAX_BYTES
                     or export.services_size > CONTROL_FILE_MAX_BYTES
@@ -765,7 +986,7 @@ class Broker:
             'telegram': {
                 'operations': ['register_complete_topic_export', 'dry_run', 'ingest', 'retry',
                                'embed', 'status', 'search'],
-                'scopes': {'topic': True, 'group': False},
+                'scopes': {'topic': True, 'group': True},
                 'export': {'available_via_separate_interface': True,
                            'invoked_by_kiber_broker': False},
                 'ingest_requires': 'complete, unbounded topic export already staged in the fixed Telegram import directory',
@@ -777,24 +998,68 @@ class Broker:
             'unsupported': ['web', 'documents', 'unimplemented connectors']}
 
     def stage(self, source_id, entry, fingerprint, chat, topic, revision=""):
+        # A media-resume checkpoint is an immutable input revision. Keep the
+        # earlier stage intact and place each later checkpoint in its own tree.
+        staging_fingerprint = (
+            hashlib.sha256((fingerprint + revision).encode()).hexdigest()
+            if revision else fingerprint
+        )
         with contextlib.ExitStack() as stack:
             fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             stack.callback(os.close, fd)
             private(os.fstat(fd), directory=True)
             source = stack.enter_context(descend(fd, ['imports', chat, topic]))
-            data = {name: read_input(source, name, CONTROL_FILE_MAX_BYTES) for name in CONTROLS}
-            if any(hashlib.sha256(data[n]).hexdigest() != entry['hashes'][n] for n in CONTROLS):
+            control_sizes = {}
+            for name in CONTROLS:
+                control_sizes[name], digest = _hash_input(source, name, CONTROL_FILE_MAX_BYTES)
+                if digest != entry['hashes'][name]:
+                    raise Refused('HASH_MISMATCH')
+            source_path = self.root / 'imports' / chat / topic
+            try:
+                from kiber_analyst.telegram_ingest import inspect_export
+
+                source_export = inspect_export(
+                    source_path, root=self.root / 'imports',
+                    max_jsonl_bytes=CONTROL_FILE_MAX_BYTES,
+                )
+            except Exception:
+                raise Refused('DATA_MISMATCH') from None
+            if (source_export.message_sha256 != entry['hashes']['messages.jsonl']
+                    or source_export.service_sha256 != entry['hashes']['services.jsonl']
+                    or source_export.manifest_sha256 != entry['hashes']['manifest.json']):
                 raise Refused('HASH_MISMATCH')
-            services = read_input(source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES)
-            service_meta = json.loads(services)
+            if (source_export.messages_size > CONTROL_FILE_MAX_BYTES
+                    or source_export.services_size > CONTROL_FILE_MAX_BYTES
+                    or source_export.manifest_size > CONTROL_FILE_MAX_BYTES
+                    or source_export.services_manifest_size > SERVICES_MANIFEST_MAX_BYTES):
+                raise Refused('TELEGRAM_EXPORT_TOO_LARGE')
+            manifest_bytes = read_input(source, 'manifest.json', 4 * 1024**2)
+            services_manifest_bytes = read_input(
+                source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES,
+            )
+            service_meta = json.loads(services_manifest_bytes)
             if (service_meta.get('source_id') != source_id
                     or service_meta.get('services_sha256') != entry['hashes']['services.jsonl']
                     or service_meta.get('complete') is not True):
                 raise Refused('DATA_MISMATCH')
-            if json.loads(data['manifest.json']).get('source_id') != source_id:
+            if json.loads(manifest_bytes).get('source_id') != source_id:
                 raise Refused('DATA_MISMATCH')
-            data['services_manifest.json'] = services
+            services_manifest_sha = hashlib.sha256(services_manifest_bytes).hexdigest()
+            controls_required = sum(control_sizes.values()) + len(services_manifest_bytes)
+            filesystem = os.fstatvfs(fd)
+            free_before_controls = filesystem.f_bavail * filesystem.f_frsize
+            if free_before_controls < controls_required + RESERVE:
+                raise Refused('INSUFFICIENT_SPACE')
+            manifest_limit = _manifest_media_limit(manifest_bytes)
             base = stack.enter_context(descend(fd, ['imports', '.broker']))
+
+            def rows_at(directory):
+                return _iter_jsonl_input(directory, 'messages.jsonl')
+
+            def media_at(directory):
+                with open_input(directory, 'messages.jsonl') as stream:
+                    yield from media_items(stream, manifest_limit)
+
             def merge(final):
                 if not revision:
                     return
@@ -802,40 +1067,78 @@ class Broker:
                     checkpoint = read_input(resumed, 'status.json', 4 * 1024**2)
                     if hashlib.sha256(checkpoint).hexdigest() != revision:
                         raise Refused('RESUME_REVISION_CONFLICT')
-                    records = resumed_photos(checkpoint, entry['hashes'],
-                                            map(json.loads, data['messages.jsonl'].splitlines()))
-                    publish_resume(resumed, final, checkpoint, records)
+                    resume_hashes = {
+                        **entry['hashes'],
+                        'services_manifest.json': services_manifest_sha,
+                    }
+                    records = resumed_photos(checkpoint, resume_hashes, rows_at(final))
+                    publish_resume(
+                        resumed, final, checkpoint, records,
+                        media_source=source,
+                    )
 
-            destination = self.root / 'imports' / '.broker' / fingerprint / chat / topic
+            destination = self.root / 'imports' / '.broker' / staging_fingerprint / chat / topic
             try:
-                with descend(base, [fingerprint, chat, topic]) as final:
-                    if any(read_input(final, n) != v for n, v in data.items()):
-                        raise Refused('HASH_MISMATCH')
+                with descend(base, [staging_fingerprint, chat, topic]) as final:
+                    for name in CONTROLS:
+                        _size, digest = _hash_input(final, name, CONTROL_FILE_MAX_BYTES)
+                        if digest != entry['hashes'][name]:
+                            raise Refused('HASH_MISMATCH')
+                    existing_services = json.loads(read_input(
+                        final, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES,
+                    ))
+                    if (existing_services.get('source_id') != source_id
+                            or existing_services.get('services_sha256') != entry['hashes']['services.jsonl']
+                            or existing_services.get('complete') is not True):
+                        raise Refused('DATA_MISMATCH')
+                    verify_media_files(final, media_at(final))
                     merge(final)
                     return destination
             except FileNotFoundError:
                 # A partially missing existing final directory is never replaced.
-                if fingerprint in os.listdir(base):
+                if staging_fingerprint in os.listdir(base):
                     raise Refused('DATA_MISMATCH') from None
-            files = media_items(data['messages.jsonl'])
-            free = os.fstatvfs(base)
-            required = sum(size for _, size, _ in files) + sum(map(len, data.values()))
-            if free.f_bavail * free.f_frsize < required + RESERVE:
-                raise Refused('INSUFFICIENT_SPACE')
             # Named children remain under the verified broker-owned directory.
             with tempfile.TemporaryDirectory(prefix='.stage-', dir=destination.parents[2]) as temporary:
                 name = Path(temporary).name
                 with descend(base, [name, chat, topic], create=True) as final:
-                    for key, value in data.items():
-                        write_file(final, key, value)
-                    copy_media(source, final, files)
+                    for key in CONTROLS:
+                        _copy_input(
+                            source, key, final, entry['hashes'][key], CONTROL_FILE_MAX_BYTES,
+                        )
+                    _copy_input(
+                        source, 'services_manifest.json', final, hashlib.sha256(
+                            services_manifest_bytes
+                        ).hexdigest(), SERVICES_MANIFEST_MAX_BYTES,
+                    )
+                    export_path = Path(temporary) / chat / topic
+                    try:
+                        staged_export = inspect_export(
+                            export_path, root=Path(temporary),
+                            max_jsonl_bytes=CONTROL_FILE_MAX_BYTES,
+                        )
+                    except Exception:
+                        raise Refused('DATA_MISMATCH') from None
+                    if (staged_export.message_sha256 != entry['hashes']['messages.jsonl']
+                            or staged_export.service_sha256 != entry['hashes']['services.jsonl']
+                            or staged_export.manifest_sha256 != entry['hashes']['manifest.json']):
+                        raise Refused('HASH_MISMATCH')
+                    media_bytes = sum(size for _rel, size, _digest in media_at(final))
+                    free = os.fstatvfs(base)
+                    # Recheck after controls were copied and before media. The
+                    # earlier preflight ensures we never fill staging with
+                    # control files before discovering the shortage.
+                    required = media_bytes
+                    if free.f_bavail * free.f_frsize < required + RESERVE:
+                        raise Refused('INSUFFICIENT_SPACE')
+                    copy_media(source, final, media_at(final))
                     merge(final)
                     os.fsync(final)
                 with descend(base, [name, chat]) as parent:
                     os.fsync(parent)
                 with descend(base, [name]) as parent:
                     os.fsync(parent)
-                os.rename(name, fingerprint, src_dir_fd=base, dst_dir_fd=base)
+                os.rename(name, staging_fingerprint, src_dir_fd=base, dst_dir_fd=base)
                 os.fsync(base)
             return destination
 
@@ -856,11 +1159,13 @@ class Broker:
             source_fd = stack.enter_context(descend(root_fd, list(relative)))
             try:
                 workspace_fd = stack.enter_context(descend(source_fd, [workspace_name]))
-                plan_data = read_input(workspace_fd, 'asr-plan.json', 8 * 1024**2)
+                plan_data = read_input(workspace_fd, 'asr-plan.json', ASR_PLAN_MAX_BYTES)
                 plan = _validated_asr_plan(json.loads(plan_data), source_id, input_fingerprint)
                 with descend(workspace_fd, ['normalized']) as normalized_fd:
-                    normalized = read_input(normalized_fd, 'messages.jsonl')
-                    if hashlib.sha256(normalized).hexdigest() != plan['normalized_sha256']:
+                    _normalized_size, normalized_sha = _hash_input(
+                        normalized_fd, 'messages.jsonl', CONTROL_FILE_MAX_BYTES,
+                    )
+                    if normalized_sha != plan['normalized_sha256']:
                         raise Refused('ASR_WORKSPACE_CONFLICT')
                 with descend(workspace_fd, ['unpacked']) as unpacked_fd:
                     for item in plan['files']:
@@ -891,65 +1196,64 @@ class Broker:
                             or normalized_info.st_nlink != 1
                             or stat.S_IMODE(normalized_info.st_mode) != 0o600):
                         raise Refused('ASR_INPUT_UNSAFE')
-                    normalized_records = []
                     total_audio = 0
                     skipped = {}
                     copies = []
                     eligible = []
-                    for line in normalized_path.read_text(encoding='utf-8').splitlines():
-                        record = json.loads(line)
-                        media_type = record.get('media_type')
-                        if not isinstance(media_type, str) or media_type.lower() not in ASR_AUDIO_TYPES:
-                            continue
-                        total_audio += 1
-                        message_id = str(record.get('message_id', ''))
-                        media_path = record.get('media_path')
-                        metadata = record.get('meta')
-                        media_export = metadata.get('media_export', {}) if isinstance(metadata, dict) else {}
-                        declared_size = media_export.get('size') if isinstance(media_export, dict) else None
-                        if not isinstance(media_path, str) or not media_path:
-                            reason = 'over_100_MiB' if type(declared_size) is int and declared_size > ASR_MAX_MEDIA_BYTES else 'missing_media'
-                            skipped[reason] = skipped.get(reason, 0) + 1
-                            continue
-                        relative_media = parts(media_path)
-                        if (len(relative_media) != 3
-                                or relative_media[0] not in {'media', 'media-resume'}
-                                or relative_media[1] != message_id):
-                            raise Refused('ASR_MEDIA_PATH_UNSAFE')
-                        if PurePosixPath(media_path).suffix.lower() not in ASR_AUDIO_EXTENSIONS:
-                            skipped['unsupported_format'] = skipped.get('unsupported_format', 0) + 1
-                            continue
-                        try:
-                            with descend(source_fd, relative_media[:-1]) as parent:
-                                with open_input(parent, relative_media[-1]) as stream:
-                                    size = os.fstat(stream.fileno()).st_size
-                                    if not 0 < size <= ASR_MAX_MEDIA_BYTES:
-                                        reason = 'over_100_MiB' if size > ASR_MAX_MEDIA_BYTES else 'missing_media'
-                                        skipped[reason] = skipped.get(reason, 0) + 1
-                                        continue
-                                    if size > ASR_MAX_FILE_BYTES:
-                                        skipped['provider_file_limit'] = skipped.get('provider_file_limit', 0) + 1
-                                        continue
-                                    digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-                        except FileNotFoundError:
-                            skipped['missing_media'] = skipped.get('missing_media', 0) + 1
-                            continue
-                        if type(declared_size) is int and declared_size != size:
-                            raise Refused('ASR_MEDIA_SIZE_MISMATCH')
-                        declared_hash = media_export.get('sha256') if isinstance(media_export, dict) else None
-                        if isinstance(declared_hash, str) and declared_hash != digest:
-                            raise Refused('ASR_MEDIA_HASH_MISMATCH')
-                        external_ref = f'tg:{chat}:{message_id}'
-                        copies.append((relative_media, size, digest))
-                        eligible.append({
-                            'external_ref': external_ref,
-                            'message_id': message_id,
-                            'media_type': media_type.lower(),
-                            'media_path': media_path,
-                            'size_bytes': size,
-                            'sha256': digest,
-                        })
-                        normalized_records.append(record)
+                    with descend(temp_fd, ['normalized']) as normalized_fd:
+                        records_stream = _iter_jsonl_input(normalized_fd, 'messages.jsonl')
+                        for record in records_stream:
+                            media_type = record.get('media_type')
+                            if not isinstance(media_type, str) or media_type.lower() not in ASR_AUDIO_TYPES:
+                                continue
+                            total_audio += 1
+                            message_id = str(record.get('message_id', ''))
+                            media_path = record.get('media_path')
+                            metadata = record.get('meta')
+                            media_export = metadata.get('media_export', {}) if isinstance(metadata, dict) else {}
+                            declared_size = media_export.get('size') if isinstance(media_export, dict) else None
+                            if not isinstance(media_path, str) or not media_path:
+                                reason = 'over_100_MiB' if type(declared_size) is int and declared_size > ASR_MAX_MEDIA_BYTES else 'missing_media'
+                                skipped[reason] = skipped.get(reason, 0) + 1
+                                continue
+                            relative_media = parts(media_path)
+                            if (len(relative_media) != 3
+                                    or relative_media[0] not in {'media', 'media-resume'}
+                                    or relative_media[1] != message_id):
+                                raise Refused('ASR_MEDIA_PATH_UNSAFE')
+                            if PurePosixPath(media_path).suffix.lower() not in ASR_AUDIO_EXTENSIONS:
+                                skipped['unsupported_format'] = skipped.get('unsupported_format', 0) + 1
+                                continue
+                            try:
+                                with descend(source_fd, relative_media[:-1]) as parent:
+                                    with open_input(parent, relative_media[-1]) as stream:
+                                        size = os.fstat(stream.fileno()).st_size
+                                        if not 0 < size <= ASR_MAX_MEDIA_BYTES:
+                                            reason = 'over_100_MiB' if size > ASR_MAX_MEDIA_BYTES else 'missing_media'
+                                            skipped[reason] = skipped.get(reason, 0) + 1
+                                            continue
+                                        if size > ASR_MAX_FILE_BYTES:
+                                            skipped['provider_file_limit'] = skipped.get('provider_file_limit', 0) + 1
+                                            continue
+                                        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                            except FileNotFoundError:
+                                skipped['missing_media'] = skipped.get('missing_media', 0) + 1
+                                continue
+                            if type(declared_size) is int and declared_size != size:
+                                raise Refused('ASR_MEDIA_SIZE_MISMATCH')
+                            declared_hash = media_export.get('sha256') if isinstance(media_export, dict) else None
+                            if isinstance(declared_hash, str) and declared_hash != digest:
+                                raise Refused('ASR_MEDIA_HASH_MISMATCH')
+                            external_ref = f'tg:{chat}:{message_id}'
+                            copies.append((relative_media, size, digest))
+                            eligible.append({
+                                'external_ref': external_ref,
+                                'message_id': message_id,
+                                'media_type': media_type.lower(),
+                                'media_path': media_path,
+                                'size_bytes': size,
+                                'sha256': digest,
+                            })
 
                     free = os.fstatvfs(source_fd)
                     required = sum(size for _path, size, _digest_value in copies)
@@ -957,13 +1261,30 @@ class Broker:
                         raise Refused('INSUFFICIENT_SPACE')
 
                     normalized_fd = stack.enter_context(descend(temp_fd, ['normalized']))
-                    filtered = ''.join(
-                        json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n'
-                        for record in normalized_records
-                    ).encode('utf-8')
-                    write_file(normalized_fd, '.asr-messages.jsonl', filtered)
+                    eligible_ids = {item['message_id'] for item in eligible}
+                    filtered_digest = hashlib.sha256()
+                    filtered_fd = os.open(
+                        '.asr-messages.jsonl', os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=normalized_fd,
+                    )
+                    try:
+                        with os.fdopen(filtered_fd, 'wb') as filtered_stream:
+                            for record in _iter_jsonl_input(normalized_fd, 'messages.jsonl'):
+                                if str(record.get('message_id', '')) not in eligible_ids:
+                                    continue
+                                encoded = (json.dumps(record, ensure_ascii=False,
+                                                      separators=(',', ':')) + '\n').encode('utf-8')
+                                filtered_stream.write(encoded)
+                                filtered_digest.update(encoded)
+                            filtered_stream.flush()
+                            os.fsync(filtered_stream.fileno())
+                    except BaseException:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink('.asr-messages.jsonl', dir_fd=normalized_fd)
+                        raise
                     os.rename('.asr-messages.jsonl', 'messages.jsonl',
                               src_dir_fd=normalized_fd, dst_dir_fd=normalized_fd)
+                    os.fsync(normalized_fd)
                     unpacked_fd = stack.enter_context(descend(temp_fd, ['unpacked'], create=True))
                     copy_media(source_fd, unpacked_fd, copies)
                     run_id = 'ka-' + input_fingerprint[:28]
@@ -972,7 +1293,7 @@ class Broker:
                         'source_id': source_id,
                         'input_fingerprint': input_fingerprint,
                         'run_id': run_id,
-                        'normalized_sha256': hashlib.sha256(filtered).hexdigest(),
+                        'normalized_sha256': filtered_digest.hexdigest(),
                         'files_total': total_audio,
                         'files_eligible': len(eligible),
                         'files_skipped': sum(skipped.values()),
@@ -980,10 +1301,10 @@ class Broker:
                         'files': eligible,
                     }
                     plan = _validated_asr_plan(plan, source_id, input_fingerprint)
-                    write_file(
-                        temp_fd, 'asr-plan.json',
-                        (json.dumps(plan, sort_keys=True, separators=(',', ':')) + '\n').encode(),
-                    )
+                    plan_data = (json.dumps(plan, sort_keys=True, separators=(',', ':')) + '\n').encode()
+                    if len(plan_data) > ASR_PLAN_MAX_BYTES:
+                        raise Refused('ASR_PLAN_TOO_LARGE')
+                    write_file(temp_fd, 'asr-plan.json', plan_data)
                     os.fsync(temp_fd)
                 os.rename(temporary, workspace_name, src_dir_fd=source_fd, dst_dir_fd=source_fd)
                 os.fsync(source_fd)
@@ -1300,11 +1621,12 @@ class Broker:
         if entry_override is None:
             entry, fingerprint, chat, topic = self.source(source_id)
         else:
-            topic_source = telegram_topic_source(source_id)
+            topic_source = telegram_export_source(source_id)
             if topic_source is None:
                 raise Refused('UNSUPPORTED_SOURCE')
             entry = entry_override
-            chat, topic = topic_source
+            chat, topic_value = topic_source
+            topic = telegram_scope_directory(topic_value)
             fingerprint = hashlib.sha256(
                 json.dumps(entry, sort_keys=True, separators=(',', ':')).encode()
             ).hexdigest()
@@ -1314,11 +1636,30 @@ class Broker:
                 since=since, limit=limit, dry_run=dry_run,
             )
         base_fingerprint = fingerprint
-        revision = media_revision(self.root, chat, topic) if operation == 'ingest' else ''
-        if revision:
+        revision = media_revision(self.root, chat, topic) if operation in {'ingest', 'embed'} else ''
+        if operation == 'ingest' and revision:
             fingerprint = hashlib.sha256((fingerprint + revision).encode()).hexdigest()
         if operation == 'ingest' and dry_run:
             fingerprint = f'{fingerprint}:dry-run'
+        ingest = None
+        embed_job_id = None
+        if operation == 'embed':
+            ingest_fingerprint = (
+                hashlib.sha256((base_fingerprint + revision).encode()).hexdigest()
+                if revision else base_fingerprint
+            )
+            ingest = self.db.execute(
+                "SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? "
+                "AND operation='ingest'",
+                (owner, source_id, ingest_fingerprint),
+            ).fetchone()
+            if ingest is None or self.status(ingest)['status'] != 'done':
+                raise Refused('INGEST_REQUIRED')
+            # Bind this embed request to the completed ingest revision before
+            # looking for an idempotent embed request. A later ingest therefore
+            # cannot accidentally reuse an older embed job.
+            embed_job_id = self.dispatch(ingest)['job_id']
+            fingerprint = f'{base_fingerprint}:ingest:{ingest["id"]}'
         relevant = self.db.execute(
             """SELECT r.*, coalesce(e.base_fingerprint,r.fingerprint) AS source_fingerprint
                FROM requests r LEFT JOIN embed_renewals e ON e.request_id=r.id
@@ -1326,7 +1667,10 @@ class Broker:
             (owner, source_id, operation),
         ).fetchall()
         for row in relevant:
-            if row['source_fingerprint'] == fingerprint:
+            revision_matches = row['source_fingerprint'] == fingerprint
+            if operation == 'embed' and not revision_matches:
+                revision_matches = self._embed_row_matches_revision(row, fingerprint)
+            if revision_matches:
                 if operation == 'ingest':
                     bound_attempt = self.db.execute(
                         'SELECT 1 FROM attempts WHERE request_id=? AND attempt=?',
@@ -1350,14 +1694,9 @@ class Broker:
             if dry_run:
                 argv.append('--dry-run')
         else:
-            resume_hash = media_revision(self.root, chat, topic)
-            ingest_key = hashlib.sha256((fingerprint + resume_hash).encode()).hexdigest() if resume_hash else fingerprint
-            ingest = self.db.execute('SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
-                                     (owner, source_id, ingest_key, 'ingest')).fetchone()
-            if ingest is None or self.status(ingest)['status'] != 'done':
+            if operation != 'embed' or ingest is None or embed_job_id is None:
                 raise Refused('INGEST_REQUIRED')
-            job_id = self.dispatch(ingest)['job_id']
-            argv = ['embed', '--job', str(self.root / 'jobs' / job_id / 'telegram-ingest'),
+            argv = ['embed', '--job', str(self.root / 'jobs' / embed_job_id / 'telegram-ingest'),
                     '--project', entry['project']]
         now = timestamp()
         request_id = str(uuid.uuid4())
@@ -1505,7 +1844,7 @@ class Broker:
 
     def managed_ingest(self, owner, source_id, project, *, since=None, limit=None, dry_run=False):
         entry, fingerprint, _parsed = self._managed_source_entry(owner, source_id, project)
-        is_telegram = telegram_topic_source(source_id) is not None
+        is_telegram = telegram_export_source(source_id) is not None
         if since is not None:
             if (not isinstance(since, str) or len(since) > 40
                     or any(ord(char) < 32 or ord(char) == 127 for char in since)):
@@ -1540,7 +1879,7 @@ class Broker:
 
     def managed_embed(self, owner, source_id, project):
         entry, fingerprint, _parsed = self._managed_source_entry(owner, source_id, project)
-        if telegram_topic_source(source_id) is not None:
+        if telegram_export_source(source_id) is not None:
             return self.start(owner, 'embed', source_id, entry_override=entry)
         return self.start_external(owner, 'embed', source_id, entry, fingerprint)
 
@@ -1669,7 +2008,7 @@ class Broker:
         if entry_override is None:
             entry, _source_fingerprint, _chat, _topic = self.source(source_id)
         else:
-            if parse_source_id(source_id) is None and telegram_topic_source(source_id) is None:
+            if parse_source_id(source_id) is None and telegram_export_source(source_id) is None:
                 raise Refused('UNSUPPORTED_SOURCE')
             entry = entry_override
         if not isinstance(query, str) or not query.strip() or len(query) > SEARCH_MAX_QUERY_CHARS:
@@ -1690,10 +2029,11 @@ class Broker:
         except JobsError:
             raise Refused('WORKER_UNAVAILABLE') from None
         external = parse_source_id(source_id) is not None
+        telegram_scope = telegram_export_source(source_id) if not external else None
         if external:
             if not overview.get('threads'):
                 raise Refused('SOURCE_NOT_FOUND')
-        elif overview.get('documents') != 1:
+        elif not isinstance(overview.get('documents'), int) or overview['documents'] < 1:
             raise Refused('SOURCE_NOT_FOUND')
         normalized = query.strip()
         fingerprint = search_fingerprint(source_id, entry['project'], normalized, limit)
@@ -1743,7 +2083,13 @@ class Broker:
                     raise Refused('SEARCH_RESULT_INVALID')
                 rows = []
                 for item in result['results'][:limit]:
-                    if not isinstance(item, dict) or item.get('source_id') != source_id:
+                    item_source = item.get('source_id') if isinstance(item, dict) else None
+                    source_matches = item_source == source_id
+                    if (not source_matches and telegram_scope is not None
+                            and telegram_scope[1] is None):
+                        result_scope = telegram_export_source(item_source)
+                        source_matches = result_scope is not None and result_scope[0] == telegram_scope[0]
+                    if not isinstance(item, dict) or not source_matches:
                         raise Refused('SEARCH_RESULT_INVALID')
                     text = item.get('text')
                     if not isinstance(text, str):
@@ -1849,12 +2195,19 @@ class Broker:
         if not 1 <= limit <= SEARCH_MAX_LIMIT:
             raise Refused('SEARCH_RESULT_INVALID')
         expected_source = row['source'] if row['operation'] == 'search' else None
+        expected_scope = telegram_export_source(expected_source) if expected_source else None
         safe_results = []
         for item in result['results'][:limit]:
             if not isinstance(item, dict):
                 raise Refused('SEARCH_RESULT_INVALID')
-            if expected_source is not None and item.get('source_id') != expected_source:
-                raise Refused('SEARCH_RESULT_INVALID')
+            if expected_source is not None:
+                item_source = item.get('source_id')
+                source_matches = item_source == expected_source
+                if not source_matches and expected_scope is not None and expected_scope[1] is None:
+                    result_scope = telegram_export_source(item_source)
+                    source_matches = result_scope is not None and result_scope[0] == expected_scope[0]
+                if not source_matches:
+                    raise Refused('SEARCH_RESULT_INVALID')
             safe_item = {key: item.get(key) for key in (
                 'source_id', 'chat_id', 'chat_title', 'topic_id', 'topic_title',
                 'message_id', 'author', 'score', 'thread_ref', 'item_ref',
@@ -2022,12 +2375,43 @@ class Broker:
             fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             stack.callback(os.close, fd)
             source = stack.enter_context(descend(fd, ['imports', chat, topic]))
-            controls = {name: read_input(source, name) for name in CONTROLS}
-            hashes = {name: hashlib.sha256(data).hexdigest() for name, data in controls.items()}
+            manifest_bytes = read_input(source, 'manifest.json', 4 * 1024**2)
+            manifest = json.loads(manifest_bytes)
+            hashes = {'manifest.json': hashlib.sha256(manifest_bytes).hexdigest()}
+            message_size, hashes['messages.jsonl'] = _hash_input(
+                source, 'messages.jsonl', CONTROL_FILE_MAX_BYTES,
+            )
+            service_size, hashes['services.jsonl'] = _hash_input(
+                source, 'services.jsonl', CONTROL_FILE_MAX_BYTES,
+            )
+            _services_manifest_size, services_manifest_sha = _hash_input(
+                source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES,
+            )
+            try:
+                services_manifest = json.loads(read_input(
+                    source, 'services_manifest.json', SERVICES_MANIFEST_MAX_BYTES,
+                ))
+            except (OSError, ValueError, UnicodeError):
+                raise Refused('SERVICES_MANIFEST_INVALID') from None
             if hashes != entry['hashes']:
                 raise Refused('HASH_MISMATCH')
-            source_rows = list(map(json.loads, controls['messages.jsonl'].splitlines()))
-            downloads = media_items(controls['messages.jsonl'])
+            if (not isinstance(services_manifest, dict)
+                    or services_manifest.get('source_id') != source_id
+                    or services_manifest.get('services_sha256') != hashes['services.jsonl']
+                    or type(services_manifest.get('event_count')) is not int
+                    or services_manifest['event_count'] < 0):
+                raise Refused('SERVICES_MANIFEST_INVALID')
+            manifest_limit = _manifest_media_limit(manifest_bytes)
+            downloaded_count = 0
+            with open_input(source, 'messages.jsonl') as stream:
+                for rel, size, digest in media_items(stream, manifest_limit):
+                    downloaded_count += 1
+                    if command == 'reindex':
+                        with descend(source, rel[:-1]) as parent:
+                            with open_input(parent, rel[-1]) as media_stream:
+                                if (os.fstat(media_stream.fileno()).st_size != size
+                                        or hashlib.file_digest(media_stream, 'sha256').hexdigest() != digest):
+                                    raise Refused('DATA_MISMATCH')
             recovered = {}
             resume_hash = None
             try:
@@ -2035,37 +2419,75 @@ class Broker:
             except FileNotFoundError:
                 resume = None
             if resume is not None:
-                checkpoint = read_input(resume, 'status.json', 4 * 1024**2)
+                resume_hashes = dict(hashes)
+                resume_hashes['services_manifest.json'] = services_manifest_sha
+                try:
+                    checkpoint = read_input(resume, 'status.json', 4 * 1024**2)
+                except OSError:
+                    raise Refused('MEDIA_CHECKPOINT_INVALID') from None
                 resume_hash = hashlib.sha256(checkpoint).hexdigest()
-                recovered = resumed_photos(checkpoint, hashes, source_rows)
-            missing = set()
-            over = set()
-            for row in source_rows:
+                try:
+                    recovered = resumed_photos(
+                        checkpoint, resume_hashes, _iter_jsonl_input(source, 'messages.jsonl'),
+                    )
+                except LoadError:
+                    raise Refused('MEDIA_CHECKPOINT_MISMATCH') from None
+            missing_count = 0
+            missing_ids = []
+            over_limit_count = 0
+            over_limit_ids = []
+            over_100_mib_count = 0
+            over_100_mib_ids = []
+            message_count = 0
+            for row in _iter_jsonl_input(source, 'messages.jsonl'):
+                message_count += 1
+                if message_count > manifest.get('message_count', 0):
+                    raise Refused('DATA_MISMATCH')
                 media = row.get('media')
-                if not media:
+                if media is None:
                     continue
+                if not isinstance(media, dict):
+                    raise Refused('DATA_MISMATCH')
                 mid = row['message_id']
+                if media.get('reason') in {'over_100_MiB', 'over_limit'}:
+                    over_limit_count += 1
+                    if len(over_limit_ids) < 1000:
+                        over_limit_ids.append(mid)
                 if media.get('reason') == 'over_100_MiB':
-                    over.add(mid)
+                    over_100_mib_count += 1
+                    if len(over_100_mib_ids) < 1000:
+                        over_100_mib_ids.append(mid)
                 if mid not in recovered and media.get('path') is None:
-                    missing.add(mid)
-            verify_hashes = command == 'reindex'
-            for group, root in (
-                (downloads, source),
-                ([(parts(r['path'])[1:], r['size'], r['sha256']) for r in recovered.values()], resume),
-            ):
-                for rel, size, digest in group:
-                    with descend(root, rel[:-1]) as parent:
-                        with open_input(parent, rel[-1]) as stream:
-                            if os.fstat(stream.fileno()).st_size != size or (
-                                verify_hashes and hashlib.file_digest(stream, 'sha256').hexdigest() != digest
-                            ):
-                                raise Refused('DATA_MISMATCH')
-        media = {'total': len(downloads) + len(recovered) + len(missing),
-                 'recovered': len(recovered), 'missing': len(missing), 'over_100_MiB': len(over),
-                 'missing_message_ids': sorted(missing)[:1000],
-                 'over_100_MiB_message_ids': sorted(over)[:1000],
-                 'message_ids_truncated': max(len(missing), len(over)) > 1000}
+                    missing_count += 1
+                    if len(missing_ids) < 1000:
+                        missing_ids.append(mid)
+            if message_count != manifest.get('message_count'):
+                raise Refused('DATA_MISMATCH')
+            if command == 'reindex' and resume is not None:
+                for receipt in recovered.values():
+                    try:
+                        rel = parts(receipt['path'])
+                    except Refused:
+                        raise Refused('MEDIA_CHECKPOINT_MISMATCH') from None
+                    if (len(rel) != 3 or rel[0] not in {'media', 'media-resume'}):
+                        raise Refused('MEDIA_CHECKPOINT_MISMATCH')
+                    media_root = source if rel[0] == 'media' else resume
+                    media_dirs = rel[:-1] if rel[0] == 'media' else rel[1:-1]
+                    try:
+                        with descend(media_root, media_dirs) as parent:
+                            size, digest = _hash_input(parent, rel[-1], receipt['size'])
+                    except OSError:
+                        raise Refused('DATA_MISMATCH') from None
+                    if size != receipt['size'] or digest != receipt['sha256']:
+                        raise Refused('DATA_MISMATCH')
+            service_count = sum(1 for _ in _iter_jsonl_input(source, 'services.jsonl'))
+        media = {'total': downloaded_count + len(recovered) + missing_count,
+                 'recovered': len(recovered), 'missing': missing_count,
+                 'over_100_MiB': over_100_mib_count, 'over_limit': over_limit_count,
+                 'missing_message_ids': missing_ids,
+                 'over_100_MiB_message_ids': over_100_mib_ids,
+                 'over_limit_message_ids': over_limit_ids,
+                 'message_ids_truncated': max(missing_count, over_limit_count) > 1000}
         if command == 'media-status':
             return {'source_id': source_id, **media}
         db = self.worker_api('source-overview', source_id=source_id, project=entry['project'])
@@ -2085,20 +2507,20 @@ class Broker:
                 by_operation[row['operation']] = {
                     'request_id': row['id'], 'status': self.status(row)['status'],
                 }
-        export = {'complete': json.loads(controls['manifest.json']).get('complete') is True,
-                  'messages': len(source_rows),
-                  'service_events': len(controls['services.jsonl'].splitlines()),
-                  'sha256': hashes}
+        export = {'complete': manifest.get('complete') is True,
+                  'messages': message_count,
+                  'service_events': service_count,
+                  'sha256': {**hashes, 'services_manifest.json': services_manifest_sha}}
         result = {'source_id': source_id, 'export': export, 'media': media,
                   'staging': {'checked': True, 'media_resume_sha256': resume_hash},
                   'ingest': by_operation.get('ingest'), 'embed': by_operation.get('embed'),
-                  'counts': db, 'media_missing': len(missing)}
+                  'counts': db, 'media_missing': missing_count}
         if command == 'reindex':
             result['integrity'] = {
-                'media_sha256_verified': len(downloads) + len(recovered),
+                'media_sha256_verified': downloaded_count + len(recovered),
                 'messages_match': export['messages'] == db['messages'] == db['unique_messages'],
                 'service_events_match': export['service_events'] == db['service_events'],
-                'ingested_media_match': db['messages_with_media'] == len(downloads) + len(recovered),
+                'ingested_media_match': db['messages_with_media'] == downloaded_count + len(recovered),
             }
         return result
 
@@ -2398,7 +2820,7 @@ class Broker:
             parsed_source = parse_source_id(row['source'])
             source_kind = (
                 parsed_source.provider if parsed_source is not None
-                else 'telegram' if telegram_topic_source(row['source']) is not None
+                else 'telegram' if telegram_export_source(row['source']) is not None
                 else None
             )
             if (not isinstance(argv, list) or len(argv) != 11 or argv[0] != 'search'

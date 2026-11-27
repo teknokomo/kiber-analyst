@@ -350,6 +350,71 @@ def test_telegram_prepared_export_has_hash_checked_dry_run_and_ingest(control, t
             for path in export_dir.iterdir() if path.is_file()} == before
 
 
+def test_large_telegram_media_is_registered_staged_and_ingest_ready(control, tmp_path):
+    app, _projects, _jobs, submitted, _api_calls = control
+    export_dir = _telegram_export(tmp_path)
+    media_size = broker.ASR_MAX_MEDIA_BYTES + 1
+    media_path = export_dir / "media" / "1" / "synthetic-video.bin"
+    media_path.parent.mkdir(mode=0o700, parents=True)
+    media_path.parent.parent.chmod(0o700)
+    media_path.parent.chmod(0o700)
+    fd = broker.os.open(media_path, broker.os.O_WRONLY | broker.os.O_CREAT | broker.os.O_EXCL, 0o600)
+    try:
+        broker.os.ftruncate(fd, media_size)
+    finally:
+        broker.os.close(fd)
+    digest = hashlib.sha256()
+    block = bytes(1024 * 1024)
+    for _ in range(media_size // len(block)):
+        digest.update(block)
+    digest.update(bytes(media_size % len(block)))
+
+    message = {
+        "chat_id": -1009000, "message_id": 1, "topic_id": 1,
+        "date": "2026-01-01T00:00:00Z", "text": "large synthetic attachment",
+        "sender_id": 12, "sender_name": "Fixture",
+        "media": {
+            "type": "video", "path": "media/1/synthetic-video.bin",
+            "size": media_size, "size_bytes": media_size,
+            "max_file_bytes": 4_000_000_000, "sha256": digest.hexdigest(),
+            "export_status": "downloaded",
+        },
+    }
+    message_bytes = (json.dumps(message, separators=(",", ":")) + "\n").encode()
+    (export_dir / "messages.jsonl").write_bytes(message_bytes)
+    (export_dir / "messages.jsonl").chmod(0o600)
+    manifest_path = export_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update({
+        "messages_sha256": hashlib.sha256(message_bytes).hexdigest(),
+        "max_file_bytes": 4_000_000_000,
+        "media_requested": True,
+    })
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    manifest_path.chmod(0o600)
+
+    registered = app.handle("client", "source-add", TELEGRAM_SOURCE, PROJECT)
+    assert registered["registered"] is True
+    request = app.handle("client", "ingest", TELEGRAM_SOURCE, PROJECT)
+    staged = Path(submitted[-1][1][3])
+    staged_file = staged / "media" / "1" / "synthetic-video.bin"
+
+    assert app.handle("client", "job-status", request["request_id"])["status"] == "queued"
+    assert staged_file.stat().st_size == media_size
+    with staged_file.open("rb") as stream:
+        assert hashlib.file_digest(stream, "sha256").hexdigest() == digest.hexdigest()
+
+    from kiber_analyst.telegram_ingest import prepare_export
+
+    artifact, _export, media_missing = prepare_export(
+        staged, tmp_path / "large-media-artifact", root=app.root / "imports",
+    )
+    normalized = json.loads((artifact / "normalized" / "messages.jsonl").read_text().splitlines()[0])
+    assert media_missing == 0
+    assert normalized["media_path"] == "media/1/synthetic-video.bin"
+    assert normalized["meta"]["media_export"]["size"] == media_size
+    assert normalized["meta"]["media_export"]["max_file_bytes"] == 4_000_000_000
+
 def test_telegram_source_add_rejects_symlinked_export(control, tmp_path):
     app, _projects, _jobs, _submitted, _api_calls = control
     target = tmp_path / "elsewhere"
@@ -374,13 +439,13 @@ def test_revoked_project_hides_status_and_cancels_and_job_list(control):
     assert jobs[request["job_id"]]["state"] == "queued"
 
 
-def test_capabilities_do_not_claim_kiber_controls_telegram_export(control):
+def test_capabilities_report_group_and_topic_export_scopes(control):
     app, *_ = control
     telegram = app.handle("client", "capabilities")["providers"]["telegram"]
     assert telegram["export"]["available_via_separate_interface"] is True
     assert telegram["export"]["invoked_by_kiber_broker"] is False
     assert "register_complete_topic_export" in telegram["operations"]
-    assert telegram["scopes"] == {"topic": True, "group": False}
+    assert telegram["scopes"] == {"topic": True, "group": True}
 
 
 def test_static_source_does_not_grant_project_wide_access(control):
@@ -930,6 +995,48 @@ def test_search_result_retrieves_completed_project_and_source_searches(
     assert source_result["status"] == "done"
     assert source_result["source_id"] == TELEGRAM_SOURCE
     assert source_result["degraded_reason"] == "quota"
+
+
+def test_group_search_result_accepts_topics_in_same_chat(control, monkeypatch):
+    app, _projects, jobs, _submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    group_source = "telegram:-1009000:group"
+    topic_source = "telegram:-1009000:topic:456"
+    app.sources[group_source] = {"project": PROJECT, "hashes": {}}
+    pending = app.handle("client", "search", group_source, "forum query", "1")
+    assert pending["error_code"] == "SEARCH_PENDING"
+    jobs[pending["job_id"]].update(
+        state="done", result={
+            "mode": "fts", "degraded": False, "degraded_reason": None,
+            "results": [{"source_id": topic_source, "chat_id": "-1009000",
+                         "topic_id": "456", "message_id": "42", "text": "safe result"}],
+        },
+    )
+
+    result = app.handle("client", "search-result", pending["request_id"])
+
+    assert result["status"] == "done"
+    assert result["source_id"] == group_source
+    assert result["results"][0]["source_id"] == topic_source
+    assert result["results"][0]["topic_id"] == "456"
+
+
+def test_group_search_result_rejects_topic_from_another_chat(control, monkeypatch):
+    app, _projects, jobs, _submitted, _api_calls = control
+    monkeypatch.setattr(broker, "SEARCH_WAIT_SECONDS", 0)
+    group_source = "telegram:-1009000:group"
+    app.sources[group_source] = {"project": PROJECT, "hashes": {}}
+    pending = app.handle("client", "search", group_source, "forum query", "1")
+    jobs[pending["job_id"]].update(
+        state="done", result={
+            "mode": "fts", "degraded": False, "degraded_reason": None,
+            "results": [{"source_id": "telegram:-1009001:topic:456",
+                         "message_id": "42", "text": "foreign result"}],
+        },
+    )
+
+    with pytest.raises(broker.Refused, match="SEARCH_RESULT_INVALID"):
+        app.handle("client", "search-result", pending["request_id"])
 
 
 def test_source_search_skips_status_lookup_for_known_terminal_requests(
