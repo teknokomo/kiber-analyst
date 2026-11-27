@@ -991,6 +991,426 @@ def test_publisher_recovers_old_revision_before_publishing_new_resume(
     assert repeated["recovery_cleanup"]["removed_artifacts"] == 0
 
 
+def test_publisher_recovers_empty_candidate_after_cleanup_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    parent = stage.parent
+    source_id = result["source_id"]
+    transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    source_hashes = transfer["source_hashes"]
+    old_media_sha = hashlib.sha256(b"interrupted-cleanup-revision").hexdigest()
+    candidate_name = telegram_publisher._transfer_candidate_name(
+        source_id, source_hashes, old_media_sha,
+    )
+    candidate = parent / candidate_name
+    candidate.mkdir(mode=0o700)
+    marker = {
+        "source_id": source_id, "source_hashes": source_hashes,
+        "media_manifest_sha256": old_media_sha,
+    }
+    (candidate / ".publisher-temp.json").write_text(
+        json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    (candidate / ".publisher-temp.json").chmod(0o600)
+    (candidate / "messages.jsonl").write_bytes(b"partial-candidate")
+    (candidate / "messages.jsonl").chmod(0o600)
+
+    candidate_info = candidate.stat()
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent_info = os.fstat(parent_fd)
+    real_rmdir = os.rmdir
+    interrupted = False
+
+    def interrupt_final_rmdir(name, *, dir_fd=None):
+        nonlocal interrupted
+        if (not interrupted and dir_fd is not None and name == candidate_name
+                and (os.fstat(dir_fd).st_dev, os.fstat(dir_fd).st_ino)
+                == (parent_info.st_dev, parent_info.st_ino)):
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) == (candidate_info.st_dev, candidate_info.st_ino):
+                interrupted = True
+                raise OSError(errno.EIO, "synthetic crash after candidate contents removed")
+        return real_rmdir(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(telegram_publisher.os, "rmdir", interrupt_final_rmdir)
+    with pytest.raises(telegram_publisher.TransferError, match="TRANSFER_RECOVERY_REQUIRED"):
+        telegram_publisher.handle(
+            "copy", source_id, config_path=str(result["publisher_config"]),
+        )
+    assert interrupted
+    assert candidate.is_dir()
+    assert list(candidate.iterdir()) == []
+    assert stage.is_dir()
+
+    monkeypatch.setattr(telegram_publisher.os, "rmdir", real_rmdir)
+    recovered = telegram_publisher.handle(
+        "copy", source_id, config_path=str(result["publisher_config"]),
+    )
+    os.close(parent_fd)
+    assert recovered["status"] == "already_ready"
+    assert not candidate.exists()
+    assert stage.is_dir()
+
+
+def test_publisher_preserves_incomplete_candidate_with_marker_intent_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    parent = stage.parent
+    source_id = result["source_id"]
+    transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    source_hashes = transfer["source_hashes"]
+    candidate_name = telegram_publisher._transfer_candidate_name(
+        source_id, source_hashes, None,
+    )
+    init_name = ".publisher-init-" + uuid.uuid4().hex
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    telegram_publisher._write_init_intent(
+        parent_fd, init_name, uid=os.geteuid(), gid=os.getegid(),
+        source_id=source_id, source_hashes=source_hashes,
+        media_manifest_sha=None,
+    )
+    os.close(parent_fd)
+
+    candidate = parent / candidate_name
+    candidate.mkdir(mode=0o700)
+    conflicting_hashes = dict(source_hashes)
+    conflicting_hashes["messages.jsonl"] = "0" * 64
+    conflicting_marker = {
+        "source_id": source_id, "source_hashes": conflicting_hashes,
+        "media_manifest_sha256": None,
+    }
+    marker_path = candidate / ".publisher-temp.json"
+    marker_path.write_text(json.dumps(conflicting_marker, sort_keys=True) + "\n")
+    marker_path.chmod(0o600)
+    payload_path = candidate / "messages.jsonl"
+    payload_path.write_bytes(b"do-not-delete-uncertain-candidate")
+    payload_path.chmod(0o600)
+    marker_before = marker_path.read_bytes()
+    payload_before = payload_path.read_bytes()
+    ready_before = (stage / "telegram_transfer_manifest.json").read_bytes()
+
+    with pytest.raises(telegram_publisher.TransferError, match="TRANSFER_RECOVERY_REQUIRED"):
+        telegram_publisher.handle(
+            "copy", source_id, config_path=str(result["publisher_config"]),
+        )
+
+    assert marker_path.read_bytes() == marker_before
+    assert payload_path.read_bytes() == payload_before
+    assert (parent / f"{init_name}.json").is_file()
+    assert (stage / "telegram_transfer_manifest.json").read_bytes() == ready_before
+
+
+def test_publisher_other_scope_candidate_does_not_block_current_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    source_id = result["source_id"]
+    source_hashes = json.loads((stage / "telegram_transfer_manifest.json").read_text())[
+        "source_hashes"
+    ]
+    other_source = source_id.rsplit(":", 1)[0] + ":topic:987"
+    other_media_sha = hashlib.sha256(b"other-scope-revision").hexdigest()
+    other_name = telegram_publisher._transfer_candidate_name(
+        other_source, source_hashes, other_media_sha,
+    )
+    other_dir = stage.parent / other_name
+    other_dir.mkdir(mode=0o700)
+    other_marker = {
+        "source_id": other_source, "source_hashes": source_hashes,
+        "media_manifest_sha256": other_media_sha,
+    }
+    (other_dir / ".publisher-temp.json").write_text(
+        json.dumps(other_marker, sort_keys=True) + "\n",
+    )
+    (other_dir / ".publisher-temp.json").chmod(0o600)
+    other_payload = other_dir / "messages.jsonl"
+    other_payload.write_bytes(b"keep-candidate-from-another-scope")
+    other_payload.chmod(0o600)
+    other_bytes_before = other_payload.read_bytes()
+
+    new_media_sha = _add_empty_media_resume_revision(result["export_dir"], source_id)
+    published = telegram_publisher.handle(
+        "copy", source_id, config_path=str(result["publisher_config"]),
+    )
+
+    assert published["status"] == "ready"
+    assert json.loads((stage / "telegram_transfer_manifest.json").read_text())[
+        "media_manifest_sha256"
+    ] == new_media_sha
+    assert other_payload.read_bytes() == other_bytes_before
+    assert other_dir.is_dir()
+    assert published["recovery_cleanup"]["preserved"]["other_source_candidate"] == 1
+
+
+def test_publisher_complete_candidate_with_marker_for_current_revision_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    source_id = result["source_id"]
+    candidate_name = telegram_publisher._transfer_candidate_name(
+        source_id, transfer["source_hashes"], transfer["media_manifest_sha256"],
+    )
+    candidate = stage.parent / candidate_name
+    shutil.copytree(stage, candidate)
+    marker = {
+        "source_id": source_id, "source_hashes": transfer["source_hashes"],
+        "media_manifest_sha256": transfer["media_manifest_sha256"],
+    }
+    marker_path = candidate / ".publisher-temp.json"
+    marker_path.write_text(json.dumps(marker, sort_keys=True) + "\n")
+    marker_path.chmod(0o600)
+    ready_before = (stage / "telegram_transfer_manifest.json").read_bytes()
+    candidate_snapshot = {
+        str(path.relative_to(candidate)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in candidate.rglob("*")
+        if path.is_file() and path.name != ".publisher-temp.json"
+    }
+
+    recovered = telegram_publisher.handle(
+        "copy", source_id, config_path=str(result["publisher_config"]),
+    )
+
+    assert recovered["status"] == "already_ready"
+    assert not candidate.exists()
+    assert (stage / "telegram_transfer_manifest.json").is_file()
+    assert not (stage / ".publisher-temp.json").exists()
+    assert (stage / "telegram_transfer_manifest.json").read_bytes() == ready_before
+    assert {
+        str(path.relative_to(stage)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in stage.rglob("*") if path.is_file()
+    } == candidate_snapshot
+    recovery_archives = list((stage.parent / ".revisions").glob("recovery-*"))
+    assert len(recovery_archives) == 1
+    revisions_fd = os.open(
+        stage.parent / ".revisions", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        archived_record, archived_sha = telegram_publisher._transfer_record(
+            revisions_fd, recovery_archives[0].name, uid=os.geteuid(),
+        )
+    finally:
+        os.close(revisions_fd)
+    assert archived_record == transfer
+    assert archived_sha == hashlib.sha256(ready_before).hexdigest()
+
+
+def test_publisher_valid_unmarked_candidate_from_other_topic_does_not_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    source_id = result["source_id"]
+    other_source = source_id.rsplit(":", 1)[0] + ":topic:17"
+    topic_id = 17
+    export_root = result["export_dir"].parent.parent
+    export_config = json.loads((result["publisher_config"].parent / "export.json").read_text())
+    client = _ScopeTelegram(chat=result["chat"], scope="topic", forum=True, count=1)
+    export_root_fd = Dir.root(str(export_root))
+    try:
+        topic_manifest = export(
+            export_root_fd, export_config,
+            ["export", result["chat"], str(topic_id), "MEDIA", "100", "100MiB"],
+            client=client,
+        )
+        services_manifest = export_services(
+            export_root_fd, export_config, result["chat"], topic_id, 100, None,
+            client=client,
+        )
+        assert topic_manifest["complete"] and services_manifest["complete"]
+    finally:
+        export_root_fd.close()
+    topic_stage = result["imports_root"] / result["chat"] / str(topic_id)
+    topic_publish = telegram_publisher.handle(
+        "copy", other_source, config_path=str(result["publisher_config"]),
+    )
+    assert topic_publish["status"] == "ready"
+    topic_transfer = json.loads((topic_stage / "telegram_transfer_manifest.json").read_text())
+    other_candidate_name = telegram_publisher._transfer_candidate_name(
+        other_source, topic_transfer["source_hashes"], topic_transfer["media_manifest_sha256"],
+    )
+    other_candidate = stage.parent / other_candidate_name
+    os.rename(topic_stage, other_candidate)
+    assert not (other_candidate / ".publisher-temp.json").exists()
+
+    parent_fd = os.open(stage.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        other_status = telegram_publisher._staged_status(
+            parent_fd, other_candidate_name, other_source, dest_uid=os.geteuid(),
+        )
+    finally:
+        os.close(parent_fd)
+    assert other_status and other_status["status"] == "ready"
+    transfer_path = other_candidate / "telegram_transfer_manifest.json"
+    message_path = other_candidate / "messages.jsonl"
+    other_transfer_before = transfer_path.read_bytes()
+    other_messages_before = message_path.read_bytes()
+
+    new_media_sha = _add_empty_media_resume_revision(result["export_dir"], source_id)
+    published = telegram_publisher.handle(
+        "copy", source_id, config_path=str(result["publisher_config"]),
+    )
+
+    assert published["status"] == "ready"
+    assert json.loads((stage / "telegram_transfer_manifest.json").read_text())[
+        "media_manifest_sha256"
+    ] == new_media_sha
+    assert transfer_path.read_bytes() == other_transfer_before
+    assert message_path.read_bytes() == other_messages_before
+    assert other_candidate.is_dir()
+    assert published["recovery_cleanup"]["preserved"]["other_source_candidate"] == 1
+
+
+def test_publisher_fsyncs_media_parent_after_creating_message_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source_media_item = source / "media" / "101"
+    source_media_item.mkdir(mode=0o700, parents=True)
+    source.chmod(0o700)
+    (source / "media").chmod(0o700)
+    source_media_item.chmod(0o700)
+    payload = b"media-parent-durability"
+    media_file = source_media_item / "attachment.bin"
+    media_file.write_bytes(payload)
+    media_file.chmod(0o600)
+    receipt = {
+        "name": "attachment.bin", "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    (source_media_item / "receipt.json").write_text(json.dumps(receipt) + "\n")
+    (source_media_item / "receipt.json").chmod(0o600)
+    destination = tmp_path / "candidate"
+    destination.mkdir(mode=0o700)
+    destination.chmod(0o700)
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    destination_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    media_info = None
+    synced_media_parent = False
+    original_open_child = telegram_publisher._open_child
+    original_fsync = os.fsync
+
+    def capture_media_parent(parent, name, **kwargs):
+        nonlocal media_info
+        fd = original_open_child(parent, name, **kwargs)
+        if name == "media":
+            info = os.fstat(fd)
+            media_info = (info.st_dev, info.st_ino)
+        return fd
+
+    def record_media_parent_fsync(fd):
+        nonlocal synced_media_parent
+        info = os.fstat(fd)
+        if media_info == (info.st_dev, info.st_ino):
+            synced_media_parent = True
+        return original_fsync(fd)
+
+    monkeypatch.setattr(telegram_publisher, "_open_child", capture_media_parent)
+    monkeypatch.setattr(telegram_publisher.os, "fsync", record_media_parent_fsync)
+    try:
+        staged_path, size, digest = telegram_publisher._copy_media_reference(
+            source_fd, destination_fd,
+            {
+                "path": "media/101/attachment.bin", "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(), "max_file_bytes": 1024,
+            },
+            101, source_uid=os.geteuid(), dest_uid=os.geteuid(),
+            dest_gid=os.getegid(), max_file_bytes=1024,
+        )
+        assert staged_path == "media/101/attachment.bin"
+        assert (size, digest) == (len(payload), hashlib.sha256(payload).hexdigest())
+        assert (destination / "media" / "101" / "attachment.bin").read_bytes() == payload
+        assert synced_media_parent, "media directory entry for the message must be fsynced"
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+
+
+def test_publisher_resyncs_revision_archive_before_already_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    parent = stage.parent
+    old_bytes = (stage / "telegram_transfer_manifest.json").read_bytes()
+    old_sha = hashlib.sha256(old_bytes).hexdigest()
+    old_revision = parent / ".revisions" / f"revision-{old_sha}"
+    new_media_sha = _add_empty_media_resume_revision(result["export_dir"], result["source_id"])
+    real_fsync = os.fsync
+    fail_revision_sync = True
+
+    def fail_archive_sync_once(fd):
+        nonlocal fail_revision_sync
+        if os.path.realpath(f"/proc/self/fd/{fd}") == str(parent / ".revisions"):
+            if fail_revision_sync:
+                fail_revision_sync = False
+                raise OSError(errno.EIO, "synthetic revision directory fsync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(telegram_publisher.os, "fsync", fail_archive_sync_once)
+    with pytest.raises((OSError, telegram_publisher.TransferError)):
+        telegram_publisher.handle(
+            "copy", result["source_id"], config_path=str(result["publisher_config"]),
+        )
+    assert not fail_revision_sync
+    assert (stage / "telegram_transfer_manifest.json").is_file()
+    assert old_revision.is_dir()
+    assert json.loads((stage / "telegram_transfer_manifest.json").read_text())[
+        "media_manifest_sha256"
+    ] == new_media_sha
+
+    revision_syncs = []
+
+    def record_archive_sync(fd):
+        if os.path.realpath(f"/proc/self/fd/{fd}") == str(parent / ".revisions"):
+            revision_syncs.append(True)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(telegram_publisher.os, "fsync", record_archive_sync)
+    retry = telegram_publisher.handle(
+        "copy", result["source_id"], config_path=str(result["publisher_config"]),
+    )
+    assert retry["status"] == "already_ready"
+    assert revision_syncs
+    assert old_revision.is_dir()
+
+
 @pytest.mark.parametrize("scenario", ["orphan_marker", "init_intent", "current_temp"])
 @pytest.mark.parametrize("failure", ["eio", "access"])
 @pytest.mark.parametrize("failure_point", ["transfer_manifest", "temp_marker"])

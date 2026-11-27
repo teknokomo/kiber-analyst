@@ -248,6 +248,155 @@ def test_telegram_import_load_and_repeat_are_idempotent_in_test_database(
         ).fetchone()[0] == 1
 
 
+@pytest.mark.parametrize("media_root", ["media", "media-resume"])
+def test_repeated_ingest_attaches_verified_recovered_media_from_each_root(
+    tmp_path: Path,
+    disposable_postgres_credentials: dict[str, str],
+    media_root: str,
+) -> None:
+    from kiber_analyst.telegram_ingest import load_telegram_export
+
+    assert TEST_ENV is not None
+    project_slug = f"kiber-recovered-media-{uuid.uuid4().hex[:10]}"
+    export_root = tmp_path / "telegram"
+    source = _fixture(export_root)
+    message_path = source / "messages.jsonl"
+    message = json.loads(message_path.read_text(encoding="utf-8"))
+    message["media"] = {
+        "type": "photo", "path": None, "size": None, "size_bytes": None,
+        "sha256": None, "max_file_bytes": 104857600,
+        "export_status": "skipped", "reason": "unknown_size",
+    }
+    messages_bytes = _json_bytes(message)
+    _write_private(message_path, messages_bytes)
+    manifest_path = source / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["messages_sha256"] = hashlib.sha256(messages_bytes).hexdigest()
+    _write_private(manifest_path, _json_bytes(manifest))
+
+    initial = load_telegram_export(
+        source, tmp_path / "artifacts" / f"initial-{media_root}",
+        env_path=Path(TEST_ENV), project_slug=project_slug, root=export_root,
+    )
+    assert (initial["inserted"], initial["media_missing"],
+            initial["service_events_inserted"]) == (1, 1, 1)
+
+    media_bytes = b"verified resumed telegram attachment"
+    media_sha = hashlib.sha256(media_bytes).hexdigest()
+    relative_media = f"{media_root}/101/recovered.bin"
+    _write_private(source / relative_media, media_bytes)
+    (source / media_root).chmod(0o700)
+    (source / media_root / "101").chmod(0o700)
+    control_hashes = {
+        "messages.jsonl": hashlib.sha256(messages_bytes).hexdigest(),
+        "services.jsonl": hashlib.sha256((source / "services.jsonl").read_bytes()).hexdigest(),
+        "manifest.json": hashlib.sha256((source / "manifest.json").read_bytes()).hexdigest(),
+        "services_manifest.json": hashlib.sha256(
+            (source / "services_manifest.json").read_bytes()
+        ).hexdigest(),
+    }
+    checkpoint = {
+        "version": 2,
+        "source_id": manifest["source_id"],
+        "inputs": control_hashes,
+        "requested_max_file_bytes": 104857600,
+        "over_limit_message_ids": [],
+        "records": {"101": {
+            "path": relative_media, "size": len(media_bytes), "sha256": media_sha,
+            "type": "photo", "max_file_bytes": 104857600,
+            "export_status": "downloaded",
+        }},
+    }
+    _write_private(
+        source / "media-resume" / "status.json",
+        _json_bytes(checkpoint),
+    )
+    (source / "media-resume").chmod(0o700)
+    files_before = _tree_snapshot(source)
+
+    with _connect(disposable_postgres_credentials) as conn:
+        project_id = conn.execute(
+            "SELECT id FROM projects WHERE slug=%s", (project_slug,),
+        ).fetchone()[0]
+        source_db_id = conn.execute(
+            "SELECT id FROM sources WHERE project_id=%s", (project_id,),
+        ).fetchone()[0]
+        segment = conn.execute(
+            """SELECT seg.id, seg.external_ref, seg.text, seg.meta::text
+               FROM segments seg JOIN documents doc ON doc.id=seg.document_id
+               WHERE doc.source_id=%s""", (source_db_id,),
+        ).fetchone()
+        segment_before = segment[:3]
+        segment_id = segment[0]
+        vector = "[" + ",".join(["0"] * 1536) + "]"
+        conn.execute(
+            """INSERT INTO embeddings
+               (project_id, owner_table, owner_id, model, embedding)
+               VALUES (%s::uuid, 'segments', %s, 'gemini-embedding-2:1536', %s::vector)""",
+            (project_id, str(segment_id), vector),
+        )
+        embedding_before = conn.execute(
+            """SELECT id, owner_id, model, embedding::text FROM embeddings
+               WHERE owner_table='segments' AND owner_id=%s""", (str(segment_id),),
+        ).fetchone()
+        events_before = conn.execute(
+            """SELECT external_ref, event_id, topic_id, event_type, payload::text,
+                      provenance::text, event_sha256
+               FROM telegram_service_events WHERE source_id=%s ORDER BY event_id""",
+            (source_db_id,),
+        ).fetchall()
+
+    resumed = load_telegram_export(
+        source, tmp_path / "artifacts" / f"resumed-{media_root}",
+        env_path=Path(TEST_ENV), project_slug=project_slug, root=export_root,
+    )
+    assert (resumed["inserted"], resumed["updated"], resumed["media_missing"],
+            resumed["service_events_skipped"]) == (0, 1, 0, 1)
+    normalized = json.loads(
+        (tmp_path / "artifacts" / f"resumed-{media_root}" / "normalized" / "messages.jsonl")
+        .read_text(encoding="utf-8")
+    )
+    assert normalized["media_path"] == relative_media
+    assert hashlib.sha256((source / normalized["media_path"]).read_bytes()).hexdigest() == media_sha
+
+    with _connect(disposable_postgres_credentials) as conn:
+        attached = conn.execute(
+            "SELECT meta->>'media_path', meta->'media_export'->>'sha256' FROM segments WHERE id=%s",
+            (segment_id,),
+        ).fetchone()
+        assert attached == (relative_media, media_sha)
+
+    repeated = load_telegram_export(
+        source, tmp_path / "artifacts" / f"repeat-{media_root}",
+        env_path=Path(TEST_ENV), project_slug=project_slug, root=export_root,
+    )
+    assert repeated["inserted"] == 0 and repeated["updated"] == 0
+    assert repeated["service_events_skipped"] == 1
+    assert _tree_snapshot(source) == files_before
+    with _connect(disposable_postgres_credentials) as conn:
+        assert conn.execute(
+            "SELECT id, external_ref, text FROM segments WHERE id=%s",
+            (segment_id,),
+        ).fetchone() == segment_before
+        assert conn.execute(
+            "SELECT meta->>'media_path', meta->'media_export'->>'sha256' FROM segments WHERE id=%s",
+            (segment_id,),
+        ).fetchone() == (relative_media, media_sha)
+        assert conn.execute(
+            "SELECT count(*) FROM segments WHERE id=%s", (segment_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            """SELECT external_ref, event_id, topic_id, event_type, payload::text,
+                      provenance::text, event_sha256
+               FROM telegram_service_events WHERE source_id=%s ORDER BY event_id""",
+            (source_db_id,),
+        ).fetchall() == events_before
+        assert conn.execute(
+            """SELECT id, owner_id, model, embedding::text FROM embeddings
+               WHERE owner_table='segments' AND owner_id=%s""", (str(segment_id),),
+        ).fetchone() == embedding_before
+
+
 def test_group_forum_group_and_topic_scopes_load_with_provenance(
     tmp_path: Path,
     disposable_postgres_credentials: dict[str, str],

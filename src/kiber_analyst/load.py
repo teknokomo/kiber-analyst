@@ -899,8 +899,17 @@ def load_job(
                     if manifest.get("media_resume_count", 0):
                         for record in iter_messages(paths["messages"]):
                             relative = record.get("media_path")
-                            if not isinstance(relative, str) or not relative.startswith("media-resume/"):
+                            if not isinstance(relative, str):
                                 continue
+                            media_parts = relative.split("/")
+                            if (
+                                len(media_parts) != 3
+                                or media_parts[0] not in {"media", "media-resume"}
+                                or media_parts[1] != str(record.get("message_id"))
+                                or media_parts[2] in {"", ".", ".."}
+                                or any("\\" in part or "\x00" in part for part in media_parts)
+                            ):
+                                raise LoadError("Media resume segment has an invalid media path")
                             media_meta = record["meta"]["media_export"]
                             identity = (doc_ids[_group_key(record)],
                                         f"tg:{record['chat_id']}:{record['message_id']}",

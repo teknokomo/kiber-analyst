@@ -452,6 +452,25 @@ def _remove_recovery_tree(parent: int, name: str, *, uid: int, summary: dict) ->
     summary["reclaimed_bytes"] += size
 
 
+def _remove_empty_recovery_candidate(parent: int, name: str, *, uid: int,
+                                     summary: dict) -> bool:
+    """Finish a cleanup interrupted after its ownership marker was removed.
+
+    The tree must be empty: non-empty markerless candidates have uncertain
+    provenance and remain untouched for operator reconciliation.
+    """
+    descriptor = _open_child(parent, name, uid=uid, mode=0o700)
+    try:
+        if os.listdir(descriptor):
+            return False
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent)
+    os.fsync(parent)
+    summary["removed_artifacts"] += 1
+    return True
+
+
 def _read_temp_marker(parent: int, name: str, *, uid: int) -> dict | None:
     try:
         directory = _open_child(parent, name, uid=uid, mode=0o700)
@@ -660,6 +679,9 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
                         )
                         processed_candidates.add(candidate_name)
             else:
+                if marker is not None:
+                    _preserve_recovery_item(summary, "candidate_marker_intent_conflict")
+                    _fail("TRANSFER_RECOVERY_REQUIRED")
                 try:
                     record, transfer_sha = _transfer_record(parent, candidate_name, uid=uid)
                 except IncompleteTransferCandidate:
@@ -736,6 +758,17 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
             continue
         try:
             record, transfer_sha = _transfer_record(parent, name, uid=uid)
+        except IncompleteTransferCandidate:
+            try:
+                removed = _remove_empty_recovery_candidate(
+                    parent, name, uid=uid, summary=summary,
+                )
+            except (TransferError, OSError):
+                _fail("TRANSFER_RECOVERY_REQUIRED")
+            if not removed:
+                _preserve_recovery_item(summary, "unverified_candidate")
+                _fail("TRANSFER_RECOVERY_REQUIRED")
+            continue
         except (TransferError, OSError, ValueError, UnicodeError):
             _preserve_recovery_item(summary, "unverified_candidate")
             _fail("TRANSFER_RECOVERY_REQUIRED")
@@ -747,7 +780,12 @@ def _recover_initialization_directories(parent: int, *, uid: int, source_id: str
             _preserve_recovery_item(summary, "candidate_name_mismatch")
             _fail("TRANSFER_RECOVERY_REQUIRED")
         elif record_source != source_id:
-            _preserve_recovery_item(summary, "other_source_candidate")
+            other_parts = parse_telegram_source(record_source)
+            current_parts = parse_telegram_source(source_id)
+            if other_parts is not None and current_parts is not None and other_parts[0] == current_parts[0]:
+                _preserve_recovery_item(summary, "other_source_candidate")
+                continue
+            _preserve_recovery_item(summary, "candidate_source_mismatch")
             _fail("TRANSFER_RECOVERY_REQUIRED")
         else:
             _archive_recovery_candidate(
@@ -940,7 +978,10 @@ def _walk_size(fd: int) -> int:
 def _remove_tree(parent: int, name: str, *, expected_uid: int):
     child = _open_child(parent, name, uid=expected_uid, mode=0o700)
     try:
-        for item in os.listdir(child):
+        # Keep the provenance marker until all payload entries have been
+        # removed. If cleanup is interrupted after the marker unlink, the
+        # remaining directory is empty and can be safely removed on retry.
+        for item in sorted(os.listdir(child), key=lambda entry: entry == ".publisher-temp.json"):
             _component(item)
             info = os.stat(item, dir_fd=child, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
@@ -1208,6 +1249,9 @@ def _copy_media_reference(source: int, dest: int, media: dict, message_id: int,
                            expected_sha=digest, max_bytes=limit)
             finally:
                 os.close(dst_item)
+            # Persist the newly created media/<message_id> directory entry
+            # before the enclosing candidate can be marked ready.
+            os.fsync(dst_media)
         finally:
             os.close(dst_media)
     finally:
@@ -1640,8 +1684,9 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                 # archived before returning idempotently.
                 if temp_name in os.listdir(destination_chat):
                     try:
-                        temp_record, _temp_sha = _transfer_record(
+                        temp_record, temp_sha = _transfer_record(
                             destination_chat, temp_name, uid=config["destination_uid"],
+                            allow_temp_marker=True,
                         )
                     except IncompleteTransferCandidate:
                         try:
@@ -1666,13 +1711,40 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     except (TransferError, OSError, ValueError, UnicodeError):
                         _fail("TRANSFER_RECOVERY_REQUIRED")
                     else:
-                        if (temp_record.get("source_hashes") != hashes):
+                        if (temp_record.get("source_id") != source_id
+                                or temp_record.get("source_hashes") != hashes):
                             _fail("TRANSFER_RECOVERY_REQUIRED")
+                        temp_dir = _open_child(
+                            destination_chat, temp_name, uid=config["destination_uid"],
+                        )
+                        try:
+                            has_temp_marker = ".publisher-temp.json" in os.listdir(temp_dir)
+                        finally:
+                            os.close(temp_dir)
+                        if has_temp_marker:
+                            if not _temp_marker_matches(
+                                    destination_chat, temp_name, uid=config["destination_uid"],
+                                    source_id=source_id, source_hashes=hashes,
+                                    media_manifest_sha=temp_record.get("media_manifest_sha256")):
+                                _fail("TRANSFER_RECOVERY_REQUIRED")
+                            _remove_temp_marker(
+                                destination_chat, temp_name, uid=config["destination_uid"],
+                            )
                         if temp_record.get("media_manifest_sha256") == desired_media_sha:
                             if final_status:
                                 previous, _ = _transfer_record(
                                     destination_chat, scope_dir, uid=config["destination_uid"],
                                 )
+                                if previous.get("media_manifest_sha256") == desired_media_sha:
+                                    _archive_recovery_candidate(
+                                        destination_chat, temp_name,
+                                        uid=config["destination_uid"],
+                                        transfer=temp_record, transfer_sha=temp_sha,
+                                        summary=recovery,
+                                    )
+                                    final_status["status"] = "already_ready"
+                                    os.fsync(destination_chat)
+                                    return recovery_result(final_status)
                                 _revision_compatible(
                                     previous, temp_record, source_hashes=hashes,
                                     media_manifest_sha=desired_media_sha,
@@ -1728,6 +1800,15 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                         _fail("DESTINATION_CONFLICT")
                     if transfer.get("media_manifest_sha256") == desired_media_sha:
                         final_status["status"] = "already_ready"
+                        if ".revisions" in os.listdir(destination_chat):
+                            revisions = _open_child(
+                                destination_chat, ".revisions", uid=config["destination_uid"],
+                                mode=0o700,
+                            )
+                            try:
+                                os.fsync(revisions)
+                            finally:
+                                os.close(revisions)
                         os.fsync(destination_chat)
                         return recovery_result(final_status)
 
