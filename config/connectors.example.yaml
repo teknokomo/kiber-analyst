@@ -1,4 +1,4 @@
-# Connector configuration for kiber-analyst 0.2.0.
+# Connector configuration for kiber-analyst 0.3.0.
 #
 # Copy to the runtime config directory as connectors.yaml:
 #   ~/.config/kiber-analyst/connectors.yaml

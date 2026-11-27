@@ -2,7 +2,7 @@
 
 Kiber-analyst is a Python toolkit for importing structured source archives into a PostgreSQL knowledge base. It normalizes discussions and messages, tracks provenance, creates embeddings, and supports hybrid full-text/vector search. A read-only MCP server, durable job worker, and restricted broker are included for controlled integrations.
 
-## Version 0.2.0 scope
+## Version 0.3.0 scope
 
 This release covers:
 
@@ -12,8 +12,9 @@ This release covers:
 - Incremental sync with checkpoints and a five-minute overlap window; repeated runs are idempotent.
 - Embeddings for non-empty discussion text, hybrid/FTS search, MCP search with provenance, and broker allowlisting for external sources.
 - A configurable Telegram topic exporter and atomic publisher, including resumable media up to 4,000,000,000 bytes per file; Telegram CLI installation/session setup remains operator-managed.
+- Project-scoped managed source control through the restricted broker: project and source discovery, project creation, source registration, dry-run, ingest, embeddings, status, retry, cancel and search.
 
-Everything stays **read-only** against the providers: Kiber-analyst never creates issues, comments, reviews, labels, or merges. Diff analysis, attachments, OCR, webhooks, cross-provider deduplication, and UI are out of scope for 0.2.0.
+Everything stays **read-only** against the providers: Kiber-analyst never creates, updates or deletes issues, comments, reviews, labels, or merges. Diff analysis, standalone document parsing (TXT, Markdown, PDF, DOCX, OCR), speech transcription of large media, webhooks, cross-provider deduplication, and UI are out of scope for 0.3.0.
 
 ## Requirements
 
