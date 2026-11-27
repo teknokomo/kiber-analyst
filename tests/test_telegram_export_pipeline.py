@@ -816,6 +816,155 @@ def test_export_resume_limit_change_reuses_verified_files_without_telegram_rpc(
         root.close()
 
 
+@pytest.mark.parametrize("media_root", ["media", "media-resume"])
+@pytest.mark.parametrize("new_limit_fits", [False, True])
+def test_export_resume_limit_change_stays_consistent_with_publisher(
+    tmp_path: Path, media_root: str, new_limit_fits: bool,
+) -> None:
+    """A limit change must either produce a publisher-ready revision or refuse unchanged."""
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    import kiber_analyst.telegram_exporter as exporter
+
+    data_root = tmp_path / "data"
+    export_root = data_root / "exports"
+    app_root = data_root / "application"
+    import_root = app_root / "imports"
+    lock_root = data_root / "run"
+    config_root = tmp_path / "config"
+    for directory in (data_root, export_root, app_root, import_root, lock_root, config_root):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    (app_root / "broker").mkdir(mode=0o700)
+    (import_root / ".broker").mkdir(mode=0o700)
+
+    storage_limit = 1024**3
+    exporter_config_path = config_root / "telegram-export.json"
+    publisher_config_path = config_root / "telegram-publisher.json"
+    exporter_config = {"storage_limit_bytes": storage_limit, "min_free_bytes": 0}
+    _write_config(exporter_config_path, exporter_config, 0o640)
+    publisher_config = {
+        "version": 1,
+        "data_root": str(data_root),
+        "source_root": str(export_root),
+        "destination_root": str(import_root),
+        "export_config": str(exporter_config_path),
+        "lock_path": str(lock_root / "publisher.lock"),
+        "expected_data_uuid": None,
+        "require_mount": False,
+        "storage_limit_bytes": storage_limit,
+        "min_free_bytes": 0,
+        "source_uid": os.geteuid(),
+        "source_gid": os.getegid(),
+        "destination_uid": os.geteuid(),
+        "destination_gid": os.getegid(),
+    }
+    _write_config(publisher_config_path, publisher_config, 0o600)
+
+    file_size = 32_768
+    old_limit = 4_000_000_000
+    new_limit = file_size + 1 if new_limit_fits else file_size - 1
+    client = _FakeTelegram(file_size)
+    root = Dir.root(str(export_root))
+    source_path = export_root / CHAT / str(TOPIC)
+    try:
+        export(root, exporter_config, ["export", CHAT, str(TOPIC), "100"], client=client)
+        export_services(root, exporter_config, CHAT, TOPIC, 100, None, client=client)
+
+        if media_root == "media":
+            original_media = source_path / "media" / "501"
+            original_media.mkdir(mode=0o700, parents=True)
+            payload = original_media / "synthetic-video.bin"
+            fd = os.open(payload, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.ftruncate(fd, file_size)
+            finally:
+                os.close(fd)
+            digest = hashlib.sha256(bytes(file_size)).hexdigest()
+            receipt = {"name": payload.name, "size": file_size, "sha256": digest}
+            receipt_path = original_media / "receipt.json"
+            receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+            receipt_path.chmod(0o600)
+
+        initial = exporter.export_resume(
+            root, exporter_config, CHAT, TOPIC, 100, old_limit, client,
+        )
+        assert initial["status"] == "complete"
+        resume_dir = source_path / "media-resume"
+        checkpoint_path = resume_dir / "status.json"
+        checkpoint_before = checkpoint_path.read_bytes()
+        status_before = (resume_dir / "manifest.json").read_bytes()
+        checkpoint = json.loads(checkpoint_before)
+        saved_record = checkpoint["records"]["501"]
+        assert saved_record["path"].startswith(f"{media_root}/501/")
+        file_path = source_path / saved_record["path"]
+        assert file_path.stat().st_size == file_size
+        file_before = file_path.read_bytes()
+
+        first_publish = telegram_publisher.handle(
+            "copy", SOURCE, config_path=str(publisher_config_path),
+        )
+        assert first_publish["status"] == "ready"
+        staged_topic = import_root / CHAT / str(TOPIC)
+        staged_manifest_before = (staged_topic / "telegram_transfer_manifest.json").read_bytes()
+
+        def no_telegram(_chat):
+            raise AssertionError("changing a verified receipt limit must not contact Telegram")
+
+        client.info = no_telegram
+        if not new_limit_fits:
+            for _attempt in range(2):
+                with pytest.raises(ExportError) as raised:
+                    exporter.export_resume(
+                        root, exporter_config, CHAT, TOPIC, 100, new_limit, client,
+                    )
+                assert raised.value.error_code == "RESUME_LIMIT_BELOW_EXISTING_MEDIA"
+                assert checkpoint_path.read_bytes() == checkpoint_before
+                assert (resume_dir / "manifest.json").read_bytes() == status_before
+                assert file_path.read_bytes() == file_before
+            repeated_publish = telegram_publisher.handle(
+                "copy", SOURCE, config_path=str(publisher_config_path),
+            )
+            assert repeated_publish["status"] == "already_ready"
+            assert (staged_topic / "telegram_transfer_manifest.json").read_bytes() == staged_manifest_before
+        else:
+            changed = exporter.export_resume(
+                root, exporter_config, CHAT, TOPIC, 100, new_limit, client,
+            )
+            updated = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            updated_status = json.loads((resume_dir / "manifest.json").read_text(encoding="utf-8"))
+            assert changed["status"] == "complete"
+            assert changed["requested_max_file_bytes"] == new_limit
+            assert updated["requested_max_file_bytes"] == new_limit
+            assert updated["records"]["501"]["max_file_bytes"] == new_limit
+            assert updated_status["complete"] is True
+            assert updated_status["requested_max_file_bytes"] == new_limit
+            assert updated_status["effective_max_file_bytes"] == new_limit
+            assert file_path.read_bytes() == file_before
+
+            republished = telegram_publisher.handle(
+                "copy", SOURCE, config_path=str(publisher_config_path),
+            )
+            assert republished["status"] == "ready"
+            staged_manifest = json.loads(
+                (staged_topic / "telegram_transfer_manifest.json").read_text(encoding="utf-8")
+            )
+            assert staged_manifest["max_file_bytes"] == new_limit
+            staged_file = staged_topic / "media" / "501" / file_path.name
+            assert staged_file.read_bytes() == file_before
+
+            repeated = exporter.export_resume(
+                root, exporter_config, CHAT, TOPIC, 100, new_limit, client,
+            )
+            assert repeated["status"] == "complete"
+            assert repeated["requested_max_file_bytes"] == new_limit
+            assert telegram_publisher.handle(
+                "copy", SOURCE, config_path=str(publisher_config_path),
+            )["status"] == "already_ready"
+    finally:
+        root.close()
+
+
 def test_export_resume_reconciles_valid_receipt_when_provisional_photo_size_was_stale(
     tmp_path: Path,
 ) -> None:

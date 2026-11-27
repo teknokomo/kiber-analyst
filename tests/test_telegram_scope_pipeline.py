@@ -1059,6 +1059,70 @@ def test_publisher_recovers_empty_candidate_after_cleanup_interruption(
     assert stage.is_dir()
 
 
+def test_publisher_preserves_nonempty_markerless_candidate_and_other_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    optional_disposable_postgres_credentials: dict[str, str] | None,
+):
+    if os.geteuid() == 0:
+        pytest.skip("the restricted publisher intentionally refuses root execution")
+    result = _run_scope_pipeline(
+        tmp_path, scope="group", forum=False, count=1, monkeypatch=monkeypatch,
+    )
+    stage = result["stage"]
+    parent = stage.parent
+    source_id = result["source_id"]
+    transfer = json.loads((stage / "telegram_transfer_manifest.json").read_text())
+    source_hashes = transfer["source_hashes"]
+    unknown_sha = hashlib.sha256(b"unknown markerless candidate").hexdigest()
+    candidate_name = telegram_publisher._transfer_candidate_name(
+        source_id, source_hashes, unknown_sha,
+    )
+    candidate = parent / candidate_name
+    candidate.mkdir(mode=0o700)
+    payload = candidate / "unverified.payload"
+    payload.write_bytes(b"keep: provenance cannot be established")
+    payload.chmod(0o600)
+    payload_before = payload.read_bytes()
+
+    other_source_id = f"telegram:{result['chat']}:topic:999"
+    other_media_sha = hashlib.sha256(b"other-source candidate").hexdigest()
+    other_name = telegram_publisher._transfer_candidate_name(
+        other_source_id, source_hashes, other_media_sha,
+    )
+    other_candidate = parent / other_name
+    other_candidate.mkdir(mode=0o700)
+    other_marker = {
+        "source_id": other_source_id,
+        "source_hashes": source_hashes,
+        "media_manifest_sha256": other_media_sha,
+    }
+    marker_path = other_candidate / ".publisher-temp.json"
+    marker_path.write_text(json.dumps(other_marker, sort_keys=True) + "\n", encoding="utf-8")
+    marker_path.chmod(0o600)
+    other_payload = other_candidate / "other-source.payload"
+    other_payload.write_bytes(b"preserve another source")
+    other_payload.chmod(0o600)
+    other_payload_before = other_payload.read_bytes()
+
+    ready_before = (stage / "telegram_transfer_manifest.json").read_bytes()
+    messages_before = (stage / "messages.jsonl").read_bytes()
+    services_before = (stage / "services.jsonl").read_bytes()
+    for _attempt in range(2):
+        with pytest.raises(telegram_publisher.TransferError, match="TRANSFER_RECOVERY_REQUIRED"):
+            telegram_publisher.handle(
+                "copy", source_id, config_path=str(result["publisher_config"]),
+            )
+        assert candidate.is_dir()
+        assert payload.read_bytes() == payload_before
+        assert not (candidate / ".publisher-temp.json").exists()
+        assert other_candidate.is_dir()
+        assert other_payload.read_bytes() == other_payload_before
+        assert marker_path.is_file()
+        assert (stage / "telegram_transfer_manifest.json").read_bytes() == ready_before
+        assert (stage / "messages.jsonl").read_bytes() == messages_before
+        assert (stage / "services.jsonl").read_bytes() == services_before
+
+
 def test_publisher_preserves_incomplete_candidate_with_marker_intent_conflict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     optional_disposable_postgres_credentials: dict[str, str] | None,

@@ -2168,6 +2168,11 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                         if (receipt['name'] != components[2]
                                 or receipt['sha256'] != row.get('sha256')):
                             raise ExportError('RESUME_CHECKPOINT_INVALID')
+                        if receipt['size'] > requested_limit:
+                            raise ExportError(
+                                'The selected limit is below an already downloaded attachment',
+                                error_code='RESUME_LIMIT_BELOW_EXISTING_MEDIA',
+                            )
                     finally:
                         media_item.close()
                 finally:
