@@ -1646,6 +1646,57 @@ def _media_receipt(directory, size, file_limit=None):
     return receipt
 
 
+def _verify_existing_media_limits(source, source_manifest, requested_limit):
+    """Verify already-exported media before a resume limit change is committed."""
+    stored_limit = source_manifest.get('max_file_bytes', DEFAULT_FILE_BYTES)
+    if type(stored_limit) is not int or not 0 < stored_limit <= MAX_FILE_BYTES:
+        raise ExportError('RESUME_SOURCE_LIMIT_INVALID')
+
+    def validate(row):
+        media = row.get('media')
+        if not isinstance(media, dict) or not media.get('path'):
+            return
+        message_id = str(row.get('message_id'))
+        path = media.get('path')
+        components = path.split('/') if isinstance(path, str) else []
+        if (len(components) != 3 or components[0] not in {'media', 'media-resume'}
+                or components[1] != message_id
+                or any(part in {'', '.', '..'} or '\\' in part or '\x00' in part
+                       for part in components)):
+            raise ExportError('RESUME_CHECKPOINT_INVALID')
+        old_limit = media.get('max_file_bytes', stored_limit)
+        size = media.get('size_bytes', media.get('size'))
+        reported_size = media.get('size')
+        digest = media.get('sha256')
+        if (type(old_limit) is not int or not 0 < old_limit <= MAX_FILE_BYTES
+                or type(size) is not int or size <= 0
+                or (reported_size is not None
+                    and (type(reported_size) is not int or reported_size != size))
+                or not isinstance(digest, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+            raise ExportError('RESUME_CHECKPOINT_INVALID')
+        media_root = source.child(components[0])
+        try:
+            item = media_root.child(message_id)
+            try:
+                receipt = _media_receipt(item, size, old_limit)
+                if receipt['name'] != components[2] or receipt['sha256'] != digest:
+                    raise ExportError('RESUME_CHECKPOINT_INVALID')
+                if receipt['size'] > requested_limit:
+                    raise ExportError(
+                        'The selected limit is below an already downloaded attachment',
+                        error_code='RESUME_LIMIT_BELOW_EXISTING_MEDIA',
+                    )
+            finally:
+                item.close()
+        finally:
+            media_root.close()
+
+    _scan_resume_jsonl(
+        source, 'messages.jsonl', MAX_EXPORT_BYTES, validate,
+    )
+
+
 def attachment(client, chat, item, media_dir, budget, raw=None, file_limit=None):
     file_limit = MAX_FILE if file_limit is None else file_limit
     if not item['media']:
@@ -2101,7 +2152,9 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
             source, chat, topic,
         )
         peer_type = source_manifest.get('chat_type', 'supergroup')
-        stored_limit = DEFAULT_FILE_BYTES
+        stored_limit = source_manifest.get('max_file_bytes', DEFAULT_FILE_BYTES)
+        if type(stored_limit) is not int or not 0 < stored_limit <= MAX_FILE_BYTES:
+            raise ExportError('RESUME_SOURCE_LIMIT_INVALID')
         try:
             existing_repair = source.child('media-resume')
         except FileNotFoundError:
@@ -2121,15 +2174,7 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
         requested_limit = stored_limit if max_file_bytes is None else max_file_bytes
         missing = {mid: row for mid, row in message_rows.items()
                    if isinstance(row.get('media'), dict) and not row['media'].get('path')}
-        if not missing:
-            return {
-                'source_id': source_id, 'status': 'complete',
-                'requested_max_file_bytes': requested_limit,
-                'effective_max_file_bytes': requested_limit,
-                'max_file_bytes_ceiling': MAX_FILE_BYTES,
-                'max_file_size_unit': 'bytes', 'media_count': 0, 'remaining': 0,
-                **_resume_counts({}),
-            }
+        _verify_existing_media_limits(source, source_manifest, requested_limit)
         budget = Budget(root, cfg)
         repair = source.child('media-resume', True)
         try:
@@ -2141,7 +2186,7 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
                 if max_file_bytes is None:
                     requested_limit = checkpoint_limit
             elif max_file_bytes is None:
-                requested_limit = DEFAULT_FILE_BYTES
+                requested_limit = stored_limit
             max_file_bytes = requested_limit
             # Verify every checkpointed receipt before either a no-op return or
             # an explicit limit change. A lower limit must not relabel retained

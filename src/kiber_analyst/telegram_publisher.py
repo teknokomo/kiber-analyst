@@ -981,8 +981,14 @@ def _remove_tree(parent: int, name: str, *, expected_uid: int):
         # Keep the provenance marker until all payload entries have been
         # removed. If cleanup is interrupted after the marker unlink, the
         # remaining directory is empty and can be safely removed on retry.
-        for item in sorted(os.listdir(child), key=lambda entry: entry == ".publisher-temp.json"):
+        # Persist payload removals before unlinking the marker, then persist
+        # marker removal before removing the directory entry from its parent.
+        items = sorted(os.listdir(child), key=lambda entry: entry == ".publisher-temp.json")
+        marker_removed = False
+        for item in items:
             _component(item)
+            if item == ".publisher-temp.json":
+                os.fsync(child)
             info = os.stat(item, dir_fd=child, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
                 _fail("UNSAFE_TEMP_ENTRY")
@@ -992,11 +998,19 @@ def _remove_tree(parent: int, name: str, *, expected_uid: int):
                 if info.st_nlink != 1:
                     _fail("UNSAFE_TEMP_ENTRY")
                 os.unlink(item, dir_fd=child)
+                if item == ".publisher-temp.json":
+                    marker_removed = True
+                    os.fsync(child)
             else:
                 _fail("UNSAFE_TEMP_ENTRY")
+            if item == ".publisher-temp.json":
+                break
+        if not marker_removed:
+            os.fsync(child)
     finally:
         os.close(child)
     os.rmdir(name, dir_fd=parent)
+    os.fsync(parent)
 
 
 def _safe_config(config_path: str) -> dict:
@@ -1698,12 +1712,21 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                         except (TransferError, OSError, ValueError, UnicodeError):
                             _fail("TRANSFER_RECOVERY_REQUIRED")
                         if not marker_matches:
-                            _fail("TRANSFER_RECOVERY_REQUIRED")
-                        _remove_tree(destination_chat, temp_name,
-                                     expected_uid=config["destination_uid"])
-                        # Persist removal of the discarded partial candidate so
-                        # a crash cannot resurrect a stale directory entry.
-                        os.fsync(destination_chat)
+                            try:
+                                removed = _remove_empty_recovery_candidate(
+                                    destination_chat, temp_name,
+                                    uid=config["destination_uid"], summary=recovery,
+                                )
+                            except (TransferError, OSError, ValueError, UnicodeError):
+                                _fail("TRANSFER_RECOVERY_REQUIRED")
+                            if not removed:
+                                _fail("TRANSFER_RECOVERY_REQUIRED")
+                        else:
+                            try:
+                                _remove_tree(destination_chat, temp_name,
+                                             expected_uid=config["destination_uid"])
+                            except (TransferError, OSError, ValueError, UnicodeError):
+                                _fail("TRANSFER_RECOVERY_REQUIRED")
                         final_status = _staged_status(
                             destination_chat, scope_dir, source_id,
                             dest_uid=config["destination_uid"],
@@ -1825,10 +1848,28 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                     staged_row = dict(row)
                     staged_media = dict(media)
                     if record.get("export_status") == "downloaded" and record.get("path"):
-                        checked = _validate_media_reference(
-                            source, record, row["message_id"], source_uid=config["source_uid"],
-                            max_file_bytes=max_file,
-                        )
+                        record_limit = record.get("max_file_bytes", max_file)
+                        copy_record = record
+                        if (type(record_limit) is int and 0 < record_limit <= MAX_FILE_BYTES
+                                and record_limit > max_file):
+                            # Original message rows are immutable and can carry
+                            # the limit selected by their first export. Verify
+                            # against that limit, then normalize only the staged
+                            # copy when the actual file fits the newer package cap.
+                            checked = _validate_media_reference(
+                                source, record, row["message_id"],
+                                source_uid=config["source_uid"],
+                                max_file_bytes=record_limit,
+                            )
+                            if checked["size"] > max_file:
+                                _fail("MEDIA_METADATA_INVALID")
+                            checked["limit"] = max_file
+                            copy_record = {**record, "max_file_bytes": max_file}
+                        else:
+                            checked = _validate_media_reference(
+                                source, record, row["message_id"], source_uid=config["source_uid"],
+                                max_file_bytes=max_file,
+                            )
                         staged_media.update({
                             "path": f"media/{mid}/{checked['name']}",
                             "size": checked["size"], "size_bytes": checked["size"],
@@ -1837,7 +1878,7 @@ def _atomic_publish(source_id: str, chat: str, scope_dir: str, config: dict):
                         })
                         staged_media.pop("reason", None)
                         staged_row["media"] = staged_media
-                        return staged_row, (record, row["message_id"], checked), False
+                        return staged_row, (copy_record, row["message_id"], checked), False
                     if record.get("export_status") != "skipped":
                         _fail("MEDIA_RECORD_INVALID")
                     reason = record.get("reason")
