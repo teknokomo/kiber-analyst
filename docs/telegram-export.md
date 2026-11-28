@@ -41,9 +41,15 @@ kiber-analyst-telegram-publish --help
 абсолютный путь к найденному исполняемому файлу, а не имя из интерактивного
 `PATH`. Экспортёр передаёт дочернему процессу только `PATH=/usr/bin:/bin`,
 поэтому Node.js должен находиться в одном из этих каталогов. Для стандартной
-установки экспортёр и издатель запускаются одним выделенным пользователем.
-Разделение exporter и publisher между разными Unix-пользователями этой версией
-не поддерживается; изменять владельцев отдельно для такого режима нельзя.
+установки экспортёр и локальный publisher запускаются одним выделенным
+непривилегированным пользователем. Telegram-сессия остаётся только у
+экспортирующего CLI; publisher не получает Telegram credentials, а worker
+импортёра не получает сессию или provider credentials. Разделение exporter и
+publisher по разным Unix-пользователям этой версией не поддерживается:
+деревья требуют `0700`, конфигурация publisher принадлежит его процессу, а
+копирование проверяет UID обоих деревьев. Для такого разделения нужен отдельный
+ограниченный transfer service с собственными тестами и планом установки;
+включать root publisher или ослаблять права каталогов нельзя.
 
 Скопируйте примеры из [`config/`](../config/telegram-export.example.json) в
 локальный конфигурационный каталог и замените значения путей, UID/GID и
@@ -68,6 +74,37 @@ kiber-analyst-telegram-export export-status CHAT_ID GROUP
 kiber-analyst-telegram-export export-transfer CHAT_ID GROUP
 kiber-analyst-telegram-export export-transfer-status CHAT_ID GROUP
 ```
+
+Для OpenSSH restricted key пакет также предоставляет
+`kiber-analyst-telegram-control`. В `authorized_keys` администратора его
+подключают как forced command с опцией `restrict`; сам интерфейс принимает
+только фиксированные строки `SSH_ORIGINAL_COMMAND`, не запускает shell и не
+принимает произвольные пути или flags. Контракт команд:
+
+```text
+export SOURCE_ID [MAX_FILE_SIZE]
+resume SOURCE_ID [MAX_FILE_SIZE]
+services SOURCE_ID
+status SOURCE_ID
+budget SOURCE_ID
+transfer SOURCE_ID
+transfer-status SOURCE_ID
+```
+
+`SOURCE_ID` — `telegram:<chat_id>:group` или
+`telegram:<chat_id>:topic:<topic_id>`. Размер можно передать как `100MiB`,
+`4000MB` или `4000000000B`; без параметра применяется `100MiB`.
+Пример fixed command (путь и ключ настраивает оператор вне репозитория):
+
+```text
+restrict,command="<absolute-path-to-kiber-analyst-telegram-control>" ssh-ed25519 <public-key> <comment>
+```
+
+Wrapper выводит только разрешённые поля статуса и безопасный код ошибки;
+локальные пути, сообщения Telegram, содержимое env и stderr publisher не
+возвращаются. Команда экспорта ограничена правами Telegram-аккаунта, в сессии
+которого работает CLI. Она не регистрирует source в проекте: перед импортом
+broker отдельно требует проектный grant и совпадающий source registration.
 
 `GROUP` экспортирует всю доступную историю обычной группы или форумной
 супергруппы со всеми её темами. Для отдельной темы форумной группы передайте
@@ -153,7 +190,8 @@ kiber-analyst-telegram-export export-status CHAT_ID GROUP
 kiber-analyst-telegram-export export-transfer CHAT_ID GROUP
 ```
 
-`export-resume` принимает новый лимит от `100MiB` по умолчанию до `4000MB`.
+`export-resume` принимает новый лимит от `100MiB` по умолчанию до
+`4,000,000,000` байт (`4000MB`).
 Оно не перезаписывает `messages.jsonl`, `services.jsonl`, обычный manifest,
 служебный manifest, уже выгруженные сообщения и события. Данные resume хранятся
 в отдельной приватной области с checkpoint, SHA-256 и причиной каждого

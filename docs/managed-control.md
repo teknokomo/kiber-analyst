@@ -60,6 +60,10 @@ cancel REQUEST_ID
 search-source SOURCE_ID PROJECT "поисковый запрос" [LIMIT]
 search-project PROJECT "поисковый запрос" [LIMIT]
 search-result REQUEST_ID
+asr-status SOURCE_ID PROJECT
+asr-pilot SOURCE_ID PROJECT [LIMIT]
+asr SOURCE_ID PROJECT
+embed-asr SOURCE_ID PROJECT
 ```
 
 Для обоих поисковых команд допустим `LIMIT` от 1 до 50; отсутствие значения
@@ -89,9 +93,57 @@ search-result REQUEST_ID
 команды входят в пакет Kiber-analyst и настраиваются для любых разрешённых
 групп и тем. Broker по-прежнему не читает Telegram-сессию и не вызывает
 экспортёр. Для запуска агентами оператор отдельно подключает фиксированные
-команды к restricted wrapper; произвольный shell не нужен. Не копируйте
-Telegram-сессию между службами. Подробные установки и команды описаны в
+команды к restricted wrapper; произвольный shell не нужен. Подробные установки
+и команды описаны в
 [Telegram export and transfer](telegram-export.md).
+
+### ASR для зарегистрированных Telegram-групп и тем
+
+ASR управляется на уровне проекта и уже зарегистрированного source, как для
+отдельной темы, так и для полного group-export. Для каждой команды broker
+заново проверяет grant проекта и запись
+`managed_sources(owner, source, project)`. Одного совпадения source ID с
+глобальной конфигурацией недостаточно. После отзыва grant или регистрации
+запуск, повтор, статус и отмена задания для managed source закрываются.
+Обычные одноаргументные ASR-команды оставлены для совместимости со старым
+static-конфигом; для managed source всегда передавайте проект.
+
+```text
+asr-status telegram:-10012345:topic:17 example-project
+asr-pilot telegram:-10012345:topic:17 example-project [LIMIT]
+asr telegram:-10012345:topic:17 example-project
+embed-asr telegram:-10012345:topic:17 example-project
+asr-status telegram:-10012345:group example-project
+asr-pilot telegram:-10012345:group example-project [LIMIT]
+asr telegram:-10012345:group example-project
+embed-asr telegram:-10012345:group example-project
+retry REQUEST_ID
+cancel REQUEST_ID
+job-status REQUEST_ID
+job-logs REQUEST_ID [N]
+job-list [source_id=SOURCE_ID] [status=STATE]
+```
+
+`asr-pilot` выбирает до 50 ещё не распознанных voice-сообщений (по умолчанию
+9). `asr` запускает полный оставшийся набор поддерживаемых audio/voice
+вложений. Оба используют штатную очередь и ротацию. В `asr-status` отдельно
+показаны eligible/done/failed/skipped/pending, ASR-сегменты, пустые сегменты и
+векторы текущей embedding-модели. `embed-asr` разрешён после завершения всех
+eligible ASR-файлов; он индексирует непустые сегменты в `asr_segments`, не
+меняя текст сообщений и их embeddings. Повтор фильтрует уже завершённые или
+имеющие вектор данные; провайдер, модель и ротация этими командами не меняются.
+
+Для group-export счётчики и ASR ограничены документом с
+`meta.export_scope='chat'`; для topic-export используется точный
+`topic:<topic_id>`. Workspace, checkpoint и ASR-embedding scope включают
+source ID, поэтому задания группы и темы не объединяются.
+
+Эти команды включены в пакет и broker. Чтобы использовать их через SSH,
+существующий root-owned forced-command wrapper нужно обновить так, чтобы он
+передавал только перечисленные формы команд в `kiber-analyst-broker-client`.
+Одной установки Python-пакета недостаточно: старый wrapper может продолжить
+отклонять новые команды. Проверка live-wrapper требует доступа владельца его
+приватного SSH-ключа.
 
 Приёмник Kiber-analyst принимает проверенные файлы Telegram-медиа размером до
 `4,000,000,000` байт (4,000 MB по десятичной шкале). Экспортёр применяет
@@ -103,7 +155,8 @@ Telegram-сессию между службами. Подробные устан
 экспортёра и publisher.
 
 Для нового Telegram-экспорта ограниченный экспортёр по умолчанию выбирает
-100 MiB (`104,857,600` байт) и допускает до 4,000 MB. При поздней дозагрузке
+100 MiB (`104,857,600` байт) и допускает до `4,000,000,000` байт (4,000 MB,
+десятичные единицы). При поздней дозагрузке
 publisher создаёт новую неизменяемую ревизию пакета и сохраняет прежние
 control-файлы и ревизии. Исходники экспортёра и межсервисного publisher
 входят в этот пакет.
@@ -124,9 +177,11 @@ ASR-путь отдельно ограничен 100 MiB на аудиофайл
 [Telegram export and transfer](telegram-export.md): экспорт истории и событий,
 возобновление медиа, проверка и атомарная публикация, затем регистрация,
 dry-run и ingest через broker. Реальный доступ ограничен членством и правами
-авторизованной Telegram-учётной записи. Конкретные restricted SSH allowlist и
-доступы на сервере настраиваются отдельно и не поставляются с публичным
-пакетом. Telegram-сессии между серверами не копируются.
+авторизованной Telegram-учётной записи. Новый `kiber-analyst-telegram-control`
+задаёт формат fixed-command для экспорта и передачи, но сам не настраивает
+`authorized_keys`, systemd, права файлов или межпользовательский publisher.
+Импортёр повторно проверяет source scope, manifest и хеши. Telegram-сессии
+между серверами не копируются.
 
 `source-status` возвращает только агрегаты и последние request/job IDs. Для
 текущей модели embeddings в счётчиках отдельно показываются число непустых

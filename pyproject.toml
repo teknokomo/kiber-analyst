@@ -49,6 +49,7 @@ kiber-analyst-backup = "kiber_analyst.backup:main"
 kiber-analyst-queue-restore = "kiber_analyst.queue_restore:main"
 kiber-analyst-migrate = "kiber_analyst.migrate:main"
 kiber-analyst-telegram-export = "kiber_analyst.telegram_exporter:main"
+kiber-analyst-telegram-control = "kiber_analyst.telegram_control:main"
 kiber-analyst-telegram-publish = "kiber_analyst.telegram_publisher:main"
 
 [tool.setuptools]

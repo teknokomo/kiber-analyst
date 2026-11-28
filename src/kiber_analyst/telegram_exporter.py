@@ -37,9 +37,61 @@ MAX_SKIPPED_MEDIA_SAMPLE = 100
 
 
 class ExportError(ValueError):
-    def __init__(self, message, *, error_code=None):
+    def __init__(self, message, *, error_code=None, safe_message=None):
         super().__init__(message)
         self.error_code = error_code
+        self.safe_message = safe_message
+
+
+_PUBLISHER_ERROR_CODES = frozenset({
+    'ATOMIC_EXCHANGE_UNAVAILABLE', 'ATOMIC_NOREPLACE_UNAVAILABLE',
+    'CONTROL_FILE_CHANGED', 'CONTROL_FILE_HASH_MISMATCH', 'CONTROL_FILE_TOO_LARGE',
+    'CONTROL_FILE_UNSAFE', 'DATA_DISK_CHECK_FAILED', 'DATA_DISK_NOT_MOUNTED',
+    'DATA_DISK_UUID_MISMATCH', 'DESTINATION_CONFLICT', 'EXPORT_CONFIG_INVALID',
+    'EXPORT_MANIFEST_INVALID', 'EXPORT_MANIFEST_MISMATCH', 'FILE_LIMIT_EXCEEDED',
+    'INSUFFICIENT_SHARED_STORAGE', 'INVALID_FIXED_ROOT', 'INVALID_OPERATION',
+    'INVALID_REQUEST', 'INVALID_SOURCE_ID', 'MEDIA_CHECKPOINT_MISMATCH',
+    'MEDIA_EXPORT_INCOMPLETE', 'MEDIA_EXPORT_NOT_READY',
+    'MEDIA_FILE_UNAVAILABLE_OR_UNSAFE', 'MEDIA_HASH_MISMATCH', 'MEDIA_LIMIT_INVALID',
+    'MEDIA_MANIFEST_HASH_MISMATCH', 'MEDIA_MANIFEST_INVALID', 'MEDIA_METADATA_INVALID',
+    'MEDIA_RECEIPT_MISMATCH', 'MEDIA_RECORD_INVALID', 'MEDIA_SKIP_REASON_INVALID',
+    'MESSAGES_HASH_MISMATCH', 'MESSAGES_INVALID', 'MESSAGE_COUNT_MISMATCH',
+    'NON_ADDITIVE_MEDIA_REVISION',
+    'OVERSIZED_FILE', 'REVISION_ARCHIVE_CONFLICT', 'ROOT_EXECUTION_FORBIDDEN',
+    'SERVICES_HASH_MISMATCH', 'SERVICES_INVALID', 'SERVICES_MANIFEST_MISMATCH',
+    'SERVICE_COUNT_MISMATCH', 'STAGED_MEDIA_REFERENCE_INVALID', 'STAGING_HASH_MISMATCH',
+    'STAGING_IDENTITY_MISMATCH', 'STAGING_MANIFEST_INVALID',
+    'STAGING_MEDIA_HASH_MISMATCH', 'STAGING_REVISION_INVALID',
+    'STAGING_REVISION_MISMATCH', 'STAGING_REVISION_NOT_ADVANCED',
+    'STORAGE_BUDGET_INVALID', 'STORAGE_POLICY_MISMATCH', 'TRANSFER_CONFIG_INVALID',
+    'TRANSFER_MANIFEST_INVALID', 'TRANSFER_RECOVERY_REQUIRED',
+    'UNEXPECTED_STAGING_ENTRY', 'UNEXPECTED_STAGING_MEDIA_ENTRY',
+    'UNSAFE_DESTINATION_CHAT_DIRECTORY', 'UNSAFE_DIRECTORY', 'UNSAFE_FILE',
+    'UNSAFE_MEDIA_PATH', 'UNSAFE_PATH_COMPONENT', 'UNSAFE_STORAGE_ENTRY',
+    'UNSAFE_STORAGE_ROOT', 'UNSAFE_TEMP_ENTRY', 'UNSAFE_TRANSFER_LOCK',
+    'TRANSFER_FAILED',
+})
+_TRANSFER_SAFE_MESSAGES = {
+    'INSUFFICIENT_SHARED_STORAGE': 'The shared storage budget or free-space reserve is insufficient.',
+    'TRANSFER_HELPER_UNAVAILABLE': 'The configured publisher helper is unavailable.',
+    'TRANSFER_HELPER_RESPONSE_TOO_LARGE': 'The publisher returned an oversized status response.',
+    'TRANSFER_HELPER_INVALID_RESPONSE': 'The publisher returned an invalid status response.',
+    'TRANSFER_BUDGET_UNAVAILABLE': 'The publisher could not verify the available storage budget.',
+    'TRANSFER_FAILED': 'The publisher failed safely; check its safe error code.',
+    'MEDIA_EXPORT_INCOMPLETE': 'The export still has media that is missing or unresolved.',
+    'MEDIA_EXPORT_NOT_READY': 'The export or its integrity metadata is not ready for transfer.',
+    'STORAGE_POLICY_MISMATCH': 'Exporter and publisher storage limits do not match.',
+    'TRANSFER_RECOVERY_REQUIRED': 'A previous transfer needs a safe recovery check.',
+    'TRANSFER_CONFIG_INVALID': 'The publisher configuration is invalid or incompatible.',
+    'EXPORT_CONFIG_INVALID': 'The shared storage policy configuration is invalid.',
+    'EXPORT_CONFIG_UNSUPPORTED': 'The exporter configuration uses an unsupported legacy format.',
+    'DATA_DISK_NOT_MOUNTED': 'The configured data volume is not mounted.',
+    'DATA_DISK_UUID_MISMATCH': 'The mounted data volume does not match the configured identity.',
+    'MEDIA_HASH_MISMATCH': 'A media file failed its integrity check.',
+    'MESSAGES_HASH_MISMATCH': 'The exported message file failed its integrity check.',
+    'STAGING_HASH_MISMATCH': 'The prepared package failed its integrity check.',
+    'EXPORT_CONFIG_REQUIRED': 'The Telegram exporter configuration is missing.',
+}
 
 
 def numeric(value, maximum=2147483647):
@@ -76,13 +128,13 @@ def _is_explicit_size(value):
 def parse(args):
     if len(args) < 3 or args[0] not in {
         'export', 'export-status', 'export-services', 'export-resume',
-        'export-transfer', 'export-transfer-status',
+        'export-transfer', 'export-transfer-status', 'export-budget',
     }:
-        raise ExportError('Use export CHAT TOPIC [MEDIA] [LIMIT] [BEFORE] [MAX_FILE_SIZE], export-resume CHAT TOPIC [MAX_FILE_SIZE] [BATCH], export-services CHAT TOPIC [LIMIT] [BEFORE], export-status CHAT TOPIC, or export-transfer[ -status] CHAT TOPIC')
+        raise ExportError('Use export CHAT TOPIC [MEDIA] [LIMIT] [BEFORE] [MAX_FILE_SIZE], export-resume CHAT TOPIC [MAX_FILE_SIZE] [BATCH], export-services CHAT TOPIC [LIMIT] [BEFORE], export-status CHAT TOPIC, export-transfer[ -status] CHAT TOPIC, or export-budget CHAT TOPIC')
     cmd, chat, topic, *rest = args
     chat_arg(chat)
     topic = None if topic.upper() == 'GROUP' else numeric(topic)
-    if cmd in {'export-transfer', 'export-transfer-status'}:
+    if cmd in {'export-transfer', 'export-transfer-status', 'export-budget'}:
         if rest or not re.fullmatch(r'-?[1-9][0-9]{0,18}', chat):
             raise ExportError('Transfer requires a numeric chat ID and topic or GROUP')
         return cmd, chat, topic, False, 0, None, MAX_FILE
@@ -347,7 +399,7 @@ class Dir:
 def config(path=None):
     configured_path = path or os.environ.get('KIBER_TELEGRAM_EXPORT_CONFIG')
     if not isinstance(configured_path, str) or not Path(configured_path).is_absolute():
-        raise ExportError('Set KIBER_TELEGRAM_EXPORT_CONFIG to an absolute config path')
+        raise ExportError('Exporter configuration is required', error_code='EXPORT_CONFIG_REQUIRED')
     try:
         fd = os.open(configured_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         with os.fdopen(fd, 'rb') as stream:
@@ -369,7 +421,15 @@ def config(path=None):
         'min_free_bytes', 'expected_mount_uuid',
     }
     if not isinstance(c, dict) or set(c) != required:
-        raise ExportError('Telegram exporter config has unsupported fields')
+        legacy_fields = {'allowed_topic_ids', 'min_free_bytes', 'storage_limit_bytes'}
+        legacy_shape = isinstance(c, dict) and set(c) == legacy_fields
+        code = 'EXPORT_CONFIG_UNSUPPORTED' if legacy_shape else 'EXPORT_CONFIG_INVALID'
+        message = (
+            'Legacy topic-only exporter config must be migrated to the current schema'
+            if legacy_shape else 'Exporter config fields do not match the supported schema'
+        )
+        safe_message = _TRANSFER_SAFE_MESSAGES.get(code)
+        raise ExportError(message, error_code=code, safe_message=safe_message)
     for key in ('export_root', 'storage_root', 'telegram_cli', 'telegram_home',
                 'publisher_executable', 'publisher_config'):
         if (not isinstance(c[key], str) or not Path(c[key]).is_absolute()
@@ -2128,13 +2188,26 @@ def transfer_helper_call(cfg, action, source_id):
         )
     except (OSError, subprocess.SubprocessError):
         raise ExportError('TRANSFER_HELPER_UNAVAILABLE', error_code='TRANSFER_HELPER_UNAVAILABLE') from None
-    if result.returncode or len(result.stdout) > 16 * 1024:
-        raise ExportError('TRANSFER_HELPER_FAILED', error_code='TRANSFER_HELPER_FAILED')
+    if len(result.stdout) > 16 * 1024:
+        raise ExportError('TRANSFER_HELPER_RESPONSE_TOO_LARGE',
+                          error_code='TRANSFER_HELPER_RESPONSE_TOO_LARGE')
     try:
         payload = json.loads(result.stdout)
     except (ValueError, UnicodeError):
         raise ExportError('TRANSFER_HELPER_INVALID_RESPONSE') from None
-    if not isinstance(payload, dict) or payload.get('source_id') != source_id:
+    if not isinstance(payload, dict):
+        raise ExportError('TRANSFER_HELPER_INVALID_RESPONSE')
+    if result.returncode or payload.get('status') == 'error':
+        code = payload.get('error_code')
+        if not isinstance(code, str) or code not in _PUBLISHER_ERROR_CODES:
+            code = 'TRANSFER_HELPER_FAILED'
+        safe_message = _TRANSFER_SAFE_MESSAGES.get(
+            code, 'The publisher rejected the transfer; inspect its safe status code.'
+        )
+        raise ExportError(
+            code, error_code=code, safe_message=safe_message,
+        )
+    if payload.get('source_id') != source_id:
         raise ExportError('TRANSFER_HELPER_INVALID_RESPONSE')
     return payload
 
@@ -2495,10 +2568,13 @@ def export_resume(root, cfg, chat, topic, limit, max_file_bytes, client):
 
 def export(root, cfg, args, client=None):
     command, supplied_chat, topic, media, limit, before, max_file_bytes = parse(args)
-    if command in {'export-transfer', 'export-transfer-status'}:
+    if command in {'export-transfer', 'export-transfer-status', 'export-budget'}:
         source_id = format_telegram_source(supplied_chat, topic)
         return transfer_helper_call(
-            cfg, 'copy' if command == 'export-transfer' else 'status', source_id,
+            cfg,
+            'copy' if command == 'export-transfer' else
+            'budget' if command == 'export-budget' else 'status',
+            source_id,
         )
     client = client or Client(cfg)
     if command == 'export-resume':
@@ -2804,7 +2880,7 @@ def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if args in (['--help'], ['-h']):
         print('Usage: kiber-analyst-telegram-export [--config FILE] '
-              'export|export-resume|export-services|export-status|export-transfer|export-transfer-status ...')
+              'export|export-resume|export-services|export-status|export-transfer|export-transfer-status|export-budget ...')
         return 0
     config_path = None
     if args[:1] == ['--config']:
@@ -2818,7 +2894,10 @@ def main(argv=None):
         code = exc.error_code or str(exc)
         if not re.fullmatch(r'[A-Z][A-Z0-9_]{1,80}', code):
             code = 'EXPORT_FAILED'
-        print(json.dumps({'status': 'error', 'error_code': code}, sort_keys=True))
+        response = {'status': 'error', 'error_code': code}
+        if exc.safe_message:
+            response['message'] = exc.safe_message
+        print(json.dumps(response, sort_keys=True))
         return 1
     except Exception:  # noqa: BLE001 - keep filesystem and provider diagnostics private.
         print(json.dumps({'status': 'error', 'error_code': 'EXPORT_FAILED'}, sort_keys=True))

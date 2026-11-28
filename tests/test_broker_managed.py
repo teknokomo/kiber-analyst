@@ -445,7 +445,10 @@ def test_capabilities_report_group_and_topic_export_scopes(control):
     assert telegram["export"]["available_via_separate_interface"] is True
     assert telegram["export"]["invoked_by_kiber_broker"] is False
     assert "register_complete_topic_export" in telegram["operations"]
-    assert telegram["scopes"] == {"topic": True, "group": True}
+    assert telegram["scopes"] == {
+        "ingest_topic": True, "ingest_group": True,
+        "asr_topic": True, "asr_group": True,
+    }
 
 
 def test_static_source_does_not_grant_project_wide_access(control):

@@ -53,7 +53,7 @@ COMMANDS = {'ingest', 'embed', 'retry', 'job-status', 'job-list', 'job-logs',
             'cancel', 'reindex', 'audit-log', 'renew-embed', 'search', 'asr',
             'asr-status', 'embed-asr', 'capabilities', 'project-list',
             'project-create', 'source-list', 'source-add', 'ingest-dry-run',
-            'search-source', 'search-project', 'search-result'}
+            'search-source', 'search-project', 'search-result', 'asr-pilot'}
 TRANSIENT = {'transient_database_error', 'server_error', 'network_error',
              'request_timeout', 'network_timeout'}
 COUNTS = {'inserted', 'updated', 'skipped', 'absent', 'media_missing',
@@ -82,6 +82,16 @@ ASR_VOICE_TYPES = {'voice', 'voice_message'}
 ASR_AUDIO_EXTENSIONS = {'.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.ogg', '.wav', '.webm'}
 ASR_MAX_FILE_BYTES = 25_000_000
 ASR_MAX_MEDIA_BYTES = 100 * 1024**2
+ASR_MANAGED_OPERATIONS = {
+    'managed_asr_pilot', 'managed_asr_full', 'managed_asr_embed',
+}
+ASR_STATIC_OPERATIONS = {'asr_pilot', 'asr_full', 'asr_embed'}
+ASR_REQUEST_OPERATIONS = ASR_MANAGED_OPERATIONS | ASR_STATIC_OPERATIONS
+ASR_STATUS_FIELDS = (
+    'files_total', 'files_eligible', 'files_done', 'files_failed', 'files_skipped',
+    'files_pending', 'segments', 'empty', 'embedding_segments_total',
+    'embedding_segments_done', 'embedding_segments_pending', 'last_error_code',
+)
 TELEGRAM_SOURCE_RE = re.compile(
     r'telegram:(?P<chat>-[1-9][0-9]{0,18}):topic:(?P<topic>[1-9][0-9]{0,9})\Z'
 )
@@ -92,8 +102,9 @@ class Refused(Exception):
 
 
 def _validated_asr_plan(plan, source_id, input_fingerprint):
-    match = re.fullmatch(r'telegram:(-[1-9][0-9]{0,18}):topic:([1-9][0-9]{0,9})', source_id)
-    if (match is None or not isinstance(plan, dict) or plan.get('version') != 2
+    parsed_source = telegram_export_source(source_id)
+    if (parsed_source is None or not parsed_source[0].startswith('-')
+            or not isinstance(plan, dict) or plan.get('version') != 2
             or plan.get('source_id') != source_id
             or plan.get('input_fingerprint') != input_fingerprint
             or plan.get('run_id') != 'ka-' + input_fingerprint[:28]
@@ -116,7 +127,7 @@ def _validated_asr_plan(plan, source_id, input_fingerprint):
             or not skipped_valid
             or plan['files_skipped'] != sum(skipped.values())):
         raise Refused('ASR_WORKSPACE_CONFLICT')
-    chat, _topic = match.groups()
+    chat, _topic = parsed_source
     refs = set()
     for item in files:
         if not isinstance(item, dict):
@@ -699,6 +710,22 @@ class Broker:
 
     def _require_request_project(self, owner, row):
         project = self._argv_project(json.loads(row['argv']))
+        try:
+            operation = row['operation']
+        except (IndexError, KeyError):
+            operation = None
+        if operation in ASR_MANAGED_OPERATIONS:
+            if project is None or not self._project_granted(owner, project):
+                raise Refused('PROJECT_NOT_ALLOWED')
+            registered = self.db.execute(
+                'SELECT 1 FROM managed_sources WHERE owner=? AND source=? AND project=?',
+                (owner, row['source'], project),
+            ).fetchone()
+            if registered is None:
+                raise Refused('SOURCE_NOT_REGISTERED')
+        elif operation in ASR_STATIC_OPERATIONS:
+            if project is None or not self._project_granted(owner, project):
+                raise Refused('PROJECT_NOT_ALLOWED')
         legacy_source_scope = self.legacy_source_projects.get(row['source']) == project
         if project is not None and not self._project_granted(owner, project) and not legacy_source_scope:
             raise Refused('PROJECT_NOT_ALLOWED')
@@ -984,12 +1011,37 @@ class Broker:
             'gitverse': {'operations': ['register', 'dry_run', 'ingest', 'retry', 'embed', 'status', 'search'],
                          'coverage': 'issues, pull requests, comments and available reviews; unsupported endpoints remain partial'},
             'telegram': {
-                'operations': ['register_complete_topic_export', 'dry_run', 'ingest', 'retry',
-                               'embed', 'status', 'search'],
-                'scopes': {'topic': True, 'group': True},
+                'operations': ['register_complete_group_or_topic_export',
+                               'register_complete_topic_export', 'dry_run', 'ingest', 'retry',
+                               'embed', 'status', 'search', 'asr_pilot', 'asr',
+                               'asr_status', 'asr_retry', 'asr_cancel', 'embed_asr'],
+                'asr_scope': 'registered Telegram group or topic in a currently granted project',
+                'asr_commands': ['asr-status SOURCE_ID PROJECT',
+                                 'asr-pilot SOURCE_ID PROJECT [LIMIT]',
+                                 'asr SOURCE_ID PROJECT',
+                                 'embed-asr SOURCE_ID PROJECT'],
+                'scopes': {
+                    'ingest_topic': True, 'ingest_group': True,
+                    'asr_topic': True, 'asr_group': True,
+                },
                 'export': {'available_via_separate_interface': True,
+                           'commands': ['export SOURCE_ID [MAX_FILE_SIZE]',
+                                        'resume SOURCE_ID [MAX_FILE_SIZE]',
+                                        'services SOURCE_ID', 'status SOURCE_ID',
+                                        'budget SOURCE_ID', 'transfer SOURCE_ID',
+                                        'transfer-status SOURCE_ID'],
+                           'default_max_file_bytes': 104857600,
+                           'max_file_bytes': 4000000000,
+                           'commands_implemented_by': 'kiber-analyst-telegram-control',
+                           'legacy_commands': ['kiber-analyst-telegram-export export',
+                                               'kiber-analyst-telegram-export export-resume',
+                                               'kiber-analyst-telegram-export export-services',
+                                               'kiber-analyst-telegram-export export-status',
+                                               'kiber-analyst-telegram-export export-budget',
+                                               'kiber-analyst-telegram-export export-transfer',
+                                               'kiber-analyst-telegram-export export-transfer-status'],
                            'invoked_by_kiber_broker': False},
-                'ingest_requires': 'complete, unbounded topic export already staged in the fixed Telegram import directory',
+                'ingest_requires': 'complete, unbounded group or topic export already staged in the fixed Telegram import directory',
             },
         }, 'project_operations': {
             'list': True, 'select_existing': True,
@@ -1314,11 +1366,42 @@ class Broker:
                 raise
         return plan, staged / workspace_name
 
-    def asr_overview(self, source_id):
-        entry, _fingerprint, _chat, _topic = self.source(source_id)
+    def _asr_source_scope(self, owner, source_id, project=None):
+        if project is None:
+            entry, fingerprint, chat, topic = self.source(source_id)
+            configured_project = entry.get('project')
+            if (not isinstance(configured_project, str)
+                    or not self._project_granted(owner, configured_project)):
+                raise Refused('PROJECT_NOT_ALLOWED')
+            if entry.get('asr_enabled') is not True:
+                raise Refused('ASR_NOT_ENABLED')
+            scope = 'static'
+        else:
+            if not isinstance(project, str) or SLUG_RE.fullmatch(project) is None:
+                raise Refused('INVALID_PROJECT')
+            if not self._project_granted(owner, project):
+                raise Refused('PROJECT_NOT_ALLOWED')
+            registered = self.db.execute(
+                'SELECT 1 FROM managed_sources WHERE owner=? AND source=? AND project=?',
+                (owner, source_id, project),
+            ).fetchone()
+            if registered is None:
+                raise Refused('SOURCE_NOT_REGISTERED')
+            entry, fingerprint, parsed = self._managed_source_entry(owner, source_id, project)
+            if not isinstance(parsed, tuple) or len(parsed) != 2:
+                raise Refused('ASR_SCOPE_REQUIRED')
+            chat, topic_id = parsed
+            topic = telegram_scope_directory(topic_id)
+            scope = 'managed'
+        if (telegram_export_source(source_id) is None or chat is None
+                or not isinstance(topic, str) or not topic):
+            raise Refused('ASR_SCOPE_REQUIRED')
+        return entry, fingerprint, chat, topic, scope
+
+    def asr_overview(self, source_id, project):
         try:
             result = self.worker_api(
-                'asr-source-overview', source_id=source_id, project=entry['project']
+                'asr-source-overview', source_id=source_id, project=project
             )
         except JobsError:
             raise Refused('ASR_STATUS_UNAVAILABLE') from None
@@ -1326,30 +1409,39 @@ class Broker:
             raise Refused('INGEST_REQUIRED')
         return result
 
-    def source_asr_status(self, owner, source_id):
-        overview = self.asr_overview(source_id)
+    def source_asr_status(self, owner, source_id, project=None):
+        entry, _fingerprint, _chat, _topic, _scope = self._asr_source_scope(
+            owner, source_id, project,
+        )
+        overview = self.asr_overview(source_id, entry['project'])
         return {
             key: overview.get(key)
-            for key in ('files_total', 'files_done', 'files_failed', 'files_skipped',
-                        'segments', 'empty', 'last_error_code')
+            for key in ASR_STATUS_FIELDS
         }
 
-    def source_asr(self, owner, source_id):
-        entry, fingerprint, chat, topic = self.source(source_id)
-        if entry.get('asr_enabled') is not True:
-            raise Refused('ASR_NOT_ENABLED')
+    def source_asr(self, owner, source_id, project=None, *, mode='auto', pilot_limit=9):
+        entry, fingerprint, chat, topic, scope = self._asr_source_scope(
+            owner, source_id, project,
+        )
         revision = media_revision(self.root, chat, topic)
         staged = self.stage(source_id, entry, fingerprint, chat, topic, revision)
         plan, workspace = self.asr_workspace(
             source_id, entry, staged, fingerprint, revision
         )
-        overview = self.asr_overview(source_id)
+        overview = self.asr_overview(source_id, entry['project'])
         completed = set(overview.get('completed_refs', []))
         failed = set(overview.get('failed_refs', []))
         voice_refs = [item['external_ref'] for item in plan['files']
                       if item['media_type'] in ASR_VOICE_TYPES]
         unresolved_voice = [ref for ref in voice_refs if ref not in completed | failed]
-        if unresolved_voice:
+        if mode == 'pilot':
+            phase = 'asr_pilot'
+            selected = unresolved_voice[:pilot_limit]
+        elif mode == 'full':
+            phase = 'asr_full'
+            selected = [item['external_ref'] for item in plan['files']
+                        if item['external_ref'] not in completed | failed]
+        elif unresolved_voice:
             phase = 'asr_pilot'
             selected = unresolved_voice
         else:
@@ -1358,8 +1450,10 @@ class Broker:
                         if item['external_ref'] not in completed | failed]
         if not selected:
             return {
-                'status': 'partial' if overview['files_failed'] else 'complete',
+                'status': ('partial' if overview['files_failed'] else
+                           'pilot_complete' if mode == 'pilot' else 'complete'),
                 'source_id': source_id,
+                'project': entry['project'],
                 'files_total': plan['files_total'],
                 'files_done': overview['files_done'],
                 'files_failed': overview['files_failed'],
@@ -1371,29 +1465,36 @@ class Broker:
         def submit_result(row):
             return {
                 **self.dispatch(row), 'source_id': source_id, 'phase': phase,
+                'project': entry['project'],
                 'files_total': plan['files_total'], 'files_selected': len(selected),
                 'files_skipped': plan['files_skipped'],
                 'skip_reasons': plan['skipped_by_reason'],
             }
 
+        operation = f'managed_{phase}' if scope == 'managed' else phase
+        placeholders = ','.join('?' for _ in ASR_REQUEST_OPERATIONS)
         for row in self.db.execute(
-            "SELECT * FROM requests WHERE owner=? AND source=? AND operation IN ('asr_pilot','asr_full')",
-            (owner, source_id),
+            f'SELECT * FROM requests WHERE owner=? AND source=? AND operation IN ({placeholders})',
+            (owner, source_id, *sorted(ASR_REQUEST_OPERATIONS)),
         ).fetchall():
+            if self._argv_project(json.loads(row['argv'])) != entry['project']:
+                continue
             if self.status(row)['status'] not in TERMINAL:
-                if row['operation'] == phase:
+                if row['operation'] == operation:
                     meta = self.db.execute(
                         'SELECT selected_refs_json FROM asr_request_meta WHERE request_id=?',
                         (row['id'],),
                     ).fetchone()
                     if meta and json.loads(meta[0]) == selected:
                         return submit_result(row)
-                raise Refused('SOURCE_BUSY')
+                raise Refused('ASR_ACTIVE')
 
         payload = {
             'source_id': source_id,
             'input_fingerprint': plan['input_fingerprint'],
             'phase': phase,
+            'project': entry['project'],
+            'scope': scope,
             'selected_refs': selected,
         }
         request_fingerprint = hashlib.sha256(json.dumps(
@@ -1401,7 +1502,7 @@ class Broker:
         ).encode()).hexdigest()
         row = self.db.execute(
             'SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
-            (owner, source_id, request_fingerprint, phase),
+            (owner, source_id, request_fingerprint, operation),
         ).fetchone()
         if row:
             return submit_result(row)
@@ -1414,7 +1515,7 @@ class Broker:
         with self.db:
             self.db.execute(
                 'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) VALUES(?,?,?,?,?,?,?,?)',
-                (request_id, owner, source_id, request_fingerprint, phase,
+                (request_id, owner, source_id, request_fingerprint, operation,
                  json.dumps(argv), now, now),
             )
             self.db.execute(
@@ -1424,28 +1525,47 @@ class Broker:
             )
         return submit_result(self.row(owner, request_id))
 
-    def source_embed_asr(self, owner, source_id):
-        entry, fingerprint, _chat, _topic = self.source(source_id)
-        if entry.get('asr_enabled') is not True:
-            raise Refused('ASR_NOT_ENABLED')
-        overview = self.asr_overview(source_id)
+    def source_embed_asr(self, owner, source_id, project=None):
+        entry, fingerprint, _chat, _topic, scope = self._asr_source_scope(
+            owner, source_id, project,
+        )
+        overview = self.asr_overview(source_id, entry['project'])
+        asr_operations = ASR_REQUEST_OPERATIONS - {'asr_embed', 'managed_asr_embed'}
+        placeholders = ','.join('?' for _ in asr_operations)
         for row in self.db.execute(
-            "SELECT * FROM requests WHERE owner=? AND source=? AND operation IN ('asr_pilot','asr_full')",
-            (owner, source_id),
+            f'SELECT * FROM requests WHERE owner=? AND source=? AND operation IN ({placeholders})',
+            (owner, source_id, *sorted(asr_operations)),
         ).fetchall():
+            if self._argv_project(json.loads(row['argv'])) != entry['project']:
+                continue
             if self.status(row)['status'] not in TERMINAL:
                 raise Refused('ASR_ACTIVE')
         if (overview.get('files_done', 0) < 1 or overview.get('files_pending', 0) != 0
                 or overview.get('files_failed', 0) != 0):
             raise Refused('ASR_INCOMPLETE')
+        if (type(overview.get('embedding_segments_total')) is int
+                and type(overview.get('embedding_segments_pending')) is int
+                and overview['embedding_segments_pending'] == 0):
+            return {
+                'status': 'complete', 'source_id': source_id,
+                'project': entry['project'],
+                'embedding_segments_total': overview['embedding_segments_total'],
+                'embedding_segments_done': overview.get('embedding_segments_done', 0),
+                'embedding_segments_pending': 0,
+            }
+        fingerprint_payload = {
+            'source_id': source_id, 'source_fingerprint': fingerprint,
+            'asr_revision': overview.get('revision'), 'project': entry['project'],
+        }
+        if scope == 'managed':
+            fingerprint_payload['scope'] = 'managed'
         request_fingerprint = hashlib.sha256(json.dumps(
-            {'source_id': source_id, 'source_fingerprint': fingerprint,
-             'asr_revision': overview.get('revision'), 'project': entry['project']},
-            sort_keys=True, separators=(',', ':'),
+            fingerprint_payload, sort_keys=True, separators=(',', ':'),
         ).encode()).hexdigest()
+        operation = 'managed_asr_embed' if scope == 'managed' else 'asr_embed'
         row = self.db.execute(
-            "SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation='asr_embed'",
-            (owner, source_id, request_fingerprint),
+            'SELECT * FROM requests WHERE owner=? AND source=? AND fingerprint=? AND operation=?',
+            (owner, source_id, request_fingerprint, operation),
         ).fetchone()
         if row:
             return self.dispatch(row)
@@ -1456,7 +1576,7 @@ class Broker:
         with self.db:
             self.db.execute(
                 'INSERT INTO requests(id,owner,source,fingerprint,operation,argv,created,updated) VALUES(?,?,?,?,?,?,?,?)',
-                (request_id, owner, source_id, request_fingerprint, 'asr_embed',
+                (request_id, owner, source_id, request_fingerprint, operation,
                  json.dumps(argv), now, now),
             )
         return self.dispatch(self.row(owner, request_id))
@@ -2367,8 +2487,15 @@ class Broker:
         except JobsError:
             return {'worker': 'unavailable'}
 
-    def inspect_source(self, owner, source_id, command):
-        entry, _, chat, topic = self.source(source_id)
+    def inspect_source(self, owner, source_id, command, project=None):
+        if project is None:
+            entry, _, chat, topic = self.source(source_id)
+        else:
+            entry, _fingerprint, parsed = self._managed_source_entry(owner, source_id, project)
+            if parse_source_id(source_id) is not None:
+                return self.external_source_status(owner, source_id, entry, command)
+            chat, topic_value = parsed
+            topic = telegram_scope_directory(topic_value)
         if chat is None:
             return self.external_source_status(owner, source_id, entry, command)
         with contextlib.ExitStack() as stack:
@@ -2573,8 +2700,10 @@ class Broker:
         if command == 'source-add' and len(args) == 2:
             return self.source_add(owner, args[0], args[1])
         if command == 'source-status' and len(args) == 2:
-            entry, _fingerprint, _parsed = self._managed_source_entry(owner, args[0], args[1])
-            return self.external_source_status(owner, args[0], entry, command)
+            entry, _fingerprint, parsed = self._managed_source_entry(owner, args[0], args[1])
+            if parsed is None:
+                return self.external_source_status(owner, args[0], entry, command)
+            return self.inspect_source(owner, args[0], command, args[1])
         if command == 'ingest' and len(args) in {2, 3}:
             return self.managed_ingest(owner, args[0], args[1], since=args[2] if len(args) == 3 else None)
         if command == 'ingest-dry-run' and len(args) in {2, 3, 4}:
@@ -2626,10 +2755,21 @@ class Broker:
             return self.source_search(owner, args[0], args[1], args[2] if len(args) == 3 else None)
         if command == 'asr' and len(args) == 1:
             return self.source_asr(owner, args[0])
-        if command == 'asr-status' and len(args) == 1:
-            return self.source_asr_status(owner, args[0])
-        if command == 'embed-asr' and len(args) == 1:
-            return self.source_embed_asr(owner, args[0])
+        if command == 'asr' and len(args) == 2:
+            return self.source_asr(owner, args[0], args[1], mode='full')
+        if command == 'asr-pilot' and len(args) in {2, 3}:
+            limit = args[2] if len(args) == 3 else '9'
+            if not re.fullmatch(r'(?:[1-9]|[1-4][0-9]|50)', limit):
+                raise Refused('INVALID_LIMIT')
+            return self.source_asr(
+                owner, args[0], args[1], mode='pilot', pilot_limit=int(limit),
+            )
+        if command == 'asr-status' and len(args) in {1, 2}:
+            return self.source_asr_status(owner, args[0], args[1] if len(args) == 2 else None)
+        if command == 'embed-asr' and len(args) in {1, 2}:
+            return self.source_embed_asr(owner, args[0], args[1] if len(args) == 2 else None)
+        if command in {'source-status', 'media-status', 'reindex'} and len(args) == 2:
+            return self.inspect_source(owner, args[0], command, args[1])
         if len(args) != 1:
             raise Refused('INVALID_REQUEST')
         value = args[0]
@@ -2710,6 +2850,12 @@ class Broker:
                     'status': cancelled['state'],
                     'cancel_requested': cancelled['cancel_requested'] is True}
         if status['status'] in ACTIVE:
+            if row['operation'] in ASR_STATIC_OPERATIONS:
+                static_entry = self.sources.get(row['source'])
+                if (not isinstance(static_entry, dict)
+                        or static_entry.get('asr_enabled') is not True
+                        or static_entry.get('project') != self._argv_project(json.loads(row['argv']))):
+                    raise Refused('ASR_NOT_ENABLED')
             if row['operation'] == 'embed':
                 renewal = self.db.execute(
                     'SELECT base_fingerprint FROM embed_renewals WHERE request_id=?',
@@ -2736,13 +2882,19 @@ class Broker:
             candidates = self._retry_source_candidates(owner, row['source'], project)
             if not candidates:
                 raise Refused('SOURCE_REVISION_CHANGED')
-            if operation in {'asr_pilot', 'asr_full', 'asr_embed'}:
-                candidates = [
-                    candidate for candidate in candidates
-                    if candidate[0].get('asr_enabled') is True
-                ]
-                if not candidates:
-                    raise Refused('ASR_NOT_ENABLED')
+            if operation in ASR_REQUEST_OPERATIONS:
+                if operation in ASR_MANAGED_OPERATIONS:
+                    # Managed ASR requests are bound to a project registration.
+                    # _require_request_project already rechecked both the grant
+                    # and registration before this retry path.
+                    candidates = candidates[:1]
+                else:
+                    candidates = [
+                        candidate for candidate in candidates
+                        if candidate[0].get('asr_enabled') is True
+                    ]
+                    if not candidates:
+                        raise Refused('ASR_NOT_ENABLED')
             entry, fingerprint, chat, topic = candidates[0]
         if operation == 'ingest' and chat is None:
             # External reruns add a uniqueness suffix to the request fingerprint;
@@ -2778,7 +2930,9 @@ class Broker:
                 raise Refused('SOURCE_REVISION_CHANGED')
             entry, fingerprint, chat, topic = selected
             self.stage(row['source'], entry, fingerprint, chat, topic, revision)
-        elif operation in {'asr_pilot', 'asr_full'}:
+        elif operation in {
+            'asr_pilot', 'asr_full', 'managed_asr_pilot', 'managed_asr_full',
+        }:
             meta = self.db.execute(
                 'SELECT input_fingerprint FROM asr_request_meta WHERE request_id=?',
                 (row['id'],),
@@ -2803,13 +2957,23 @@ class Broker:
             if selected is None:
                 raise Refused('SOURCE_REVISION_CHANGED')
             entry, fingerprint, chat, topic = selected
-        elif operation == 'asr_embed':
-            overview = self.asr_overview(row['source'])
-            selected = next((candidate for candidate in candidates if hashlib.sha256(json.dumps(
-                {'source_id': row['source'], 'source_fingerprint': candidate[1],
-                 'asr_revision': overview.get('revision'), 'project': candidate[0]['project']},
-                sort_keys=True, separators=(',', ':'),
-            ).encode()).hexdigest() == expected_fingerprint), None)
+        elif operation in {'asr_embed', 'managed_asr_embed'}:
+            overview = self.asr_overview(row['source'], project)
+            selected = None
+            for candidate in candidates:
+                fingerprint_payload = {
+                    'source_id': row['source'], 'source_fingerprint': candidate[1],
+                    'asr_revision': overview.get('revision'),
+                    'project': candidate[0]['project'],
+                }
+                if operation == 'managed_asr_embed':
+                    fingerprint_payload['scope'] = 'managed'
+                current = hashlib.sha256(json.dumps(
+                    fingerprint_payload, sort_keys=True, separators=(',', ':'),
+                ).encode()).hexdigest()
+                if current == expected_fingerprint:
+                    selected = candidate
+                    break
             if selected is None:
                 raise Refused('SOURCE_REVISION_CHANGED')
             entry, fingerprint, chat, topic = selected
@@ -2854,8 +3018,8 @@ class Broker:
         else:
             raise Refused('RETRY_NOT_ALLOWED')
         active_operations = (
-            {'asr_pilot', 'asr_full', 'asr_embed'}
-            if operation in {'asr_pilot', 'asr_full', 'asr_embed'}
+            ASR_REQUEST_OPERATIONS
+            if operation in ASR_REQUEST_OPERATIONS
             else {operation}
         )
         for active in self.db.execute(
@@ -2863,6 +3027,8 @@ class Broker:
             (owner, row['source'], row['id']),
         ).fetchall():
             if active['operation'] not in active_operations:
+                continue
+            if self._argv_project(json.loads(active['argv'])) != project:
                 continue
             if self.status(active)['status'] not in TERMINAL:
                 raise Refused('SOURCE_BUSY')

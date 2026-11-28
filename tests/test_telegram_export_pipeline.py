@@ -21,6 +21,7 @@ from kiber_analyst.telegram_exporter import (
     _file_limit_bytes,
     export,
     export_services,
+    transfer_helper_call,
 )
 
 CHAT = "-10012345"
@@ -148,6 +149,62 @@ class _InterruptedTelegram:
 def _write_config(path: Path, config: dict, mode: int) -> None:
     path.write_text(json.dumps(config, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(mode)
+
+
+def test_legacy_topic_allowlist_config_fails_with_migration_reason(tmp_path):
+    from kiber_analyst.telegram_exporter import config
+
+    path = tmp_path / 'legacy-export.json'
+    _write_config(path, {
+        'allowed_topic_ids': ['telegram:-10012345:topic:1'],
+        'min_free_bytes': 1_000_000,
+        'storage_limit_bytes': 10_000_000_000,
+    }, 0o600)
+
+    with pytest.raises(ExportError) as error:
+        config(str(path))
+
+    assert error.value.error_code == 'EXPORT_CONFIG_UNSUPPORTED'
+    assert error.value.safe_message == (
+        'The exporter configuration uses an unsupported legacy format.'
+    )
+
+
+@pytest.mark.parametrize(
+    ('code', 'message'),
+    [
+        ('INSUFFICIENT_SHARED_STORAGE',
+         'The shared storage budget or free-space reserve is insufficient.'),
+        ('TRANSFER_RECOVERY_REQUIRED',
+         'A previous transfer needs a safe recovery check.'),
+    ],
+)
+def test_transfer_helper_returns_only_allowlisted_safe_error(monkeypatch, code, message):
+    def fake_run(argv, **kwargs):
+        assert argv == ['/fixed/publisher', '--config', '/fixed/publisher.json']
+        assert kwargs['input'] == b'copy\n' + SOURCE.encode() + b'\n'
+        assert kwargs['env'] == {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}
+        return SimpleNamespace(
+            returncode=1,
+            stdout=(json.dumps({
+                'status': 'error', 'error_code': code,
+                'path': '/private/server/path', 'detail': 'sensitive diagnostic',
+            }) + '\n').encode(),
+            stderr=b'private stderr must not escape',
+        )
+
+    monkeypatch.setattr('kiber_analyst.telegram_exporter.subprocess.run', fake_run)
+
+    with pytest.raises(ExportError) as error:
+        transfer_helper_call({
+            'publisher_executable': '/fixed/publisher',
+            'publisher_config': '/fixed/publisher.json',
+        }, 'copy', SOURCE)
+
+    assert error.value.error_code == code
+    assert error.value.safe_message == message
+    assert '/private' not in str(error.value)
+    assert 'sensitive' not in str(error.value)
 
 
 class _BasicGroupPhotoTelegram:

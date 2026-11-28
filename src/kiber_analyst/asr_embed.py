@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +26,7 @@ from kiber_analyst.embedding_api import (
 from kiber_analyst.errors import EmbedError, IngestError
 from kiber_analyst.load import ENV_PATH, _connect, _required_env
 from kiber_analyst.paths import write_json_atomic
+from kiber_analyst.telegram_source import parse_telegram_source
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,7 +56,13 @@ WHERE ar.project_id = %s::uuid
       JOIN sources so ON so.id = d.source_id
       WHERE s.external_ref = a.external_ref
         AND so.project_id = ar.project_id
-        AND ('telegram:' || so.external_id || ':topic:' || (s.meta->>'topic_id')) = %s::text
+        AND CASE
+              WHEN d.meta->>'export_scope' = 'chat'
+                OR (d.meta->>'export_scope' IS NULL AND d.meta->>'topic_id' IS NULL)
+                THEN 'group'
+              WHEN d.meta->>'topic_id' IS NOT NULL
+                THEN ('topic:' || (d.meta->>'topic_id'))
+            END = %s::text
   ))
 ORDER BY a.id
 """
@@ -133,6 +139,15 @@ def _scope_key(project: str, run_key: str | None, source_id: str | None) -> str:
     return f"asr:{project}:{source_id or '*'}:{run_key or 'all'}:{MODEL_KEY}"
 
 
+def _telegram_scope_key(source_id: str | None) -> str | None:
+    if source_id is None:
+        return None
+    parsed = parse_telegram_source(source_id)
+    if parsed is None or not parsed[0].startswith("-"):
+        raise ASREmbedError("Invalid Telegram source ID")
+    return "group" if parsed[1] is None else f"topic:{parsed[1]}"
+
+
 def _get_run(
     cursor: Any, project_id: str, scope_key: str
 ) -> tuple[str, dict[str, Any]]:
@@ -206,10 +221,7 @@ def embed_asr(
         raise ASREmbedError("Project slug is required")
     if (run_key is None) == (not all_runs):
         raise ASREmbedError("Specify exactly one of run_key or all_runs")
-    if source_id is not None and not re.fullmatch(
-        r"telegram:-[1-9][0-9]{0,18}:topic:[1-9][0-9]{0,9}", source_id
-    ):
-        raise ASREmbedError("Invalid Telegram source ID")
+    source_scope = _telegram_scope_key(source_id)
     if limit is not None and limit < 1:
         raise ASREmbedError("--limit must be at least 1")
 
@@ -254,7 +266,7 @@ def embed_asr(
                 project_id = str(project_row[0])
                 cursor.execute(
                     ASR_EMBED_SELECT_SQL,
-                    (MODEL_KEY, project_id, run_key, run_key, source_id, source_id),
+                    (MODEL_KEY, project_id, run_key, run_key, source_scope, source_scope),
                 )
                 records = [
                     {
