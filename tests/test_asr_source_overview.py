@@ -40,6 +40,8 @@ class _Connection(_Transaction):
         self.statements.append((query, params))
         if 'SELECT count(*) FROM documents' in query:
             return _Cursor(one=(1,))
+        if 'AS nonempty_segments' in query:
+            return _Cursor(one=(3, 2))
         if query.lstrip().startswith('WITH source AS'):
             return _Cursor(rows=self.rows)
         return _Cursor()
@@ -69,14 +71,17 @@ def test_asr_source_overview_is_read_only_and_counts_done_failed_and_skipped(mon
     assert {key: result[key] for key in (
         'files_total', 'files_eligible', 'files_done', 'files_failed',
         'files_skipped', 'files_pending', 'skipped_by_reason',
-        'segments', 'empty', 'last_error_code',
+        'segments', 'empty', 'embedding_segments_total',
+        'embedding_segments_done', 'embedding_segments_pending', 'last_error_code',
     )} == {
         'files_total': 5, 'files_eligible': 2, 'files_done': 1,
         'files_failed': 1, 'files_skipped': 3, 'files_pending': 0,
         'skipped_by_reason': {
             'missing_media': 1, 'over_100_MiB': 1, 'provider_file_limit': 1,
         },
-        'segments': 4, 'empty': 1, 'last_error_code': 'HTTP_429',
+        'segments': 4, 'empty': 1, 'embedding_segments_total': 3,
+        'embedding_segments_done': 2, 'embedding_segments_pending': 1,
+        'last_error_code': 'HTTP_429',
     }
     assert result['completed_refs'] == ['tg:-1001:1']
     assert result['failed_refs'] == ['tg:-1001:2']
@@ -92,7 +97,29 @@ def test_asr_source_overview_is_read_only_and_counts_done_failed_and_skipped(mon
     )
     assert "g.meta->>'media_type' = ANY(%s)" in source_query
     assert "substring(g.meta->>'media_path'" not in source_query
+    assert "'topic:'" in source_query
+    assert source_params[2] == 'topic:1'
     assert source_params[-1] == list(asr_source_overview._AUDIO_TYPES)
+
+
+def test_asr_group_overview_uses_group_document_scope(monkeypatch):
+    conn = _Connection([])
+    monkeypatch.setattr('kiber_analyst.load._required_env', lambda _path: object())
+    monkeypatch.setattr('kiber_analyst.load._connect', lambda _config: conn)
+
+    result = asr_source_overview.asr_source_overview(
+        'telegram:-1001:group', 'sample-project'
+    )
+
+    assert result['documents'] == 1
+    documents_query, documents_params = next(
+        (query, params) for query, params in conn.statements
+        if query.lstrip().startswith('SELECT count(*) FROM documents')
+    )
+    assert "THEN 'group'" in documents_query
+    assert documents_params == ('sample-project', '-1001', 'group')
+    assert all(params[2] == 'group' for query, params in conn.statements
+               if query.lstrip().startswith('WITH source AS'))
 
 
 def test_asr_source_overview_does_not_classify_mp4_without_audio_media_type():

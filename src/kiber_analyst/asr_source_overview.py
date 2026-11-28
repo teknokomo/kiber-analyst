@@ -1,4 +1,4 @@
-"""Read-only ASR counts for one registered Telegram topic."""
+"""Read-only ASR counts for one registered Telegram group or topic."""
 
 from __future__ import annotations
 
@@ -10,7 +10,10 @@ from typing import Any
 from kiber_analyst.jobqueue import JobsError
 
 _AUDIO_TYPES = ("audio", "audio_file", "voice", "voice_message")
-_SOURCE_ID = re.compile(r"telegram:(-[1-9][0-9]{0,18}):topic:([1-9][0-9]{0,9})\Z")
+_SOURCE_ID = re.compile(
+    r"telegram:(?P<chat>-[1-9][0-9]{0,18}):"
+    r"(?:(?:topic:(?P<topic>[1-9][0-9]{0,9}))|group)\Z"
+)
 _SAFE_ERROR = re.compile(r"[A-Z][A-Z0-9_]{0,39}\Z")
 _PROVIDER_MAX_BYTES = 25_000_000
 _EXPORT_MAX_BYTES = 100 * 1024**2
@@ -23,7 +26,13 @@ WITH source AS (
 ), documents AS (
     SELECT d.id FROM documents d JOIN source s ON s.id = d.source_id
     WHERE d.doc_type = 'export'
-      AND d.meta->>'topic_id' = %s
+      AND CASE
+            WHEN d.meta->>'export_scope' = 'chat'
+              OR (d.meta->>'export_scope' IS NULL AND d.meta->>'topic_id' IS NULL)
+              THEN 'group'
+            WHEN d.meta->>'topic_id' IS NOT NULL
+              THEN ('topic:' || (d.meta->>'topic_id'))
+          END = %s
 ), expected AS (
     SELECT DISTINCT ON (g.external_ref)
            g.external_ref,
@@ -66,6 +75,42 @@ LEFT JOIN LATERAL (
 ORDER BY e.external_ref
 """
 
+_EMBEDDINGS_SQL = """
+WITH source AS (
+    SELECT so.id, so.project_id
+    FROM sources so JOIN projects p ON p.id = so.project_id
+    WHERE p.slug = %s AND so.kind = 'telegram' AND so.external_id = %s
+), expected AS (
+    SELECT DISTINCT g.external_ref
+    FROM segments g
+    JOIN documents d ON d.id = g.document_id
+    JOIN source s ON s.id = d.source_id
+    WHERE g.external_ref IS NOT NULL
+      AND d.doc_type = 'export'
+      AND CASE
+            WHEN d.meta->>'export_scope' = 'chat'
+              OR (d.meta->>'export_scope' IS NULL AND d.meta->>'topic_id' IS NULL)
+              THEN 'group'
+            WHEN d.meta->>'topic_id' IS NOT NULL
+              THEN ('topic:' || (d.meta->>'topic_id'))
+          END = %s
+      AND g.meta->>'media_type' = ANY(%s)
+)
+SELECT count(*) FILTER (WHERE btrim(a.text) <> '') AS nonempty_segments,
+       count(*) FILTER (WHERE btrim(a.text) <> '' AND e.id IS NOT NULL) AS embedded_segments
+FROM source s
+JOIN asr_runs ar ON ar.project_id = s.project_id
+                 AND ar.model = 'whisper-large-v3-turbo'
+                 AND ar.status IN ('done', 'partial')
+JOIN asr_results r ON r.run_id = ar.id AND r.status = 'complete'
+JOIN asr_segments a ON a.run_id = ar.id AND a.external_ref = r.external_ref
+JOIN expected x ON x.external_ref = a.external_ref
+LEFT JOIN embeddings e ON e.project_id = ar.project_id
+                      AND e.owner_table = 'asr_segments'
+                      AND e.owner_id = a.id::text
+                      AND e.model = %s
+"""
+
 
 def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
     if not isinstance(source_id, str) or not isinstance(project, str):
@@ -73,8 +118,11 @@ def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
     match = _SOURCE_ID.fullmatch(source_id)
     if match is None or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", project):
         raise JobsError("Invalid ASR source scope")
-    chat_id, topic_id = match.groups()
+    chat_id = match.group("chat")
+    topic_id = match.group("topic")
+    scope_key = "group" if topic_id is None else f"topic:{topic_id}"
 
+    from kiber_analyst.embedding_api import MODEL_KEY
     from kiber_analyst.load import ENV_PATH, _connect, _required_env
 
     try:
@@ -87,13 +135,23 @@ def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
                    JOIN projects p ON p.id = so.project_id
                    WHERE p.slug = %s AND so.kind = 'telegram'
                      AND so.external_id = %s AND d.doc_type = 'export'
-                     AND d.meta->>'topic_id' = %s""",
-                (project, chat_id, topic_id),
+                     AND CASE
+                           WHEN d.meta->>'export_scope' = 'chat'
+                             OR (d.meta->>'export_scope' IS NULL AND d.meta->>'topic_id' IS NULL)
+                             THEN 'group'
+                           WHEN d.meta->>'topic_id' IS NOT NULL
+                             THEN ('topic:' || (d.meta->>'topic_id'))
+                         END = %s""",
+                (project, chat_id, scope_key),
             ).fetchone()[0]
             rows = conn.execute(
                 _ROWS_SQL,
-                (project, chat_id, topic_id, list(_AUDIO_TYPES)),
+                (project, chat_id, scope_key, list(_AUDIO_TYPES)),
             ).fetchall()
+            embedding_row = conn.execute(
+                _EMBEDDINGS_SQL,
+                (project, chat_id, scope_key, list(_AUDIO_TYPES), MODEL_KEY),
+            ).fetchone()
     except Exception as exc:  # noqa: BLE001 - database details and credentials stay private.
         raise JobsError(f"ASR source overview unavailable ({type(exc).__name__})") from None
 
@@ -161,6 +219,8 @@ def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
     total = len(rows)
     eligible = max(0, total - skipped)
     pending = max(0, eligible - len(completed) - len(failed_refs))
+    embedding_total = int(embedding_row[0]) if embedding_row else 0
+    embedding_done = int(embedding_row[1]) if embedding_row else 0
     return {
         "source_id": source_id,
         "documents": int(documents),
@@ -173,6 +233,9 @@ def asr_source_overview(source_id: Any, project: Any) -> dict[str, Any]:
         "skipped_by_reason": skipped_by_reason,
         "segments": segments,
         "empty": empty,
+        "embedding_segments_total": embedding_total,
+        "embedding_segments_done": embedding_done,
+        "embedding_segments_pending": max(0, embedding_total - embedding_done),
         "last_error_code": latest_error[1] if latest_error else None,
         "completed_refs": completed,
         "failed_refs": failed_refs,

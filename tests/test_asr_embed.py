@@ -20,7 +20,8 @@ def test_asr_embed_skips_empty_and_uses_asr_owner_table_contract() -> None:
     normalized = " ".join(ASR_EMBED_SELECT_SQL.lower().split())
     assert "owner_table = 'asr_segments'" in normalized
     assert "owner_id = a.id::text" in normalized
-    assert "('telegram:' || so.external_id || ':topic:'" in normalized
+    assert "then 'group'" in normalized
+    assert "then ('topic:' || (d.meta->>'topic_id'))" in normalized
     assert "%s::text is null or exists" in normalized
     assert "gemini-embedding-2:1536" in asr_embed.MODEL_KEY
 
@@ -35,6 +36,16 @@ def test_asr_embed_source_scopes_checkpoint_and_rejects_invalid_source() -> None
         asr_embed.embed_asr(
             project="sample-project", all_runs=True, source_id="telegram:-1001:topic:../1"
         )
+
+
+def test_asr_embed_source_scope_accepts_groups_without_crossing_topic_scope():
+    topic_scope = asr_embed._telegram_scope_key('telegram:-1001:topic:1')
+    group_scope = asr_embed._telegram_scope_key('telegram:-1001:group')
+    assert topic_scope == 'topic:1'
+    assert group_scope == 'group'
+    assert asr_embed._scope_key('sample-project', None, topic_scope) != (
+        asr_embed._scope_key('sample-project', None, group_scope)
+    )
 
 
 def test_asr_embed_retry_and_split_match_existing_batch_policy(

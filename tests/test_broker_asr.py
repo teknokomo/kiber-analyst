@@ -107,7 +107,8 @@ def asr_setup(tmp_path, monkeypatch):
 
     app = broker.Broker(tmp_path, {SOURCE: {'project': 'sample-project', 'hashes': hashes,
                                            'asr_enabled': True}},
-                        worker_api=worker, submit=submit)
+                        worker_api=worker, submit=submit,
+                        authorized_projects={'sample-project'})
     yield app, src, jobs, argv_log, overview, original
     app.db.close()
 
@@ -157,9 +158,217 @@ def test_asr_status_returns_only_documented_safe_fields(asr_setup):
     result = app.handle('client', 'asr-status', SOURCE)
     assert result == {
         'files_total': 4, 'files_done': 2, 'files_failed': 1,
-        'files_skipped': 1, 'segments': 8, 'empty': 1,
+        'files_eligible': None, 'files_skipped': 1, 'files_pending': 4,
+        'segments': 8, 'empty': 1,
+        'embedding_segments_total': None, 'embedding_segments_done': None,
+        'embedding_segments_pending': None,
         'last_error_code': 'HTTP_413',
     }
+
+
+def _register_managed_telegram(app, source=SOURCE, project='sample-project'):
+    app.authorized_projects.add(project)
+    entry = app.sources[source]
+    with app.db:
+        app.db.execute(
+            'INSERT INTO managed_sources(owner,source,project,provider,metadata,added) '
+            'VALUES(?,?,?,?,?,?)',
+            ('client', source, project, 'telegram',
+             json.dumps({'hashes': entry['hashes']}), '2026-01-01T00:00:00+00:00'),
+        )
+
+
+def _register_group_export(app, root, project='sample-project'):
+    source = 'telegram:-1009000:group'
+    chat = '-1009000'
+    export_dir = root / 'imports' / chat / 'group'
+    payload = b'group voice sample'
+    message = {
+        'message_id': 1, 'topic_id': None, 'topic_id_status': 'not_applicable',
+        'date': '2020-01-02T12:00:00+03:00', 'text': '',
+        'sender_name': 'Example Author', 'chat_id': chat,
+        'media': {
+            'type': 'voice_message', 'path': 'media/1/audio.ogg',
+            'size': len(payload), 'sha256': hashlib.sha256(payload).hexdigest(),
+        },
+    }
+    messages = (json.dumps(message, separators=(',', ':')) + '\n').encode()
+    services = b''
+    manifest = json.dumps({
+        'export_version': 1, 'complete': True, 'scope_before': None,
+        'scope': 'chat', 'chat_id': chat, 'topic_id': None,
+        'source_id': source, 'message_count': 1,
+        'messages_sha256': hashlib.sha256(messages).hexdigest(),
+        'max_file_bytes': 100 * 1024**2,
+    }, sort_keys=True).encode()
+    service_manifest = json.dumps({
+        'source_id': source, 'chat_id': int(chat), 'topic_id': None,
+        'scope': 'chat', 'complete': True, 'range_complete': True,
+        'scope_before': None, 'errors': [], 'event_count': 0,
+        'services_sha256': hashlib.sha256(services).hexdigest(),
+    }, sort_keys=True).encode()
+    files = {
+        'messages.jsonl': messages, 'services.jsonl': services,
+        'manifest.json': manifest, 'services_manifest.json': service_manifest,
+        'media/1/audio.ogg': payload,
+    }
+    for name, data in files.items():
+        private_write(export_dir / name, data)
+    for directory in (root / 'imports', root / 'imports' / chat, export_dir,
+                      export_dir / 'media', export_dir / 'media' / '1'):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    hashes = {name: hashlib.sha256(files[name]).hexdigest()
+              for name in ('messages.jsonl', 'services.jsonl', 'manifest.json')}
+    entry = {'project': project, 'asr_enabled': True, 'hashes': hashes}
+    app.sources[source] = entry
+    _register_managed_telegram(app, source=source, project=project)
+    return source
+
+
+def test_project_registered_telegram_supports_pilot_and_full_asr(asr_setup):
+    app, _source, jobs, argv_log, _overview, _original = asr_setup
+    _register_managed_telegram(app)
+
+    pilot = app.handle('client', 'asr-pilot', SOURCE, 'sample-project', '2')
+    assert pilot['phase'] == 'asr_pilot'
+    assert pilot['project'] == 'sample-project'
+    assert pilot['files_selected'] == 2
+    assert app.db.execute(
+        'SELECT operation FROM requests WHERE id=?', (pilot['request_id'],),
+    ).fetchone()[0] == 'managed_asr_pilot'
+    assert pilot == app.handle('client', 'asr-pilot', SOURCE, 'sample-project', '2')
+
+    jobs[pilot['job_id']]['state'] = 'done'
+    overview = _overview
+    overview.update(
+        files_done=3, completed_refs=[f'tg:-1009000:{message_id}' for message_id in range(1, 4)],
+    )
+    full = app.handle('client', 'asr', SOURCE, 'sample-project')
+    assert full['phase'] == 'asr_full'
+    assert full['files_selected'] == 1
+    assert argv_log[-1].count('--external-ref') == 1
+    assert argv_log[-1][argv_log[-1].index('--external-ref') + 1] == 'tg:-1009000:4'
+
+
+def test_static_and_managed_asr_share_one_active_source_slot(asr_setup):
+    app, _source, _jobs, argv_log, _overview, _original = asr_setup
+    _register_managed_telegram(app)
+    static = app.handle('client', 'asr', SOURCE)
+
+    with pytest.raises(broker.Refused, match='ASR_ACTIVE'):
+        app.handle('client', 'asr-pilot', SOURCE, 'sample-project')
+
+    assert len(argv_log) == 1
+    assert static['job_id']
+
+
+def test_managed_asr_status_reports_embedding_backlog(asr_setup):
+    app, _source, _jobs, _argv, overview, _original = asr_setup
+    _register_managed_telegram(app)
+    overview.update(
+        files_total=4, files_eligible=3, files_done=2, files_failed=0,
+        files_skipped=1, files_pending=1, segments=12, empty=2,
+        embedding_segments_total=10, embedding_segments_done=7,
+        embedding_segments_pending=3, last_error_code=None,
+        private_path='/must/not/escape',
+    )
+
+    result = app.handle('client', 'asr-status', SOURCE, 'sample-project')
+
+    assert result == {
+        'files_total': 4, 'files_eligible': 3, 'files_done': 2,
+        'files_failed': 0, 'files_skipped': 1, 'files_pending': 1,
+        'segments': 12, 'empty': 2,
+        'embedding_segments_total': 10, 'embedding_segments_done': 7,
+        'embedding_segments_pending': 3, 'last_error_code': None,
+    }
+
+
+def test_managed_asr_retry_rechecks_project_and_source_registration(asr_setup):
+    app, _source, jobs, argv_log, _overview, _original = asr_setup
+    _register_managed_telegram(app)
+    first = app.handle('client', 'asr-pilot', SOURCE, 'sample-project')
+    jobs[first['job_id']].update(
+        state='failed', error={'category': 'rate_limited'},
+        last_provider_error={'http_code': 429, 'category': 'rate_limited'},
+    )
+
+    app.authorized_projects.remove('sample-project')
+    with pytest.raises(broker.Refused, match='PROJECT_NOT_ALLOWED'):
+        app.handle('client', 'retry', first['request_id'])
+    assert len(argv_log) == 1
+    app.authorized_projects.add('sample-project')
+    with app.db:
+        app.db.execute(
+            'DELETE FROM managed_sources WHERE owner=? AND source=? AND project=?',
+            ('client', SOURCE, 'sample-project'),
+        )
+    with pytest.raises(broker.Refused, match='SOURCE_NOT_REGISTERED'):
+        app.handle('client', 'retry', first['request_id'])
+    assert len(argv_log) == 1
+
+
+def test_static_active_asr_retry_rechecks_enabled_flag(asr_setup):
+    app, _source, jobs, argv_log, _overview, _original = asr_setup
+    active = app.handle('client', 'asr', SOURCE)
+    app.sources[SOURCE]['asr_enabled'] = False
+
+    with pytest.raises(broker.Refused, match='ASR_NOT_ENABLED'):
+        app.handle('client', 'retry', active['request_id'])
+
+    assert len(argv_log) == 1
+    assert jobs[active['job_id']]['state'] == 'queued'
+
+
+def test_managed_asr_status_and_cancel_recheck_revoked_project(asr_setup):
+    app, _source, _jobs, argv_log, _overview, _original = asr_setup
+    _register_managed_telegram(app)
+    first = app.handle('client', 'asr-pilot', SOURCE, 'sample-project')
+    app.authorized_projects.remove('sample-project')
+
+    with pytest.raises(broker.Refused, match='PROJECT_NOT_ALLOWED'):
+        app.handle('client', 'job-status', first['request_id'])
+    with pytest.raises(broker.Refused, match='PROJECT_NOT_ALLOWED'):
+        app.handle('client', 'cancel', first['request_id'])
+    assert len(argv_log) == 1
+
+
+def test_managed_asr_embed_requires_completed_asr_and_uses_separate_job(asr_setup):
+    app, _source, jobs, argv_log, overview, _original = asr_setup
+    _register_managed_telegram(app)
+    overview.update(
+        files_done=3, files_pending=0, files_failed=0,
+        completed_refs=[f'tg:-1009000:{message_id}' for message_id in range(1, 4)],
+        embedding_segments_total=10, embedding_segments_done=7,
+        embedding_segments_pending=3,
+    )
+
+    result = app.handle('client', 'embed-asr', SOURCE, 'sample-project')
+
+    assert argv_log[-1] == [
+        'asr', 'embed', '--all-runs', '--project', 'sample-project',
+        '--source-id', SOURCE,
+    ]
+    assert app.db.execute(
+        'SELECT operation FROM requests WHERE id=?', (result['request_id'],),
+    ).fetchone()[0] == 'managed_asr_embed'
+    assert jobs[result['job_id']]['state'] == 'queued'
+
+
+def test_managed_asr_rejects_foreign_project_and_supports_registered_group(asr_setup):
+    app, _source, _jobs, argv_log, _overview, _original = asr_setup
+    _register_managed_telegram(app)
+    with pytest.raises(broker.Refused, match='PROJECT_NOT_ALLOWED'):
+        app.handle('client', 'asr-pilot', SOURCE, 'other-project')
+    group_source = _register_group_export(app, app.root)
+
+    pilot = app.handle('client', 'asr-pilot', group_source, 'sample-project')
+
+    assert pilot['phase'] == 'asr_pilot'
+    assert pilot['files_selected'] == 1
+    assert argv_log[-1][argv_log[-1].index('--external-ref') + 1] == 'tg:-1009000:1'
+    assert Path(argv_log[-1][argv_log[-1].index('--job') + 1]).parent.name == 'group'
 
 
 def test_asr_retry_after_transient_error_reuses_same_run_and_selection(asr_setup):
